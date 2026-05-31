@@ -13,7 +13,7 @@ from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
-from amc_pipeline.alignment import TokenUniformAligner
+from amc_pipeline.alignment import TokenUniformAligner, _alignment_units_from_whisperx
 from amc_pipeline.audio import decode_to_wav
 from amc_pipeline.cli import build_parser, load_cli_config
 from amc_pipeline.config import PipelineConfig
@@ -278,6 +278,33 @@ class CorePipelineTests(unittest.TestCase):
         intervals = TokenUniformAligner().spans_to_intervals([span], transcript, words, channel=1)
 
         self.assertGreater(intervals[0].end_sec, 4.0)
+
+    def test_whisperx_character_alignment_masks_phone_to_final_digit(self):
+        transcript = "Could you please give me a call at 212-537-0830? Thank you."
+        start = transcript.index("212")
+        phone = "212-537-0830"
+        digit_times = [9.55, 9.90, 10.22, 10.65, 11.02, 11.38, 11.77, 12.15, 12.55, 13.05]
+        chars = []
+        phone_digit_idx = 0
+        for idx, ch in enumerate(transcript):
+            if idx < start:
+                chars.append({"char": ch, "start": idx * 0.03, "end": idx * 0.03 + 0.02})
+            elif start <= idx < start + len(phone):
+                if ch.isdigit():
+                    t = digit_times[phone_digit_idx]
+                    chars.append({"char": ch, "start": t, "end": t + 0.18})
+                    phone_digit_idx += 1
+            elif idx > start + len(phone):
+                chars.append({"char": ch, "start": 14.0 + idx * 0.02, "end": 14.0 + idx * 0.02 + 0.01})
+        aligned = {"segments": [{"chars": chars}]}
+        span = PIISpan("PHONE", phone, start, start + len(phone), 0.99, "regex")
+
+        units = _alignment_units_from_whisperx(transcript, aligned)
+        intervals = TokenUniformAligner().spans_to_intervals([span], transcript, units, channel=1)
+
+        self.assertLess(intervals[0].start_sec, 9.55)
+        self.assertGreater(intervals[0].end_sec, 13.20)
+        self.assertLess(intervals[0].end_sec, 13.60)
 
     def test_partial_numeric_pii_span_expands_to_full_phone_context(self):
         transcript = "Could you call me at 212-537-0830 today?"

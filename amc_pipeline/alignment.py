@@ -84,16 +84,50 @@ class WhisperXAligner:
             metadata,
             audio,
             device,
-            return_char_alignments=False,
+            return_char_alignments=True,
         )
-        raw_words = aligned.get("word_segments") or []
-        if not raw_words:
-            for item in aligned.get("segments", []):
-                raw_words.extend(item.get("words", []))
-        words = _words_with_char_spans(transcript, raw_words)
-        if not words:
-            raise RequiredAlignmentError(f"WhisperX returned no word alignments for {segment.segment_id}")
-        return words
+        units = _alignment_units_from_whisperx(transcript, aligned)
+        if not units:
+            raise RequiredAlignmentError(f"WhisperX returned no usable alignments for {segment.segment_id}")
+        return units
+
+
+def _alignment_units_from_whisperx(transcript: str, aligned: dict) -> list[AlignmentWord]:
+    raw_chars = []
+    for item in aligned.get("segments", []):
+        raw_chars.extend(item.get("chars", []) or [])
+    char_units = _chars_with_char_spans(transcript, raw_chars)
+    if char_units:
+        return char_units
+    raw_words = aligned.get("word_segments") or []
+    if not raw_words:
+        for item in aligned.get("segments", []):
+            raw_words.extend(item.get("words", []) or [])
+    return _words_with_char_spans(transcript, raw_words)
+
+
+def _chars_with_char_spans(transcript: str, raw_chars: list[dict]) -> list[AlignmentWord]:
+    out: list[AlignmentWord] = []
+    cursor = 0
+    for raw in raw_chars:
+        token = str(raw.get("char", raw.get("word", "")))
+        if not token or raw.get("start") is None or raw.get("end") is None:
+            continue
+        found = _find_char_position(transcript, token, cursor)
+        if found is None:
+            continue
+        cursor = found + len(token)
+        out.append(
+            AlignmentWord(
+                word=token,
+                start_char=found,
+                end_char=found + len(token),
+                start_sec=float(raw["start"]),
+                end_sec=float(raw["end"]),
+                confidence=float(raw.get("score", 1.0) or 1.0),
+            )
+        )
+    return out
 
 
 def _words_with_char_spans(transcript: str, raw_words: list[dict]) -> list[AlignmentWord]:
@@ -123,6 +157,22 @@ def _words_with_char_spans(transcript: str, raw_words: list[dict]) -> list[Align
             )
         )
     return out
+
+
+def _find_char_position(transcript: str, token: str, cursor: int) -> int | None:
+    if token.isspace():
+        match = re.search(re.escape(token), transcript[cursor:])
+    else:
+        match = re.search(re.escape(token), transcript[cursor:], flags=re.IGNORECASE)
+    if match:
+        return cursor + match.start()
+    if token.strip():
+        stripped_cursor = cursor
+        while stripped_cursor < len(transcript) and transcript[stripped_cursor].isspace():
+            stripped_cursor += 1
+        if stripped_cursor < len(transcript) and transcript[stripped_cursor].lower() == token.lower():
+            return stripped_cursor
+    return None
 
 
 def _conservative_pii_start(span: PIISpan, words: list[AlignmentWord], overlapping: list[AlignmentWord]) -> float:
@@ -156,13 +206,24 @@ def _conservative_pii_end(span: PIISpan, words: list[AlignmentWord], overlapping
 
 
 def _span_char_coverage(span: PIISpan, words: list[AlignmentWord]) -> float:
-    span_len = max(1, span.end_char - span.start_char)
-    covered = 0
+    positions = _significant_span_positions(span)
+    if not positions:
+        positions = set(range(span.start_char, span.end_char))
+    covered_positions: set[int] = set()
     for word in words:
         overlap_start = max(span.start_char, word.start_char)
         overlap_end = min(span.end_char, word.end_char)
-        covered += max(0, overlap_end - overlap_start)
-    return min(1.0, covered / span_len)
+        covered_positions.update(range(overlap_start, overlap_end))
+    return min(1.0, len(positions & covered_positions) / max(1, len(positions)))
+
+
+def _significant_span_positions(span: PIISpan) -> set[int]:
+    value = str(span.text or "")
+    if _needs_high_recall_numeric_mask(span):
+        digits = {span.start_char + idx for idx, char in enumerate(value) if char.isdigit()}
+        if digits:
+            return digits
+    return {span.start_char + idx for idx, char in enumerate(value) if not char.isspace()}
 
 
 def _needs_high_recall_numeric_mask(span: PIISpan) -> bool:
