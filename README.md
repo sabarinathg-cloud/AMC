@@ -10,6 +10,14 @@ pyenv local 3.10.12
 python3.10 -m pip install -e .
 ```
 
+For Qwen ASR, install the same supported runtime used by the training notebook.
+`qwen-asr` currently requires `transformers==4.57.6`; newer Transformers
+versions can load the package but fail at model initialization.
+
+```bash
+python3.10 -m pip install -e ".[qwen]"
+```
+
 ## One-File Smoke Test
 
 Prepare a single-call input folder. The call ID is the parent directory name.

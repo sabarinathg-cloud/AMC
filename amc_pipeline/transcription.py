@@ -3,18 +3,21 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import gc
-import inspect
 import json
 import math
 import os
 import warnings
 from concurrent.futures import ThreadPoolExecutor
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Iterable
 
 from .config import PipelineConfig
 from .models import ASRResult, SegmentRecord
 from .progress import iter_progress
+
+
+QWEN_REQUIRED_TRANSFORMERS = "4.57.6"
 
 
 class ASRAdapter:
@@ -131,16 +134,15 @@ class QwenAdapter(ASRAdapter):
         _require_qwen_model_config(self.model_path)
         _require_import("qwen_asr", self.name)
         _require_import("torch", self.name)
+        _require_qwen_runtime_versions()
 
     def _load(self):
         if self._model is None:
             _configure_quiet_transformers()
             import torch  # type: ignore
 
-            _patch_transformers_check_model_inputs_for_qwen()
             from qwen_asr import Qwen3ASRModel  # type: ignore
 
-            _patch_qwen_asr_config_class()
             _configure_torch_for_inference(torch)
             _clear_cuda(torch)
             qwen_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
@@ -460,6 +462,26 @@ def _require_qwen_model_config(path: Path) -> None:
         )
 
 
+def _require_qwen_runtime_versions() -> None:
+    transformers_version = _package_version("transformers")
+    if transformers_version != QWEN_REQUIRED_TRANSFORMERS:
+        raise RuntimeError(
+            "qwen ASR must run with the qwen-asr supported runtime: "
+            f"transformers=={QWEN_REQUIRED_TRANSFORMERS}. "
+            f"Found transformers=={transformers_version}. "
+            "Install the same Qwen runtime used by the training notebook with: "
+            f"python3 -m pip install --force-reinstall 'qwen-asr==0.0.6' "
+            f"'transformers=={QWEN_REQUIRED_TRANSFORMERS}' 'accelerate==1.12.0'"
+        )
+
+
+def _package_version(distribution: str) -> str:
+    try:
+        return version(distribution)
+    except PackageNotFoundError as exc:
+        raise RuntimeError(f"required package is not installed: {distribution}") from exc
+
+
 def _require_import(module: str, name: str) -> None:
     if importlib.util.find_spec(module) is None:
         raise RuntimeError(f"{name} model enabled but Python module '{module}' is not installed")
@@ -480,69 +502,6 @@ def _configure_quiet_transformers() -> None:
         hf_logging.set_verbosity_error()
     except Exception:
         pass
-
-
-def _patch_transformers_check_model_inputs_for_qwen() -> bool:
-    try:
-        from transformers.utils import generic  # type: ignore
-    except Exception:
-        return False
-    original = getattr(generic, "check_model_inputs", None)
-    if original is None or getattr(original, "_amc_qwen_compat", False):
-        return False
-    try:
-        signature = inspect.signature(original)
-        params = list(signature.parameters.values())
-        needs_func = bool(params) and params[0].default is inspect.Signature.empty
-    except Exception:
-        needs_func = False
-    if not needs_func:
-        return False
-    compat = _make_check_model_inputs_compat(original)
-    setattr(generic, "check_model_inputs", compat)
-    return True
-
-
-def _make_check_model_inputs_compat(original):
-    def compat(func=None, *args, **kwargs):
-        if func is None:
-            def decorator(real_func):
-                return original(real_func, *args, **kwargs)
-
-            return decorator
-        return original(func, *args, **kwargs)
-
-    compat._amc_qwen_compat = True  # type: ignore[attr-defined]
-    return compat
-
-
-def _patch_qwen_asr_config_class() -> bool:
-    try:
-        from qwen_asr.core.transformers_backend.configuration_qwen3_asr import (  # type: ignore
-            Qwen3ASRConfig,
-            Qwen3ASRThinkerConfig,
-        )
-    except Exception:
-        return False
-    if getattr(Qwen3ASRConfig, "_amc_thinker_config_patch", False):
-        return False
-    original_init = Qwen3ASRConfig.__init__
-
-    def patched_init(self, *args, **kwargs):
-        original_init(self, *args, **kwargs)
-        if not hasattr(self, "thinker_config"):
-            thinker_config = kwargs.get("thinker_config")
-            if thinker_config is None:
-                thinker_config = {}
-            if isinstance(thinker_config, dict):
-                thinker_config = Qwen3ASRThinkerConfig(**thinker_config)
-            self.thinker_config = thinker_config
-        if not hasattr(self, "support_languages"):
-            self.support_languages = kwargs.get("support_languages")
-
-    Qwen3ASRConfig.__init__ = patched_init
-    Qwen3ASRConfig._amc_thinker_config_patch = True
-    return True
 
 
 def _configure_torch_for_inference(torch) -> None:

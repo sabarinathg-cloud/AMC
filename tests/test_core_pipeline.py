@@ -28,7 +28,7 @@ from amc_pipeline.pipeline import Pipeline
 from amc_pipeline.preprocessing import preprocess_file
 from amc_pipeline.segmentation import split_chunks_on_pauses
 from amc_pipeline.state import SQLiteStateStore
-from amc_pipeline.transcription import _make_check_model_inputs_compat, _require_qwen_model_config
+from amc_pipeline.transcription import _require_qwen_model_config, _require_qwen_runtime_versions
 from amc_pipeline.models import dataclass_to_dict
 
 
@@ -388,22 +388,6 @@ class CorePipelineTests(unittest.TestCase):
             self.assertEqual(cfg.asr_models["granite"].batch_size, 3)
             self.assertFalse(cfg.asr_models["whisper"].enabled)
 
-    def test_qwen_check_model_inputs_compat_accepts_decorator_factory_call(self):
-        calls = []
-
-        def original(func):
-            calls.append(func.__name__)
-            return func
-
-        compat = _make_check_model_inputs_compat(original)
-
-        @compat()
-        def forward():
-            return "ok"
-
-        self.assertEqual(forward(), "ok")
-        self.assertEqual(calls, ["forward"])
-
     def test_qwen_preflight_requires_thinker_config(self):
         with tempfile.TemporaryDirectory() as td:
             model_dir = Path(td) / "qwen"
@@ -418,6 +402,14 @@ class CorePipelineTests(unittest.TestCase):
 
             (model_dir / "config.json").write_text(json.dumps({"model_type": "qwen3_asr", "thinker_config": {}}))
             _require_qwen_model_config(model_dir)
+
+    def test_qwen_preflight_rejects_unsupported_transformers_runtime(self):
+        with patch("amc_pipeline.transcription.version", return_value="5.9.0"):
+            with self.assertRaisesRegex(RuntimeError, "transformers==4.57.6"):
+                _require_qwen_runtime_versions()
+
+        with patch("amc_pipeline.transcription.version", return_value="4.57.6"):
+            _require_qwen_runtime_versions()
 
     def test_manifest_stage_includes_transcripts_pii_and_redacted_paths(self):
         with tempfile.TemporaryDirectory() as td:
