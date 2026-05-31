@@ -40,8 +40,12 @@ class TokenUniformAligner:
             overlapping = [w for w in words if not (w.end_char <= span.start_char or w.start_char >= span.end_char)]
             if not overlapping:
                 raise RequiredAlignmentError(f"Could not align PII span '{span.text}'")
-            start = max(0.0, overlapping[0].start_sec - pre_padding_ms / 1000.0)
-            end = overlapping[-1].end_sec + post_padding_ms / 1000.0
+            start = overlapping[0].start_sec
+            end = _conservative_pii_end(span, words, overlapping)
+            if _needs_high_recall_numeric_mask(span):
+                start = _conservative_pii_start(span, words, overlapping)
+            start = max(0.0, start - pre_padding_ms / 1000.0)
+            end = end + post_padding_ms / 1000.0
             intervals.append(MaskInterval(channel, start, end, span.source, span.entity_type, span.confidence, span.source))
         return intervals
 
@@ -119,3 +123,76 @@ def _words_with_char_spans(transcript: str, raw_words: list[dict]) -> list[Align
             )
         )
     return out
+
+
+def _conservative_pii_start(span: PIISpan, words: list[AlignmentWord], overlapping: list[AlignmentWord]) -> float:
+    start = overlapping[0].start_sec
+    if _span_char_coverage(span, overlapping) >= 0.85:
+        return start
+    missing_prefix = max(0, overlapping[0].start_char - span.start_char)
+    if missing_prefix:
+        start = max(0.0, start - _estimated_chars_duration(span.text[:missing_prefix]))
+    previous = [w for w in words if w.end_char <= span.start_char and w.end_sec <= overlapping[0].start_sec]
+    if previous and missing_prefix:
+        start = max(previous[-1].end_sec, start)
+    return start
+
+
+def _conservative_pii_end(span: PIISpan, words: list[AlignmentWord], overlapping: list[AlignmentWord]) -> float:
+    end = overlapping[-1].end_sec
+    if not _needs_high_recall_numeric_mask(span):
+        return end
+    coverage = _span_char_coverage(span, overlapping)
+    if coverage >= 0.85:
+        return end
+    first_start = overlapping[0].start_sec
+    estimated_end = first_start + _estimated_numeric_duration(span.text)
+    next_words = [w for w in words if w.start_char >= span.end_char and w.start_sec >= end]
+    if next_words:
+        estimated_end = max(estimated_end, next_words[0].start_sec)
+    return max(end, estimated_end)
+
+
+def _span_char_coverage(span: PIISpan, words: list[AlignmentWord]) -> float:
+    span_len = max(1, span.end_char - span.start_char)
+    covered = 0
+    for word in words:
+        overlap_start = max(span.start_char, word.start_char)
+        overlap_end = min(span.end_char, word.end_char)
+        covered += max(0, overlap_end - overlap_start)
+    return min(1.0, covered / span_len)
+
+
+def _needs_high_recall_numeric_mask(span: PIISpan) -> bool:
+    entity = span.entity_type.upper()
+    high_risk_entities = {
+        "PHONE",
+        "PHONE_NUMBER",
+        "SSN",
+        "ID",
+        "ACCOUNT",
+        "ACCOUNT_NUMBER",
+        "POLICY",
+        "POLICY_NUMBER",
+        "MEMBER_ID",
+        "SUBSCRIBER_ID",
+        "ZIP",
+        "DATE",
+        "DOB",
+        "NUMBER",
+        "CARDINAL",
+    }
+    return entity in high_risk_entities or sum(ch.isdigit() for ch in span.text) >= 4
+
+
+def _estimated_numeric_duration(text: str) -> float:
+    digits = sum(ch.isdigit() for ch in text)
+    if digits >= 7:
+        return max(2.4, digits * 0.32)
+    if digits >= 4:
+        return max(1.2, digits * 0.28)
+    return _estimated_chars_duration(text)
+
+
+def _estimated_chars_duration(text: str) -> float:
+    return max(0.25, len(str(text or "")) * 0.08)

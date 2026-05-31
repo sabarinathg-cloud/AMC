@@ -21,10 +21,10 @@ from amc_pipeline.consensus import build_consensus
 from amc_pipeline.discovery import discover_audio_files
 from amc_pipeline.inspection import inspect_audio
 from amc_pipeline.masking import redact_wav_with_plan
-from amc_pipeline.models import ASRResult, MaskInterval, PIISpan
+from amc_pipeline.models import ASRResult, AlignmentWord, MaskInterval, PIISpan
 from amc_pipeline.normalization import normalize_transcript
 from amc_pipeline.pii_detection import RegexPIIDetector
-from amc_pipeline.pipeline import Pipeline
+from amc_pipeline.pipeline import Pipeline, _expand_numeric_pii_context
 from amc_pipeline.preprocessing import preprocess_file
 from amc_pipeline.segmentation import split_chunks_on_pauses
 from amc_pipeline.state import SQLiteStateStore
@@ -241,6 +241,34 @@ class CorePipelineTests(unittest.TestCase):
         intervals = TokenUniformAligner().spans_to_intervals(spans, transcript, words)
         self.assertEqual(len(intervals), 1)
         self.assertGreater(intervals[0].end_sec, intervals[0].start_sec)
+
+    def test_phone_mask_expands_when_alignment_only_times_prefix(self):
+        transcript = "Please call me at 212-537-0830 thank you"
+        span = PIISpan("PHONE", "212-537-0830", transcript.index("212"), transcript.index("212") + len("212-537-0830"), 0.99, "regex")
+        words = [
+            AlignmentWord("Please", 0, 6, 0.0, 0.35),
+            AlignmentWord("call", 7, 11, 0.36, 0.62),
+            AlignmentWord("me", 12, 14, 0.63, 0.78),
+            AlignmentWord("at", 15, 17, 0.79, 0.92),
+            AlignmentWord("212", 18, 21, 1.00, 1.35),
+            AlignmentWord("thank", 31, 36, 4.20, 4.55),
+            AlignmentWord("you", 37, 40, 4.56, 4.78),
+        ]
+
+        intervals = TokenUniformAligner().spans_to_intervals([span], transcript, words, channel=1)
+
+        self.assertEqual(intervals[0].channel, 1)
+        self.assertGreater(intervals[0].end_sec, 3.5)
+
+    def test_partial_numeric_pii_span_expands_to_full_phone_context(self):
+        transcript = "Could you call me at 212-537-0830 today?"
+        start = transcript.index("212")
+        span = PIISpan("NUMBER", "212", start, start + 3, 0.80, "gliner")
+
+        expanded = _expand_numeric_pii_context(span, transcript)
+
+        self.assertEqual(expanded.text, "212-537-0830")
+        self.assertEqual(expanded.entity_type, "PHONE")
 
     def test_cli_dry_run_writes_summary(self):
         with tempfile.TemporaryDirectory() as td:

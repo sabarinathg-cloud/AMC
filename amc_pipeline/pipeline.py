@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import traceback
 from dataclasses import replace
@@ -297,6 +298,7 @@ class Pipeline:
                     mapped = _map_span_to_final(span, transcript, final_transcript)
                     if mapped is None:
                         continue
+                    mapped = _expand_numeric_pii_context(mapped, final_transcript)
                     data = dataclass_to_dict(mapped)
                     data["transcript_source"] = source_name
                     data["detector_source"] = span.source
@@ -593,6 +595,61 @@ def _map_span_to_final(span: PIISpan, source_transcript: str, final_transcript: 
         source=span.source,
         raw={**span.raw, "source_transcript": source_transcript, "source_start_char": span.start_char, "source_end_char": span.end_char},
     )
+
+
+def _expand_numeric_pii_context(span: PIISpan, transcript: str) -> PIISpan:
+    if not _is_numeric_pii_candidate(span):
+        return span
+    text = str(transcript or "")
+    left = max(0, span.start_char)
+    right = min(len(text), span.end_char)
+    allowed = set("0123456789+().-/ #")
+    while left > 0 and text[left - 1] in allowed:
+        left -= 1
+    while right < len(text) and text[right] in allowed:
+        right += 1
+    while left < right and text[left] in " +().-/ #":
+        left += 1
+    while right > left and text[right - 1] in " +().-/ #":
+        right -= 1
+    expanded = text[left:right]
+    if _digit_count(expanded) < max(4, _digit_count(span.text)):
+        return span
+    entity_type = "PHONE" if _digit_count(expanded) >= 7 and span.entity_type.upper() in {"NUMBER", "CARDINAL", "PHONE", "PHONE_NUMBER"} else span.entity_type
+    return PIISpan(
+        entity_type=entity_type,
+        text=expanded,
+        start_char=left,
+        end_char=right,
+        confidence=span.confidence,
+        source=span.source,
+        raw={**span.raw, "expanded_from_text": span.text, "expanded_from_start_char": span.start_char, "expanded_from_end_char": span.end_char},
+    )
+
+
+def _is_numeric_pii_candidate(span: PIISpan) -> bool:
+    entity = span.entity_type.upper()
+    return entity in {
+        "PHONE",
+        "PHONE_NUMBER",
+        "SSN",
+        "ID",
+        "ACCOUNT",
+        "ACCOUNT_NUMBER",
+        "POLICY",
+        "POLICY_NUMBER",
+        "MEMBER_ID",
+        "SUBSCRIBER_ID",
+        "ZIP",
+        "DATE",
+        "DOB",
+        "NUMBER",
+        "CARDINAL",
+    } or _digit_count(span.text) >= 4
+
+
+def _digit_count(text: str) -> int:
+    return len(re.findall(r"\d", str(text or "")))
 
 
 def _dedupe_pii_dicts(spans: list[dict[str, Any]]) -> list[dict[str, Any]]:
