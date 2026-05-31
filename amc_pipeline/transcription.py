@@ -4,6 +4,7 @@ import importlib
 import importlib.util
 import gc
 import inspect
+import json
 import math
 import os
 import warnings
@@ -127,6 +128,7 @@ class QwenAdapter(ASRAdapter):
 
     def preflight(self) -> None:
         _require_path(self.model_path, self.name)
+        _require_qwen_model_config(self.model_path)
         _require_import("qwen_asr", self.name)
         _require_import("torch", self.name)
 
@@ -138,6 +140,7 @@ class QwenAdapter(ASRAdapter):
             _patch_transformers_check_model_inputs_for_qwen()
             from qwen_asr import Qwen3ASRModel  # type: ignore
 
+            _patch_qwen_asr_config_class()
             _configure_torch_for_inference(torch)
             _clear_cuda(torch)
             qwen_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
@@ -441,6 +444,22 @@ def _require_path(path: Path, name: str) -> None:
         raise RuntimeError(f"{name} model path does not exist: {path}")
 
 
+def _require_qwen_model_config(path: Path) -> None:
+    config_path = path / "config.json"
+    if not config_path.exists():
+        raise RuntimeError(f"qwen model config missing: {config_path}")
+    try:
+        payload = json.loads(config_path.read_text())
+    except Exception as exc:
+        raise RuntimeError(f"qwen model config is not readable JSON: {config_path}: {exc}") from exc
+    if "thinker_config" not in payload:
+        raise RuntimeError(
+            "qwen model config.json is missing thinker_config. "
+            "The local Qwen3-ASR model snapshot appears stale or incomplete; "
+            "refresh the qwen3-asr-1.7b model directory, then rerun this stage."
+        )
+
+
 def _require_import(module: str, name: str) -> None:
     if importlib.util.find_spec(module) is None:
         raise RuntimeError(f"{name} model enabled but Python module '{module}' is not installed")
@@ -495,6 +514,35 @@ def _make_check_model_inputs_compat(original):
 
     compat._amc_qwen_compat = True  # type: ignore[attr-defined]
     return compat
+
+
+def _patch_qwen_asr_config_class() -> bool:
+    try:
+        from qwen_asr.core.transformers_backend.configuration_qwen3_asr import (  # type: ignore
+            Qwen3ASRConfig,
+            Qwen3ASRThinkerConfig,
+        )
+    except Exception:
+        return False
+    if getattr(Qwen3ASRConfig, "_amc_thinker_config_patch", False):
+        return False
+    original_init = Qwen3ASRConfig.__init__
+
+    def patched_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        if not hasattr(self, "thinker_config"):
+            thinker_config = kwargs.get("thinker_config")
+            if thinker_config is None:
+                thinker_config = {}
+            if isinstance(thinker_config, dict):
+                thinker_config = Qwen3ASRThinkerConfig(**thinker_config)
+            self.thinker_config = thinker_config
+        if not hasattr(self, "support_languages"):
+            self.support_languages = kwargs.get("support_languages")
+
+    Qwen3ASRConfig.__init__ = patched_init
+    Qwen3ASRConfig._amc_thinker_config_patch = True
+    return True
 
 
 def _configure_torch_for_inference(torch) -> None:

@@ -28,7 +28,7 @@ from amc_pipeline.pipeline import Pipeline
 from amc_pipeline.preprocessing import preprocess_file
 from amc_pipeline.segmentation import split_chunks_on_pauses
 from amc_pipeline.state import SQLiteStateStore
-from amc_pipeline.transcription import _make_check_model_inputs_compat
+from amc_pipeline.transcription import _make_check_model_inputs_compat, _require_qwen_model_config
 from amc_pipeline.models import dataclass_to_dict
 
 
@@ -403,6 +403,21 @@ class CorePipelineTests(unittest.TestCase):
 
         self.assertEqual(forward(), "ok")
         self.assertEqual(calls, ["forward"])
+
+    def test_qwen_preflight_requires_thinker_config(self):
+        with tempfile.TemporaryDirectory() as td:
+            model_dir = Path(td) / "qwen"
+            model_dir.mkdir()
+
+            with self.assertRaisesRegex(RuntimeError, "config missing"):
+                _require_qwen_model_config(model_dir)
+
+            (model_dir / "config.json").write_text(json.dumps({"model_type": "qwen3_asr"}))
+            with self.assertRaisesRegex(RuntimeError, "thinker_config"):
+                _require_qwen_model_config(model_dir)
+
+            (model_dir / "config.json").write_text(json.dumps({"model_type": "qwen3_asr", "thinker_config": {}}))
+            _require_qwen_model_config(model_dir)
 
     def test_manifest_stage_includes_transcripts_pii_and_redacted_paths(self):
         with tempfile.TemporaryDirectory() as td:
