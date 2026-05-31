@@ -6,7 +6,7 @@
 
 **Architecture:** Implement a staged pipeline with durable state, deterministic artifacts, optional heavy model integrations, and a standard-library testable core. The core must run in this bare workspace; production ASR/PII/audio backends activate only when local dependencies, FFmpeg, and model paths are available.
 
-**Tech Stack:** Python 3.11, argparse, sqlite3, json, wave/audioop-compatible PCM handling, subprocess FFprobe/FFmpeg integration when present, optional faster-whisper/qwen-asr/transformers/GLiNER/spaCy/Piiranha.
+**Tech Stack:** Python 3.10.12, argparse, sqlite3, json, wave/audioop-compatible PCM handling, subprocess FFprobe/FFmpeg integration when present, optional faster-whisper/qwen-asr/transformers/GLiNER/spaCy/Piiranha.
 
 ---
 

@@ -2,8 +2,12 @@
 name = "amc-pipeline"
 version = "0.1.0"
 description = "Resumable audio PII redaction and ASR training artifact pipeline"
-requires-python = ">=3.11"
+requires-python = ">=3.10.12,<3.11"
 dependencies = ["tqdm>=4.66"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+]
 
 [project.scripts]
 amc-pipeline = "amc_pipeline.cli:main"

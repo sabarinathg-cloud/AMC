@@ -3,6 +3,13 @@
 Resumable audio preprocessing, ASR, normalization, transcript PII detection,
 forced alignment, channel-specific masking, validation, and manifest generation.
 
+Use Python 3.10.12 for the runtime environment.
+
+```bash
+pyenv local 3.10.12
+python3.10 -m pip install -e .
+```
+
 ## One-File Smoke Test
 
 Prepare a single-call input folder. The call ID is the parent directory name.
@@ -16,17 +23,17 @@ rm -rf /tmp/amc-one-output
 Run each stage independently:
 
 ```bash
-python3 -m amc_pipeline.cli dry-run --input /tmp/amc-one --output /tmp/amc-one-output
-python3 -m amc_pipeline.cli run-stage preprocess --input /tmp/amc-one --output /tmp/amc-one-output
-python3 -m amc_pipeline.cli run-stage asr --input /tmp/amc-one --output /tmp/amc-one-output --models whisper,qwen,cohere,granite
-python3 -m amc_pipeline.cli run-stage normalize --input /tmp/amc-one --output /tmp/amc-one-output
-python3 -m amc_pipeline.cli run-stage consensus --input /tmp/amc-one --output /tmp/amc-one-output
-python3 -m amc_pipeline.cli run-stage pii --input /tmp/amc-one --output /tmp/amc-one-output --detectors regex,gliner,piiranha,spacy,rule_name,saved_json
-python3 -m amc_pipeline.cli run-stage align --input /tmp/amc-one --output /tmp/amc-one-output
-python3 -m amc_pipeline.cli run-stage mask-plan --input /tmp/amc-one --output /tmp/amc-one-output
-python3 -m amc_pipeline.cli run-stage redact --input /tmp/amc-one --output /tmp/amc-one-output --mask-strategy beep --allow-fallback-format wav
-python3 -m amc_pipeline.cli run-stage validate --input /tmp/amc-one --output /tmp/amc-one-output
-python3 -m amc_pipeline.cli run-stage manifest --input /tmp/amc-one --output /tmp/amc-one-output
+python3.10 -m amc_pipeline.cli dry-run --input /tmp/amc-one --output /tmp/amc-one-output
+python3.10 -m amc_pipeline.cli run-stage preprocess --input /tmp/amc-one --output /tmp/amc-one-output
+python3.10 -m amc_pipeline.cli run-stage asr --input /tmp/amc-one --output /tmp/amc-one-output --models whisper,qwen,cohere,granite
+python3.10 -m amc_pipeline.cli run-stage normalize --input /tmp/amc-one --output /tmp/amc-one-output
+python3.10 -m amc_pipeline.cli run-stage consensus --input /tmp/amc-one --output /tmp/amc-one-output
+python3.10 -m amc_pipeline.cli run-stage pii --input /tmp/amc-one --output /tmp/amc-one-output --detectors regex,gliner,piiranha,spacy,rule_name,saved_json
+python3.10 -m amc_pipeline.cli run-stage align --input /tmp/amc-one --output /tmp/amc-one-output
+python3.10 -m amc_pipeline.cli run-stage mask-plan --input /tmp/amc-one --output /tmp/amc-one-output
+python3.10 -m amc_pipeline.cli run-stage redact --input /tmp/amc-one --output /tmp/amc-one-output --mask-strategy beep --allow-fallback-format wav
+python3.10 -m amc_pipeline.cli run-stage validate --input /tmp/amc-one --output /tmp/amc-one-output
+python3.10 -m amc_pipeline.cli run-stage manifest --input /tmp/amc-one --output /tmp/amc-one-output
 ```
 
 Progress bars are enabled by default. Add `--no-progress` to any command if you
@@ -39,7 +46,7 @@ and manifests are under `/tmp/amc-one-output/manifests/`.
 ## Full Run
 
 ```bash
-python3 -m amc_pipeline.cli run \
+python3.10 -m amc_pipeline.cli run \
   --input /mnt/amc-data \
   --output /mnt/amc-redacted \
   --models whisper,qwen,cohere,granite \

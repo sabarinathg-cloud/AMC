@@ -11,7 +11,7 @@ Build a production-grade, local-first audio PII redaction and ASR training data 
 - `/Users/gsabarinath/amc/training_2026_full_optimized_complete(1)(1).py`
 - `/Users/gsabarinath/amc/pii.py`
 
-The new implementation will be a clean Python 3.11 package and CLI. The experimental notebooks/scripts remain untouched and serve as references for model integrations and current logic.
+The new implementation will be a clean Python 3.10.12 package and CLI. The experimental notebooks/scripts remain untouched and serve as references for model integrations and current logic.
 
 The pipeline has two first-class outputs from day one:
 
