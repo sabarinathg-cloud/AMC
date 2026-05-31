@@ -30,6 +30,28 @@ from amc_pipeline.state import SQLiteStateStore
 from amc_pipeline.models import dataclass_to_dict
 
 
+class FailingASRAdapter:
+    name = "qwen"
+    progress_enabled = False
+
+    def preflight(self):
+        return None
+
+    def transcribe_batch(self, segments):
+        raise RuntimeError("model boom")
+
+
+class StaticASRAdapter:
+    name = "granite"
+    progress_enabled = False
+
+    def preflight(self):
+        return None
+
+    def transcribe_batch(self, segments):
+        return [ASRResult(s.segment_id, self.name, "safe transcript", 0.9, s.language or "en") for s in segments]
+
+
 def write_stereo_wav(path: Path, sample_rate: int = 16000, seconds: float = 1.0) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     nframes = int(sample_rate * seconds)
@@ -304,6 +326,28 @@ class CorePipelineTests(unittest.TestCase):
             final_audio = out / "2022" / "call123" / "audio.wav"
             self.assertTrue(final_audio.exists())
             self.assertEqual(source.read_bytes(), final_audio.read_bytes())
+
+    def test_asr_model_failure_is_recorded_without_stopping_other_models(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "input"
+            out = Path(td) / "out"
+            write_stereo_wav(root / "2022" / "call123" / "audio.wav")
+            config = PipelineConfig(input_root=root, output_root=out)
+            config.audio.vad_backend = "energy"
+            config.progress_enabled = False
+            pipeline = Pipeline(config)
+            pipeline.preprocess()
+
+            with patch("amc_pipeline.pipeline.build_enabled_adapters", return_value=[FailingASRAdapter(), StaticASRAdapter()]):
+                summary = pipeline.asr()
+
+            self.assertEqual(summary["models"]["qwen"], 2)
+            self.assertEqual(summary["models"]["granite"], 2)
+            self.assertEqual(summary["model_failures"][0]["model"], "qwen")
+            rows = pipeline.state.fetch_model_results()
+            statuses = {(row["model_name"], row["status"]) for row in rows}
+            self.assertIn(("qwen", "failed"), statuses)
+            self.assertIn(("granite", "transcribed"), statuses)
 
     def test_manifest_stage_includes_transcripts_pii_and_redacted_paths(self):
         with tempfile.TemporaryDirectory() as td:

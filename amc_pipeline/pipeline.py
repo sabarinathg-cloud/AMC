@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import traceback
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -22,7 +23,7 @@ from .progress import iter_progress
 from .resources import detect_resources
 from .segmentation import preflight_vad_backend
 from .state import PostgresStateStore, SQLiteStateStore
-from .transcription import build_enabled_adapters, preflight_adapters
+from .transcription import build_enabled_adapters
 from .validation import validate_audio_pair
 
 
@@ -158,8 +159,8 @@ class Pipeline:
     def asr(self) -> dict[str, Any]:
         segments = self._load_segments()
         adapters = build_enabled_adapters(self.config)
-        preflight_adapters(adapters)
         counts: dict[str, int] = {}
+        failed_models: list[dict[str, Any]] = []
         supported = {x.lower() for x in self.config.languages}
         language_by_segment: dict[str, str | None] = {}
         language_confidence_by_segment: dict[str, float | None] = {}
@@ -179,7 +180,26 @@ class Pipeline:
                     for s in segments
                     if (language_by_segment.get(s.segment_id) or "").lower() in supported
                 ]
-            results = adapter.transcribe_batch(model_segments)
+            try:
+                adapter.preflight()
+                results = adapter.transcribe_batch(model_segments)
+            except Exception as exc:
+                tb = traceback.format_exc()
+                failed_models.append({"model": adapter.name, "error": repr(exc), "segments": len(model_segments)})
+                self.state.record_failure(f"asr:{adapter.name}", "model", adapter.name, repr(exc), retryable=True, traceback=tb)
+                results = [
+                    ASRResult(
+                        segment_id=s.segment_id,
+                        model_name=adapter.name,
+                        transcript="",
+                        confidence=0.0,
+                        language=s.language,
+                        language_confidence=s.language_confidence,
+                        error=repr(exc),
+                        raw={"model_stage_failure": True},
+                    )
+                    for s in model_segments
+                ]
             counts[adapter.name] = len(results)
             for result in results:
                 if adapter.name == "whisper":
@@ -199,7 +219,7 @@ class Pipeline:
                 payload["language"] = lang
                 payload["status_reason"] = "unsupported_language"
                 self.state.upsert_segment(segment.segment_id, segment.file_id, "skipped_unsupported_language", payload)
-        summary = {"stage": "asr", "segments": len(segments), "models": counts, "skipped_unsupported_language": skipped}
+        summary = {"stage": "asr", "segments": len(segments), "models": counts, "model_failures": failed_models, "skipped_unsupported_language": skipped}
         self._write_report("asr_summary.json", summary)
         return summary
 
