@@ -1,0 +1,12 @@
+[project]
+name = "amc-pipeline"
+version = "0.1.0"
+description = "Resumable audio PII redaction and ASR training artifact pipeline"
+requires-python = ">=3.11"
+dependencies = ["tqdm>=4.66"]
+
+[project.scripts]
+amc-pipeline = "amc_pipeline.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

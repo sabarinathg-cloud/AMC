@@ -1,0 +1,26 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local experiment artifacts and large notebooks
+*.ipynb
+
+# Runtime outputs, state, caches, and audio data
+amc_output/
+output/
+outputs/
+*.sqlite3
+.pii_pipeline/
+manifests/
+segments/
+
+# Local environments and model/data mounts
+.venv/
+venv/
+env/
+models/
+data/
+mnt/
