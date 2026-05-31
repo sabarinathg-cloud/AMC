@@ -13,7 +13,7 @@ from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
-from amc_pipeline.alignment import TokenUniformAligner, _alignment_units_from_whisperx
+from amc_pipeline.alignment import TokenUniformAligner, _alignment_units_from_whisperx, _digit_expanded_alignment_text
 from amc_pipeline.audio import decode_to_wav
 from amc_pipeline.cli import build_parser, load_cli_config
 from amc_pipeline.config import PipelineConfig
@@ -305,6 +305,51 @@ class CorePipelineTests(unittest.TestCase):
         self.assertLess(intervals[0].start_sec, 9.55)
         self.assertGreater(intervals[0].end_sec, 13.20)
         self.assertLess(intervals[0].end_sec, 13.60)
+
+    def test_digit_expanded_alignment_maps_spoken_phone_digits_to_original_span(self):
+        transcript = "Could you please give me a call at 212-537-0830? Thank you."
+        start = transcript.index("212")
+        phone = "212-537-0830"
+        alignment_text, source_to_original = _digit_expanded_alignment_text(transcript)
+        digit_positions = [start + idx for idx, char in enumerate(phone) if char.isdigit()]
+        digit_times = {pos: 9.55 + idx * 0.42 for idx, pos in enumerate(digit_positions)}
+        chars = []
+        for pos, char in enumerate(alignment_text):
+            orig = source_to_original[pos]
+            if orig is None or char.isspace():
+                continue
+            if orig in digit_times:
+                t = digit_times[orig]
+                chars.append({"char": char, "start": t, "end": t + 0.18})
+            elif orig > start + len(phone):
+                t = 14.20 + pos * 0.01
+                chars.append({"char": char, "start": t, "end": t + 0.01})
+            else:
+                t = pos * 0.02
+                chars.append({"char": char, "start": t, "end": t + 0.01})
+        aligned = {"segments": [{"chars": chars}]}
+        span = PIISpan("PHONE", phone, start, start + len(phone), 0.99, "regex")
+
+        units = _alignment_units_from_whisperx(
+            transcript,
+            aligned,
+            alignment_text=alignment_text,
+            source_to_original=source_to_original,
+        )
+        intervals = TokenUniformAligner().spans_to_intervals([span], transcript, units, channel=1)
+
+        self.assertIn("two one two", alignment_text)
+        self.assertGreater(intervals[0].end_sec, digit_times[digit_positions[-1]] + 0.20)
+        self.assertLess(intervals[0].end_sec, 14.10)
+
+    def test_digit_expanded_alignment_uses_spanish_digit_words(self):
+        transcript = "Llame al 212-537-0830 gracias."
+
+        alignment_text, source_to_original = _digit_expanded_alignment_text(transcript, language="es")
+
+        self.assertIn("dos uno dos", alignment_text)
+        self.assertNotIn("two one two", alignment_text)
+        self.assertEqual(len(alignment_text), len(source_to_original))
 
     def test_partial_numeric_pii_span_expands_to_full_phone_context(self):
         transcript = "Could you call me at 212-537-0830 today?"

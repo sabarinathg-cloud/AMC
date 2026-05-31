@@ -7,6 +7,35 @@ from pathlib import Path
 from .models import AlignmentWord, MaskInterval, PIISpan, SegmentRecord
 
 
+_DIGIT_WORDS_BY_LANGUAGE = {
+    "en": {
+        "0": "zero",
+        "1": "one",
+        "2": "two",
+        "3": "three",
+        "4": "four",
+        "5": "five",
+        "6": "six",
+        "7": "seven",
+        "8": "eight",
+        "9": "nine",
+    },
+    "es": {
+        "0": "cero",
+        "1": "uno",
+        "2": "dos",
+        "3": "tres",
+        "4": "cuatro",
+        "5": "cinco",
+        "6": "seis",
+        "7": "siete",
+        "8": "ocho",
+        "9": "nueve",
+    },
+}
+_NUMERIC_SEPARATORS = set(" +-()./#")
+
+
 class RequiredAlignmentError(RuntimeError):
     pass
 
@@ -78,36 +107,111 @@ class WhisperXAligner:
         device = "cuda" if self.device == "auto" and torch.cuda.is_available() else "cpu" if self.device == "auto" else self.device
         audio = whisperx.load_audio(str(segment.segment_audio_path))
         model, metadata = whisperx.load_align_model(language_code=language, device=device)
+        alignment_text, source_to_original = _digit_expanded_alignment_text(transcript, language=language)
         aligned = whisperx.align(
-            [{"start": 0.0, "end": segment.duration_sec, "text": transcript}],
+            [{"start": 0.0, "end": segment.duration_sec, "text": alignment_text}],
             model,
             metadata,
             audio,
             device,
             return_char_alignments=True,
         )
-        units = _alignment_units_from_whisperx(transcript, aligned)
+        units = _alignment_units_from_whisperx(
+            transcript,
+            aligned,
+            alignment_text=alignment_text,
+            source_to_original=source_to_original,
+        )
         if not units:
             raise RequiredAlignmentError(f"WhisperX returned no usable alignments for {segment.segment_id}")
         return units
 
 
-def _alignment_units_from_whisperx(transcript: str, aligned: dict) -> list[AlignmentWord]:
+def _digit_expanded_alignment_text(transcript: str, language: str | None = None) -> tuple[str, list[int | None]]:
+    text = str(transcript or "")
+    digit_words = _digit_words_for_language(language)
+    out: list[str] = []
+    source_to_original: list[int | None] = []
+    for idx, char in enumerate(text):
+        if char.isdigit():
+            _append_alignment_space(out, source_to_original)
+            for letter in digit_words[char]:
+                out.append(letter)
+                source_to_original.append(idx)
+            _append_alignment_space(out, source_to_original)
+        elif _is_digit_run_separator(text, idx):
+            _append_alignment_space(out, source_to_original)
+        else:
+            out.append(char)
+            source_to_original.append(idx)
+    return "".join(out).strip(), _trim_alignment_map(out, source_to_original)
+
+
+def _digit_words_for_language(language: str | None) -> dict[str, str]:
+    key = str(language or "en").lower().replace("_", "-").split("-", 1)[0]
+    return _DIGIT_WORDS_BY_LANGUAGE.get(key, _DIGIT_WORDS_BY_LANGUAGE["en"])
+
+
+def _append_alignment_space(out: list[str], source_to_original: list[int | None]) -> None:
+    if out and not out[-1].isspace():
+        out.append(" ")
+        source_to_original.append(None)
+
+
+def _trim_alignment_map(out: list[str], source_to_original: list[int | None]) -> list[int | None]:
+    start = 0
+    end = len(out)
+    while start < end and out[start].isspace():
+        start += 1
+    while end > start and out[end - 1].isspace():
+        end -= 1
+    return source_to_original[start:end]
+
+
+def _is_digit_run_separator(text: str, idx: int) -> bool:
+    char = text[idx]
+    if char not in _NUMERIC_SEPARATORS:
+        return False
+    left = idx - 1
+    while left >= 0 and text[left] in _NUMERIC_SEPARATORS:
+        left -= 1
+    right = idx + 1
+    while right < len(text) and text[right] in _NUMERIC_SEPARATORS:
+        right += 1
+    return left >= 0 and right < len(text) and text[left].isdigit() and text[right].isdigit()
+
+
+def _alignment_units_from_whisperx(
+    transcript: str,
+    aligned: dict,
+    alignment_text: str | None = None,
+    source_to_original: list[int | None] | None = None,
+) -> list[AlignmentWord]:
+    source_text = alignment_text if alignment_text is not None else transcript
+    char_map = source_to_original if source_to_original is not None else list(range(len(source_text)))
     raw_chars = []
     for item in aligned.get("segments", []):
         raw_chars.extend(item.get("chars", []) or [])
-    char_units = _chars_with_char_spans(transcript, raw_chars)
+    char_units = _chars_with_char_spans(source_text, raw_chars, original_text=transcript, source_to_original=char_map)
     if char_units:
         return char_units
     raw_words = aligned.get("word_segments") or []
     if not raw_words:
         for item in aligned.get("segments", []):
             raw_words.extend(item.get("words", []) or [])
-    return _words_with_char_spans(transcript, raw_words)
+    return _words_with_char_spans(source_text, raw_words, original_text=transcript, source_to_original=char_map)
 
 
-def _chars_with_char_spans(transcript: str, raw_chars: list[dict]) -> list[AlignmentWord]:
-    out: list[AlignmentWord] = []
+def _chars_with_char_spans(
+    transcript: str,
+    raw_chars: list[dict],
+    original_text: str | None = None,
+    source_to_original: list[int | None] | None = None,
+) -> list[AlignmentWord]:
+    original_text = transcript if original_text is None else original_text
+    source_to_original = source_to_original if source_to_original is not None else list(range(len(transcript)))
+    grouped: dict[tuple[int, int], dict[str, float | int | str]] = {}
+    order: list[tuple[int, int]] = []
     cursor = 0
     for raw in raw_chars:
         token = str(raw.get("char", raw.get("word", "")))
@@ -117,20 +221,34 @@ def _chars_with_char_spans(transcript: str, raw_chars: list[dict]) -> list[Align
         if found is None:
             continue
         cursor = found + len(token)
-        out.append(
-            AlignmentWord(
-                word=token,
-                start_char=found,
-                end_char=found + len(token),
-                start_sec=float(raw["start"]),
-                end_sec=float(raw["end"]),
-                confidence=float(raw.get("score", 1.0) or 1.0),
-            )
-        )
-    return out
+        mapped = _source_span_to_original_span(found, found + len(token), source_to_original)
+        if mapped is None:
+            continue
+        if mapped not in grouped:
+            order.append(mapped)
+            grouped[mapped] = {
+                "word": original_text[mapped[0] : mapped[1]],
+                "start_char": mapped[0],
+                "end_char": mapped[1],
+                "start_sec": float(raw["start"]),
+                "end_sec": float(raw["end"]),
+                "confidence": float(raw.get("score", 1.0) or 1.0),
+            }
+        else:
+            grouped[mapped]["start_sec"] = min(float(grouped[mapped]["start_sec"]), float(raw["start"]))
+            grouped[mapped]["end_sec"] = max(float(grouped[mapped]["end_sec"]), float(raw["end"]))
+            grouped[mapped]["confidence"] = max(float(grouped[mapped]["confidence"]), float(raw.get("score", 1.0) or 1.0))
+    return [AlignmentWord(**grouped[key]) for key in order]
 
 
-def _words_with_char_spans(transcript: str, raw_words: list[dict]) -> list[AlignmentWord]:
+def _words_with_char_spans(
+    transcript: str,
+    raw_words: list[dict],
+    original_text: str | None = None,
+    source_to_original: list[int | None] | None = None,
+) -> list[AlignmentWord]:
+    original_text = transcript if original_text is None else original_text
+    source_to_original = source_to_original if source_to_original is not None else list(range(len(transcript)))
     out: list[AlignmentWord] = []
     cursor = 0
     for raw in raw_words:
@@ -146,9 +264,13 @@ def _words_with_char_spans(transcript: str, raw_words: list[dict]) -> list[Align
             start_char = cursor
             end_char = min(len(transcript), cursor + len(token))
             cursor = end_char
+        mapped = _source_span_to_original_span(start_char, end_char, source_to_original)
+        if mapped is None:
+            continue
+        start_char, end_char = mapped
         out.append(
             AlignmentWord(
-                word=token,
+                word=original_text[start_char:end_char],
                 start_char=start_char,
                 end_char=end_char,
                 start_sec=float(raw["start"]),
@@ -157,6 +279,13 @@ def _words_with_char_spans(transcript: str, raw_words: list[dict]) -> list[Align
             )
         )
     return out
+
+
+def _source_span_to_original_span(start: int, end: int, source_to_original: list[int | None]) -> tuple[int, int] | None:
+    mapped = [source_to_original[idx] for idx in range(max(0, start), min(end, len(source_to_original))) if source_to_original[idx] is not None]
+    if not mapped:
+        return None
+    return min(mapped), max(mapped) + 1
 
 
 def _find_char_position(transcript: str, token: str, cursor: int) -> int | None:
