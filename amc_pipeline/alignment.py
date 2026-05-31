@@ -143,10 +143,12 @@ def _conservative_pii_end(span: PIISpan, words: list[AlignmentWord], overlapping
     if not _needs_high_recall_numeric_mask(span):
         return end
     coverage = _span_char_coverage(span, overlapping)
-    if coverage >= 0.85:
-        return end
     first_start = overlapping[0].start_sec
-    estimated_end = first_start + _estimated_numeric_duration(span.text)
+    current_duration = max(0.0, end - first_start)
+    estimated_duration = _estimated_numeric_duration(span.text)
+    if coverage >= 0.85 and current_duration >= estimated_duration * 0.65:
+        return end
+    estimated_end = first_start + estimated_duration
     next_words = [w for w in words if w.start_char >= span.end_char and w.start_sec >= end]
     if next_words:
         estimated_end = max(estimated_end, next_words[0].start_sec)

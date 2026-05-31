@@ -260,6 +260,25 @@ class CorePipelineTests(unittest.TestCase):
         self.assertEqual(intervals[0].channel, 1)
         self.assertGreater(intervals[0].end_sec, 3.5)
 
+    def test_phone_mask_expands_when_full_token_time_is_too_short(self):
+        transcript = "Could you call me at 212-537-0830 thank you"
+        start = transcript.index("212")
+        span = PIISpan("PHONE", "212-537-0830", start, start + len("212-537-0830"), 0.99, "regex")
+        words = [
+            AlignmentWord("Could", 0, 5, 0.0, 0.30),
+            AlignmentWord("you", 6, 9, 0.31, 0.48),
+            AlignmentWord("call", 10, 14, 0.49, 0.76),
+            AlignmentWord("me", 15, 17, 0.77, 0.90),
+            AlignmentWord("at", 18, 20, 0.91, 1.02),
+            AlignmentWord("212-537-0830", start, start + len("212-537-0830"), 1.10, 1.30),
+            AlignmentWord("thank", 34, 39, 4.15, 4.45),
+            AlignmentWord("you", 40, 43, 4.46, 4.70),
+        ]
+
+        intervals = TokenUniformAligner().spans_to_intervals([span], transcript, words, channel=1)
+
+        self.assertGreater(intervals[0].end_sec, 4.0)
+
     def test_partial_numeric_pii_span_expands_to_full_phone_context(self):
         transcript = "Could you call me at 212-537-0830 today?"
         start = transcript.index("212")
