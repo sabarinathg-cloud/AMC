@@ -28,6 +28,7 @@ from amc_pipeline.pipeline import Pipeline
 from amc_pipeline.preprocessing import preprocess_file
 from amc_pipeline.segmentation import split_chunks_on_pauses
 from amc_pipeline.state import SQLiteStateStore
+from amc_pipeline.transcription import _make_check_model_inputs_compat
 from amc_pipeline.models import dataclass_to_dict
 
 
@@ -386,6 +387,22 @@ class CorePipelineTests(unittest.TestCase):
             self.assertEqual(cfg.asr_models["cohere"].batch_size, 2)
             self.assertEqual(cfg.asr_models["granite"].batch_size, 3)
             self.assertFalse(cfg.asr_models["whisper"].enabled)
+
+    def test_qwen_check_model_inputs_compat_accepts_decorator_factory_call(self):
+        calls = []
+
+        def original(func):
+            calls.append(func.__name__)
+            return func
+
+        compat = _make_check_model_inputs_compat(original)
+
+        @compat()
+        def forward():
+            return "ok"
+
+        self.assertEqual(forward(), "ok")
+        self.assertEqual(calls, ["forward"])
 
     def test_manifest_stage_includes_transcripts_pii_and_redacted_paths(self):
         with tempfile.TemporaryDirectory() as td:

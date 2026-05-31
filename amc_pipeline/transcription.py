@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import gc
+import inspect
 import math
 import os
 import warnings
@@ -133,6 +134,8 @@ class QwenAdapter(ASRAdapter):
         if self._model is None:
             _configure_quiet_transformers()
             import torch  # type: ignore
+
+            _patch_transformers_check_model_inputs_for_qwen()
             from qwen_asr import Qwen3ASRModel  # type: ignore
 
             _configure_torch_for_inference(torch)
@@ -458,6 +461,40 @@ def _configure_quiet_transformers() -> None:
         hf_logging.set_verbosity_error()
     except Exception:
         pass
+
+
+def _patch_transformers_check_model_inputs_for_qwen() -> bool:
+    try:
+        from transformers.utils import generic  # type: ignore
+    except Exception:
+        return False
+    original = getattr(generic, "check_model_inputs", None)
+    if original is None or getattr(original, "_amc_qwen_compat", False):
+        return False
+    try:
+        signature = inspect.signature(original)
+        params = list(signature.parameters.values())
+        needs_func = bool(params) and params[0].default is inspect.Signature.empty
+    except Exception:
+        needs_func = False
+    if not needs_func:
+        return False
+    compat = _make_check_model_inputs_compat(original)
+    setattr(generic, "check_model_inputs", compat)
+    return True
+
+
+def _make_check_model_inputs_compat(original):
+    def compat(func=None, *args, **kwargs):
+        if func is None:
+            def decorator(real_func):
+                return original(real_func, *args, **kwargs)
+
+            return decorator
+        return original(func, *args, **kwargs)
+
+    compat._amc_qwen_compat = True  # type: ignore[attr-defined]
+    return compat
 
 
 def _configure_torch_for_inference(torch) -> None:
