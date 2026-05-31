@@ -97,11 +97,12 @@ def decode_to_wav(source: Path, target_wav: Path, sample_rate: int | None = None
         return source
     if not shutil.which("ffmpeg"):
         raise MissingDependencyError("FFmpeg is required to decode non-WAV audio")
+    target_wav.parent.mkdir(parents=True, exist_ok=True)
     cmd = ["ffmpeg", "-y", "-i", str(source)]
     if sample_rate:
         cmd += ["-ar", str(sample_rate)]
     cmd += [str(target_wav)]
-    subprocess.run(cmd, check=True, text=True, capture_output=True)
+    _run_ffmpeg(cmd)
     return target_wav
 
 
@@ -117,7 +118,7 @@ def encode_from_wav(wav_path: Path, target_path: Path, source_path: Path | None 
     if source_path is not None:
         cmd += ["-map_metadata", "0"]
     cmd += [str(target_path)]
-    subprocess.run(cmd, check=True, text=True, capture_output=True)
+    _run_ffmpeg(cmd)
     return target_path
 
 
@@ -126,3 +127,13 @@ def temp_wav_path(prefix: str = "amc") -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
 
+
+def _run_ffmpeg(cmd: list[str]) -> None:
+    try:
+        subprocess.run(cmd, check=True, text=True, capture_output=True)
+    except subprocess.CalledProcessError as exc:
+        details = (exc.stderr or exc.stdout or "").strip()
+        if len(details) > 4000:
+            details = details[-4000:]
+        joined = " ".join(cmd)
+        raise RuntimeError(f"FFmpeg failed with exit code {exc.returncode}: {joined}\n{details}") from exc

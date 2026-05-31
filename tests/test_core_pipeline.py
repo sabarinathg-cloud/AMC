@@ -11,8 +11,10 @@ import unittest
 import wave
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 
 from amc_pipeline.alignment import TokenUniformAligner
+from amc_pipeline.audio import decode_to_wav
 from amc_pipeline.config import PipelineConfig
 from amc_pipeline.consensus import build_consensus
 from amc_pipeline.discovery import discover_audio_files
@@ -103,6 +105,20 @@ class CorePipelineTests(unittest.TestCase):
                 self.assertEqual(sr, 16000)
                 self.assertEqual(channels, 1)
                 self.assertEqual(len(rows), segment.duration_samples)
+
+    def test_decode_to_wav_creates_nested_cache_parent(self):
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / "input.opus"
+            source.write_bytes(b"fake")
+            target = Path(td) / "cache" / "preprocess" / "file1" / "decoded.wav"
+
+            with patch("amc_pipeline.audio.shutil.which", return_value="/usr/bin/ffmpeg"), patch("amc_pipeline.audio.subprocess.run") as run:
+                result = decode_to_wav(source, target, sample_rate=16000)
+
+            self.assertEqual(result, target)
+            self.assertTrue(target.parent.exists())
+            run.assert_called_once()
+            self.assertEqual(run.call_args.args[0][-1], str(target))
 
     def test_segmentation_prefers_pause_split_near_target(self):
         intervals = [(0.0, 4.0), (4.6, 9.0), (9.6, 14.0)]
