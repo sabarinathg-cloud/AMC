@@ -41,15 +41,15 @@ asr_models:
   qwen:
     enabled: true
     path: /mnt/amc-data/pipeline/models/qwen3-asr-1.7b
-    batch_size: 64
+    batch_size: 8
   cohere:
     enabled: true
     path: /mnt/amc-data/pipeline/models/cohere-transcribe-03-2026
-    batch_size: 128
+    batch_size: 4
   granite:
     enabled: true
     path: /mnt/amc-data/pipeline/models/granite-4.0-1b-speech
-    batch_size: 128
+    batch_size: 4
 
 pii_models:
   regex:

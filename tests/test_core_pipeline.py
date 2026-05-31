@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 from amc_pipeline.alignment import TokenUniformAligner
 from amc_pipeline.audio import decode_to_wav
+from amc_pipeline.cli import build_parser, load_cli_config
 from amc_pipeline.config import PipelineConfig
 from amc_pipeline.consensus import build_consensus
 from amc_pipeline.discovery import discover_audio_files
@@ -33,6 +34,7 @@ from amc_pipeline.models import dataclass_to_dict
 class FailingASRAdapter:
     name = "qwen"
     progress_enabled = False
+    closed = False
 
     def preflight(self):
         return None
@@ -40,16 +42,23 @@ class FailingASRAdapter:
     def transcribe_batch(self, segments):
         raise RuntimeError("model boom")
 
+    def close(self):
+        type(self).closed = True
+
 
 class StaticASRAdapter:
     name = "granite"
     progress_enabled = False
+    closed = False
 
     def preflight(self):
         return None
 
     def transcribe_batch(self, segments):
         return [ASRResult(s.segment_id, self.name, "safe transcript", 0.9, s.language or "en") for s in segments]
+
+    def close(self):
+        type(self).closed = True
 
 
 def write_stereo_wav(path: Path, sample_rate: int = 16000, seconds: float = 1.0) -> None:
@@ -329,6 +338,8 @@ class CorePipelineTests(unittest.TestCase):
 
     def test_asr_model_failure_is_recorded_without_stopping_other_models(self):
         with tempfile.TemporaryDirectory() as td:
+            FailingASRAdapter.closed = False
+            StaticASRAdapter.closed = False
             root = Path(td) / "input"
             out = Path(td) / "out"
             write_stereo_wav(root / "2022" / "call123" / "audio.wav")
@@ -348,6 +359,33 @@ class CorePipelineTests(unittest.TestCase):
             statuses = {(row["model_name"], row["status"]) for row in rows}
             self.assertIn(("qwen", "failed"), statuses)
             self.assertIn(("granite", "transcribed"), statuses)
+            self.assertTrue(FailingASRAdapter.closed)
+            self.assertTrue(StaticASRAdapter.closed)
+
+    def test_cli_can_override_asr_batch_sizes(self):
+        with tempfile.TemporaryDirectory() as td:
+            parser = build_parser()
+            args = parser.parse_args(
+                [
+                    "run-stage",
+                    "asr",
+                    "--input",
+                    str(Path(td) / "in"),
+                    "--output",
+                    str(Path(td) / "out"),
+                    "--models",
+                    "qwen,cohere,granite",
+                    "--asr-batch-sizes",
+                    "qwen=1,cohere=2,granite=3",
+                ]
+            )
+
+            cfg = load_cli_config(args)
+
+            self.assertEqual(cfg.asr_models["qwen"].batch_size, 1)
+            self.assertEqual(cfg.asr_models["cohere"].batch_size, 2)
+            self.assertEqual(cfg.asr_models["granite"].batch_size, 3)
+            self.assertFalse(cfg.asr_models["whisper"].enabled)
 
     def test_manifest_stage_includes_transcripts_pii_and_redacted_paths(self):
         with tempfile.TemporaryDirectory() as td:

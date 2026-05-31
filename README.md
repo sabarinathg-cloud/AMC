@@ -39,6 +39,16 @@ python3.10 -m amc_pipeline.cli run-stage manifest --input /tmp/amc-one --output 
 Progress bars are enabled by default. Add `--no-progress` to any command if you
 want quiet logs.
 
+If the OS kills a heavy ASR run, lower batch sizes or run one model at a time:
+
+```bash
+python3.10 -m amc_pipeline.cli run-stage asr \
+  --input /tmp/amc-one \
+  --output /tmp/amc-one-output \
+  --models qwen,cohere,granite \
+  --asr-batch-sizes qwen=1,cohere=1,granite=1
+```
+
 The final redacted audio mirrors the input structure under `/tmp/amc-one-output`.
 Training segments and transcripts are under `/tmp/amc-one-output/<year>/segments/`
 and manifests are under `/tmp/amc-one-output/manifests/`.

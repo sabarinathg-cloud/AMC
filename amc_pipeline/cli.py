@@ -31,6 +31,7 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--input", type=Path, default=None)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--models", default=None, help="Comma-separated ASR models, for example: whisper,qwen,cohere,granite")
+    parser.add_argument("--asr-batch-sizes", default=None, help="Comma-separated ASR batch overrides, for example: qwen=1,cohere=1,granite=1")
     parser.add_argument("--detectors", default=None, help="Comma-separated PII detectors")
     parser.add_argument("--vad-backend", choices=["silero", "energy"], default=None)
     parser.add_argument("--mask-strategy", choices=["beep", "silence", "noise"], default=None)
@@ -49,6 +50,8 @@ def load_cli_config(args: argparse.Namespace) -> PipelineConfig:
         wanted = {x.strip() for x in args.models.split(",") if x.strip()}
         for name, model_cfg in cfg.asr_models.items():
             model_cfg.enabled = name in wanted
+    if getattr(args, "asr_batch_sizes", None):
+        _apply_asr_batch_sizes(cfg, args.asr_batch_sizes)
     if getattr(args, "detectors", None):
         wanted = {x.strip() for x in args.detectors.split(",") if x.strip()}
         for name, detector_cfg in cfg.pii_models.items():
@@ -62,6 +65,20 @@ def load_cli_config(args: argparse.Namespace) -> PipelineConfig:
     if getattr(args, "no_progress", False):
         cfg.progress_enabled = False
     return cfg
+
+
+def _apply_asr_batch_sizes(cfg: PipelineConfig, raw: str) -> None:
+    for item in [x.strip() for x in raw.split(",") if x.strip()]:
+        name, sep, value = item.partition("=")
+        if not sep:
+            batch_size = int(name)
+            for model_cfg in cfg.asr_models.values():
+                model_cfg.batch_size = batch_size
+            continue
+        model_name = name.strip()
+        if model_name not in cfg.asr_models:
+            raise ValueError(f"Unknown ASR model in --asr-batch-sizes: {model_name}")
+        cfg.asr_models[model_name].batch_size = int(value.strip())
 
 
 def main(argv: list[str] | None = None) -> int:

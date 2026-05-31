@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import gc
 import math
 import os
 import warnings
@@ -23,6 +24,13 @@ class ASRAdapter:
 
     def transcribe_batch(self, segments: list[SegmentRecord]) -> list[ASRResult]:
         raise NotImplementedError
+
+    def close(self) -> None:
+        torch = getattr(self, "_torch", None)
+        for attr in ["_model", "_processor", "_tokenizer", "_prompt"]:
+            if hasattr(self, attr):
+                setattr(self, attr, None)
+        _release_model_memory(torch)
 
 
 class FixtureASRAdapter(ASRAdapter):
@@ -109,9 +117,9 @@ class WhisperAdapter(ASRAdapter):
 class QwenAdapter(ASRAdapter):
     name = "qwen"
 
-    def __init__(self, model_path: str, batch_size: int = 64, device: str = "auto"):
+    def __init__(self, model_path: str, batch_size: int = 8, device: str = "auto"):
         self.model_path = Path(model_path)
-        self.batch_size = max(1, int(batch_size or 64))
+        self.batch_size = max(1, int(batch_size or 8))
         self.device = device
         self._model = None
         self._torch = None
@@ -191,9 +199,9 @@ class QwenAdapter(ASRAdapter):
 class CohereAdapter(ASRAdapter):
     name = "cohere"
 
-    def __init__(self, model_path: str, batch_size: int = 128, device: str = "auto"):
+    def __init__(self, model_path: str, batch_size: int = 4, device: str = "auto"):
         self.model_path = Path(model_path)
-        self.batch_size = max(1, int(batch_size or 128))
+        self.batch_size = max(1, int(batch_size or 4))
         self.device = device
         self._processor = None
         self._model = None
@@ -303,9 +311,9 @@ class CohereAdapter(ASRAdapter):
 class GraniteAdapter(ASRAdapter):
     name = "granite"
 
-    def __init__(self, model_path: str, batch_size: int = 128, device: str = "auto"):
+    def __init__(self, model_path: str, batch_size: int = 4, device: str = "auto"):
         self.model_path = Path(model_path)
-        self.batch_size = max(1, int(batch_size or 128))
+        self.batch_size = max(1, int(batch_size or 4))
         self.device = device
         self._processor = None
         self._model = None
@@ -468,6 +476,18 @@ def _clear_cuda(torch) -> None:
             torch.cuda.ipc_collect()
     except Exception:
         pass
+
+
+def _release_model_memory(torch) -> None:
+    gc.collect()
+    try:
+        if torch is not None and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        pass
+    gc.collect()
 
 
 def _wants_cuda(device: str, torch) -> bool:

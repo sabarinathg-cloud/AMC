@@ -169,47 +169,52 @@ class Pipeline:
         for adapter in adapters:
             adapter.progress_enabled = self.config.progress_enabled
         for adapter in iter_progress(adapters, desc="ASR models", total=len(adapters), unit="model", enabled=self.config.progress_enabled):
-            model_segments = segments
-            if adapter.name != "whisper" and language_by_segment:
-                model_segments = [
-                    replace(
-                        s,
-                        language=language_by_segment.get(s.segment_id),
-                        language_confidence=language_confidence_by_segment.get(s.segment_id),
-                    )
-                    for s in segments
-                    if (language_by_segment.get(s.segment_id) or "").lower() in supported
-                ]
             try:
-                adapter.preflight()
-                results = adapter.transcribe_batch(model_segments)
-            except Exception as exc:
-                tb = traceback.format_exc()
-                failed_models.append({"model": adapter.name, "error": repr(exc), "segments": len(model_segments)})
-                self.state.record_failure(f"asr:{adapter.name}", "model", adapter.name, repr(exc), retryable=True, traceback=tb)
-                results = [
-                    ASRResult(
-                        segment_id=s.segment_id,
-                        model_name=adapter.name,
-                        transcript="",
-                        confidence=0.0,
-                        language=s.language,
-                        language_confidence=s.language_confidence,
-                        error=repr(exc),
-                        raw={"model_stage_failure": True},
-                    )
-                    for s in model_segments
-                ]
-            counts[adapter.name] = len(results)
-            for result in results:
-                if adapter.name == "whisper":
-                    language_by_segment[result.segment_id] = result.language
-                    language_confidence_by_segment[result.segment_id] = result.language_confidence
-                    segment = segment_by_id.get(result.segment_id)
-                    if segment is not None:
-                        payload = dataclass_to_dict(replace(segment, language=result.language, language_confidence=result.language_confidence))
-                        self.state.upsert_segment(segment.segment_id, segment.file_id, segment.status, payload)
-                self.state.upsert_model_result(result.segment_id, result.model_name, "failed" if result.error else "transcribed", dataclass_to_dict(result))
+                model_segments = segments
+                if adapter.name != "whisper" and language_by_segment:
+                    model_segments = [
+                        replace(
+                            s,
+                            language=language_by_segment.get(s.segment_id),
+                            language_confidence=language_confidence_by_segment.get(s.segment_id),
+                        )
+                        for s in segments
+                        if (language_by_segment.get(s.segment_id) or "").lower() in supported
+                    ]
+                try:
+                    adapter.preflight()
+                    results = adapter.transcribe_batch(model_segments)
+                except Exception as exc:
+                    tb = traceback.format_exc()
+                    failed_models.append({"model": adapter.name, "error": repr(exc), "segments": len(model_segments)})
+                    self.state.record_failure(f"asr:{adapter.name}", "model", adapter.name, repr(exc), retryable=True, traceback=tb)
+                    results = [
+                        ASRResult(
+                            segment_id=s.segment_id,
+                            model_name=adapter.name,
+                            transcript="",
+                            confidence=0.0,
+                            language=s.language,
+                            language_confidence=s.language_confidence,
+                            error=repr(exc),
+                            raw={"model_stage_failure": True},
+                        )
+                        for s in model_segments
+                    ]
+                counts[adapter.name] = len(results)
+                for result in results:
+                    if adapter.name == "whisper":
+                        language_by_segment[result.segment_id] = result.language
+                        language_confidence_by_segment[result.segment_id] = result.language_confidence
+                        segment = segment_by_id.get(result.segment_id)
+                        if segment is not None:
+                            payload = dataclass_to_dict(replace(segment, language=result.language, language_confidence=result.language_confidence))
+                            self.state.upsert_segment(segment.segment_id, segment.file_id, segment.status, payload)
+                    self.state.upsert_model_result(result.segment_id, result.model_name, "failed" if result.error else "transcribed", dataclass_to_dict(result))
+            finally:
+                close = getattr(adapter, "close", None)
+                if callable(close):
+                    close()
         skipped = []
         for segment in segments:
             lang = language_by_segment.get(segment.segment_id)
