@@ -1,0 +1,72 @@
+# Docker runtime config.
+# Mount input audio at /data, output at /output, and model snapshots at /models.
+
+input_root: /data
+output_root: /output
+run_id: docker
+progress_enabled: true
+languages: [en, es]
+
+audio:
+  vad_backend: silero
+  silero_repo_or_dir: snakers4/silero-vad
+  target_sample_rate: 16000
+  target_segment_sec: 12
+  max_segment_sec: 30
+  min_segment_sec: 0.25
+  merge_gap_sec: 0.8
+  min_split_gap_sec: 0.35
+  max_split_recursion: 10
+
+masking:
+  strategy: beep
+  pre_padding_ms: 80
+  post_padding_ms: 120
+  beep_frequency_hz: 1000
+  beep_gain: 0.35
+  allow_wav_fallback: true
+
+alignment:
+  backend: whisperx
+
+state:
+  backend: sqlite
+  postgres_dsn:
+
+asr_models:
+  whisper:
+    enabled: true
+    path: /models/whisper-large-v3
+    batch_size: 32
+  qwen:
+    enabled: true
+    path: /models/qwen3-asr-1.7b
+    batch_size: 1
+  cohere:
+    enabled: true
+    path: /models/cohere-transcribe-03-2026
+    batch_size: 1
+  granite:
+    enabled: true
+    path: /models/granite-4.0-1b-speech
+    batch_size: 1
+
+pii_models:
+  regex:
+    enabled: true
+  gliner:
+    enabled: true
+    threshold: 0.35
+    model_name_or_path: knowledgator/gliner-pii-large-v1.0
+  piiranha:
+    enabled: true
+    threshold: 0.45
+    model_name_or_path: iiiorg/piiranha-v1-detect-personal-information
+  spacy:
+    enabled: true
+    threshold: 0.60
+    model_name_or_path: en_core_web_sm
+  rule_name:
+    enabled: true
+  saved_json:
+    enabled: true

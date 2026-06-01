@@ -1,0 +1,22 @@
+.git
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Large local notebooks and exported experiments are not needed in the image.
+PII.ipynb
+Training_2026_full_optimized_complete(1)(1).ipynb
+training_2026_full_optimized_complete(1)(1).py
+pii.py
+
+# Runtime data, models, and outputs must be mounted into the container.
+data/
+models/
+outputs/
+output/
+amc-output*/
+amc-redacted*/
+.pii_pipeline/

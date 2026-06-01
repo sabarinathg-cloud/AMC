@@ -1,0 +1,20 @@
+# ASR runtimes
+faster-whisper>=1.0.3
+whisperx>=3.3.0
+
+# Audio loading and DSP
+librosa>=0.10.2
+soundfile>=0.12.1
+scipy>=1.10
+
+# PII detectors
+gliner>=0.2.13
+spacy>=3.7,<3.8
+
+# Manifests and review exports
+pandas>=2.2
+pyarrow>=15
+openpyxl>=3.1
+
+# Optional shared state for multi-machine runs
+psycopg[binary]>=3.1

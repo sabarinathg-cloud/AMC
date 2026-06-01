@@ -1,0 +1,48 @@
+FROM python:3.10.12-slim-bookworm
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    HF_HOME=/cache/huggingface \
+    TORCH_HOME=/cache/torch \
+    TRANSFORMERS_CACHE=/cache/huggingface \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    curl \
+    ffmpeg \
+    git \
+    libgomp1 \
+    libsndfile1 \
+    sox \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY pyproject.toml .python-version README.md ./
+COPY amc_pipeline ./amc_pipeline
+COPY docker ./docker
+
+RUN python -m pip install --upgrade pip setuptools wheel
+
+# Install CUDA-enabled PyTorch wheels. The host still needs NVIDIA drivers and
+# NVIDIA Container Toolkit, and the container must be run with --gpus all.
+RUN python -m pip install \
+    torch \
+    torchaudio \
+    --index-url https://download.pytorch.org/whl/cu121
+
+RUN python -m pip install \
+    --constraint docker/constraints-gpu.txt \
+    -r docker/requirements-gpu.txt \
+    -e ".[qwen]"
+
+RUN python -m spacy download en_core_web_sm
+RUN python -m compileall amc_pipeline
+
+ENTRYPOINT ["amc-pipeline"]
+CMD ["--help"]

@@ -1,0 +1,21 @@
+services:
+  amc:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.gpu
+    image: amc-pipeline:gpu
+    gpus: all
+    ipc: host
+    shm_size: "16gb"
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      HF_HOME: /cache/huggingface
+      TORCH_HOME: /cache/torch
+    volumes:
+      - ${AMC_IN:-/mnt/amc-data}:/data:ro
+      - ${AMC_OUT:-/mnt/amc-redacted}:/output
+      - ${AMC_MODEL_ROOT:-/mnt/amc-data/pipeline/models}:/models:ro
+      - ${AMC_CACHE_ROOT:-/mnt/amc-cache}:/cache
+    command: ["--help"]

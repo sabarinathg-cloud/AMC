@@ -61,6 +61,106 @@ nvidia-smi
 ffmpeg -version
 ```
 
+## Docker GPU Runtime
+
+Docker is supported for the GPU runtime. Model weights are not copied into the
+image. The model directory is mounted at runtime so the image stays small and
+the same image can be used on all A10 machines.
+
+Host requirements:
+
+```bash
+nvidia-smi
+docker --version
+```
+
+The EC2 host must have NVIDIA Container Toolkit installed. GPU access is tested
+by running containers with `--gpus all`.
+
+Build the image:
+
+```bash
+cd /mnt/amc-data-ebs/AMC
+docker/build_gpu.sh
+```
+
+Test GPU access inside the container:
+
+```bash
+docker/test_gpu.sh
+```
+
+Expected test result:
+
+```text
+cuda_available: True
+cuda_device_count: 1
+cuda_device_name: NVIDIA A10G
+```
+
+Default Docker mount layout:
+
+```text
+/data    -> input audio root
+/output  -> pipeline output root
+/models  -> local model snapshots
+/cache   -> Hugging Face and Torch cache
+```
+
+Run one stage through Docker:
+
+```bash
+export AMC_IN=/mnt/amc-data
+export AMC_OUT=/mnt/amc-redacted
+export MODEL_ROOT=/mnt/amc-data/pipeline/models
+export CACHE_ROOT=/mnt/amc-cache
+
+docker/run_stage.sh --config /app/docker/config.docker.yaml run-stage preprocess \
+  --input /data \
+  --output /output \
+  --vad-backend silero
+```
+
+Run ASR model by model through Docker:
+
+```bash
+docker/run_stage.sh --config /app/docker/config.docker.yaml run-stage asr --input /data --output /output --models whisper
+docker/run_stage.sh --config /app/docker/config.docker.yaml run-stage asr --input /data --output /output --models qwen --asr-batch-sizes qwen=1
+docker/run_stage.sh --config /app/docker/config.docker.yaml run-stage asr --input /data --output /output --models cohere --asr-batch-sizes cohere=1
+docker/run_stage.sh --config /app/docker/config.docker.yaml run-stage asr --input /data --output /output --models granite --asr-batch-sizes granite=1
+```
+
+Run the known one-call test through Docker:
+
+```bash
+export SRC_ROOT=/mnt/amc-data
+export MODEL_ROOT=/mnt/amc-data/pipeline/models
+export CACHE_ROOT=/mnt/amc-cache
+export YEAR=2023
+export CALL_ID=aaf5285a-3d70-56a8-87e3-77c26d547494
+
+docker/run_one_call.sh
+```
+
+Docker Compose can also be used:
+
+```bash
+export AMC_IN=/mnt/amc-data
+export AMC_OUT=/mnt/amc-redacted
+export AMC_MODEL_ROOT=/mnt/amc-data/pipeline/models
+export AMC_CACHE_ROOT=/mnt/amc-cache
+
+docker compose -f docker/compose.gpu.yaml build
+docker compose -f docker/compose.gpu.yaml run --rm amc --help
+```
+
+For multi-machine Docker runs, use the same rules as the normal runtime:
+
+- one shared Postgres state store for a shared model-parallel run
+- or one independent sharded output folder per machine
+- do not run the same model and same stage from multiple machines into the same
+  SQLite output folder
+
 ## Folder Rule
 
 Always pass an input root that contains the year folder.
