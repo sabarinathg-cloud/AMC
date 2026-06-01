@@ -1,28 +1,38 @@
 # AMC PII Audio Pipeline
 
-Resumable audio preprocessing, ASR, normalization, transcript PII detection,
-forced alignment, channel-specific masking, validation, and manifest generation.
+This is my pipeline for AMC audio preprocessing, ASR, normalization, PII
+detection, force alignment, channel-specific audio masking, validation, and ASR
+training manifests.
 
-The pipeline preserves the input folder structure in the output folder. For an
-input like:
+The main goal is simple:
+
+- keep the original folder structure
+- process each channel separately
+- detect transcript-based PII
+- align the detected PII back to audio time
+- mask only the affected channel and time range
+- keep unmasked mono channel segments for ASR training
+- keep enough state so I can resume after failures
+
+If my input is:
 
 ```text
 /mnt/amc-data/2023/aaf5285a-3d70-56a8-87e3-77c26d547494/audio.opus
 ```
 
-the redacted output is written to:
+then my redacted output will be:
 
 ```text
 <output>/2023/aaf5285a-3d70-56a8-87e3-77c26d547494/audio.opus
 ```
 
-Pipeline state, cache, and reports are written under:
+The pipeline state, cache, and reports will be inside:
 
 ```text
 <output>/.pii_pipeline/
 ```
 
-Use Python 3.10.12.
+I use Python 3.10.12 for this project.
 
 ## Install
 
@@ -36,10 +46,14 @@ python3.10 -m pip install -e .
 python3.10 -m pip install -e ".[qwen]"
 ```
 
-For Qwen ASR, keep the supported runtime from the training notebook:
-`qwen-asr==0.0.6` with `transformers==4.57.6`.
+For Qwen ASR I keep the same supported runtime used in my training notebook:
 
-Check the machine:
+```text
+qwen-asr==0.0.6
+transformers==4.57.6
+```
+
+I check the machine like this:
 
 ```bash
 python3.10 --version
@@ -47,25 +61,26 @@ nvidia-smi
 ffmpeg -version
 ```
 
-## Important Folder Rule
+## My Folder Rule
 
-Always pass an input root that contains the year folder.
+I always pass an input root that contains the year folder.
 
-Good:
+Correct:
 
 ```text
 /mnt/amc-data/2023/<call_id>/audio.opus
 --input /mnt/amc-data
 ```
 
-For a one-call or one-year test, create a small staging folder that still keeps
-the `year/call_id/audio.opus` layout. Do not point `--input` directly at
-`/mnt/amc-data/2023`, because then the year level is no longer visible to the
-pipeline.
+For one-call or one-year testing, I create a small staging folder that still has
+the same `year/call_id/audio.opus` layout.
 
-## One Call
+I do not point `--input` directly at `/mnt/amc-data/2023`, because then the
+pipeline cannot see the year level correctly.
 
-Use this for the call you tested earlier:
+## One Call Test
+
+This is the command set I use to test one call end to end.
 
 ```bash
 export YEAR=2023
@@ -79,7 +94,7 @@ mkdir -p "$ONE_IN/$YEAR/$CALL_ID"
 cp "$SRC_ROOT/$YEAR/$CALL_ID/audio.opus" "$ONE_IN/$YEAR/$CALL_ID/audio.opus"
 ```
 
-Run a quick discovery check:
+First I check that discovery works:
 
 ```bash
 python3.10 -m amc_pipeline.cli dry-run \
@@ -87,8 +102,8 @@ python3.10 -m amc_pipeline.cli dry-run \
   --output "$ONE_OUT"
 ```
 
-Run stage by stage. On one A10 GPU, the safest ASR pattern is one model per
-command so the model is unloaded before the next model starts.
+Then I run the stages one by one. On one A10 GPU, I normally run one ASR model
+per command so memory is cleared before the next model starts.
 
 ```bash
 python3.10 -m amc_pipeline.cli run-stage preprocess \
@@ -155,7 +170,7 @@ python3.10 -m amc_pipeline.cli run-stage manifest \
   --output "$ONE_OUT"
 ```
 
-Listen in Jupyter:
+To listen in Jupyter:
 
 ```python
 from IPython.display import Audio, display
@@ -165,7 +180,7 @@ display(Audio("/tmp/amc-one-output/2023/aaf5285a-3d70-56a8-87e3-77c26d547494/aud
 
 ## One Folder Or One Year
 
-If the folder already contains year folders, use it directly:
+If my folder already contains year folders, I use it directly:
 
 ```bash
 export AMC_IN=/mnt/amc-data
@@ -176,7 +191,7 @@ python3.10 -m amc_pipeline.cli dry-run \
   --output "$AMC_OUT"
 ```
 
-If you want only one year, make a staging root with a symlink:
+If I want to process only one year, I make a staging root with a symlink:
 
 ```bash
 export YEAR=2023
@@ -189,11 +204,11 @@ mkdir -p "$YEAR_IN"
 ln -s "$SRC_ROOT/$YEAR" "$YEAR_IN/$YEAR"
 ```
 
-Then run the same stage commands using `"$YEAR_IN"` and `"$YEAR_OUT"`.
+Then I use `"$YEAR_IN"` as `--input` and `"$YEAR_OUT"` as `--output`.
 
-## Full Folder
+## Full Folder On One Machine
 
-Use this when you want the full dataset in one run on one machine:
+If I want to run the full dataset on one machine in one command:
 
 ```bash
 export AMC_IN=/mnt/amc-data
@@ -210,7 +225,8 @@ python3.10 -m amc_pipeline.cli run \
   --allow-fallback-format wav
 ```
 
-For production, stage-by-stage is easier to verify and resume:
+For production I prefer stage by stage, because it is easier to verify and
+resume:
 
 ```bash
 export AMC_IN=/mnt/amc-data
@@ -233,8 +249,8 @@ python3.10 -m amc_pipeline.cli run-stage manifest --input "$AMC_IN" --output "$A
 
 ## Resume After Failure
 
-Rerun the failed stage with the same `--input` and `--output`. State is kept
-inside `<output>/.pii_pipeline/`.
+If anything fails, I rerun the failed stage with the same `--input` and
+`--output`. The state is already stored inside `<output>/.pii_pipeline/`.
 
 Examples:
 
@@ -256,15 +272,13 @@ python3.10 -m amc_pipeline.cli run-stage redact \
   --allow-fallback-format wav
 ```
 
-To pause a long preprocessing run:
+If I need to pause a long preprocessing run:
 
 ```bash
 python3.10 -m amc_pipeline.cli pause --output "$AMC_OUT" --global
 ```
 
-## Output Files
-
-Important outputs:
+## Outputs I Check
 
 ```text
 <output>/<year>/<call_id>/audio.opus
@@ -279,29 +293,35 @@ Important outputs:
 <output>/.pii_pipeline/reports/
 ```
 
-## Multiple A10 GPU Instances
+## Multiple A10 GPU Machines With Shared Storage
 
-There are two safe ways to use multiple AWS instances with shared storage.
+I use one of these two patterns. I do not run the exact same stage and same
+model from multiple machines into the same SQLite output folder.
 
-Do not run the exact same stage and same model from multiple instances into the
-same SQLite output folder. That causes duplicate work and can create database
-locking problems on shared filesystems.
+That unsafe pattern can duplicate work and cause database locking issues on
+shared storage.
 
-### Option A: Model-Parallel Shared Run
+### Option A: One Shared Run, One ASR Model Per Machine
 
-Use this when you have up to four A10 instances and want all instances to work
-on the same dataset. One instance owns preprocessing, then each GPU instance
-owns exactly one ASR model.
+I use this when I have up to four A10 machines and want all machines to work on
+the same dataset.
 
-Use a shared Postgres state store, not SQLite.
+The rule is:
 
-Install the Postgres client package on every instance:
+- preprocess once
+- run one ASR model per machine
+- wait until all ASR jobs finish
+- run the remaining stages once
+
+For this shared run I use Postgres state, not SQLite.
+
+Install the Postgres client package on every machine:
 
 ```bash
 python3.10 -m pip install "psycopg[binary]>=3.1"
 ```
 
-Create `config.shared.yaml` on shared storage:
+Create this config on shared storage as `config.shared.yaml`:
 
 ```yaml
 input_root: /mnt/amc-data
@@ -334,13 +354,22 @@ state:
   postgres_dsn: postgresql://amc_user:amc_password@POSTGRES_HOST:5432/amc_pipeline
 ```
 
-Run discovery and preprocessing once:
+On every machine I set:
 
 ```bash
+cd /mnt/amc-data-ebs/AMC
+git pull
+
 export AMC_IN=/mnt/amc-data
 export AMC_OUT=/mnt/amc-redacted
 export CFG=/mnt/amc-data-ebs/AMC/config.shared.yaml
+export CUDA_VISIBLE_DEVICES=0
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+```
 
+First I run discovery and preprocessing once from one machine:
+
+```bash
 python3.10 -m amc_pipeline.cli --config "$CFG" dry-run \
   --input "$AMC_IN" \
   --output "$AMC_OUT"
@@ -351,24 +380,20 @@ python3.10 -m amc_pipeline.cli --config "$CFG" run-stage preprocess \
   --vad-backend silero
 ```
 
-Then run these on different A10 instances at the same time.
+Then I run these in parallel, one command per A10 machine.
 
-Instance 1:
+Machine 1:
 
 ```bash
-export CUDA_VISIBLE_DEVICES=0
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 python3.10 -m amc_pipeline.cli --config "$CFG" run-stage asr \
   --input "$AMC_IN" \
   --output "$AMC_OUT" \
   --models whisper
 ```
 
-Instance 2:
+Machine 2:
 
 ```bash
-export CUDA_VISIBLE_DEVICES=0
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 python3.10 -m amc_pipeline.cli --config "$CFG" run-stage asr \
   --input "$AMC_IN" \
   --output "$AMC_OUT" \
@@ -376,11 +401,9 @@ python3.10 -m amc_pipeline.cli --config "$CFG" run-stage asr \
   --asr-batch-sizes qwen=1
 ```
 
-Instance 3:
+Machine 3:
 
 ```bash
-export CUDA_VISIBLE_DEVICES=0
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 python3.10 -m amc_pipeline.cli --config "$CFG" run-stage asr \
   --input "$AMC_IN" \
   --output "$AMC_OUT" \
@@ -388,11 +411,9 @@ python3.10 -m amc_pipeline.cli --config "$CFG" run-stage asr \
   --asr-batch-sizes cohere=1
 ```
 
-Instance 4:
+Machine 4:
 
 ```bash
-export CUDA_VISIBLE_DEVICES=0
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 python3.10 -m amc_pipeline.cli --config "$CFG" run-stage asr \
   --input "$AMC_IN" \
   --output "$AMC_OUT" \
@@ -400,8 +421,7 @@ python3.10 -m amc_pipeline.cli --config "$CFG" run-stage asr \
   --asr-batch-sizes granite=1
 ```
 
-After all ASR model jobs finish, run the remaining stages once from one
-instance:
+After all four ASR jobs finish, I run the rest once from one machine:
 
 ```bash
 python3.10 -m amc_pipeline.cli --config "$CFG" run-stage normalize --input "$AMC_IN" --output "$AMC_OUT"
@@ -414,20 +434,21 @@ python3.10 -m amc_pipeline.cli --config "$CFG" run-stage validate --input "$AMC_
 python3.10 -m amc_pipeline.cli --config "$CFG" run-stage manifest --input "$AMC_IN" --output "$AMC_OUT"
 ```
 
-Rules for this mode:
+Important rules for this mode:
 
-- Preprocess once.
-- Each ASR model runs on exactly one instance.
-- Do not run `qwen` on two instances against the same output.
-- Run `normalize`, `consensus`, `pii`, `align`, `mask-plan`, `redact`,
-  `validate`, and `manifest` once after ASR completes.
-- Use Postgres state for shared multi-instance runs.
+- I run preprocessing once.
+- I run each ASR model on exactly one machine.
+- I do not run `qwen` on two machines against the same output.
+- I run post-ASR stages only once after all ASR jobs finish.
+- I use Postgres state for this shared multi-machine mode.
 
 ### Option B: N-Way Sharded Runs
 
-Use this when you have any number of A10 instances and want no shared database
-writes during processing. Each instance gets a deterministic subset of call IDs,
-its own output folder, and its own pipeline state.
+I use this when I have many A10 machines or when I want the safest parallel
+setup. Each machine gets its own subset of call IDs, its own output folder, and
+its own state database.
+
+This avoids shared database writes during processing.
 
 Create call-ID shards on shared storage:
 
@@ -464,12 +485,16 @@ for audio in sorted(src.glob("*/*/audio.*")):
 PY
 ```
 
-On each instance, set a different `SHARD_ID`:
+On each machine I use a different `SHARD_ID`.
+
+Machine example:
 
 ```bash
 export SHARD_ID=0
 export SHARD_IN=/mnt/amc-shards/shard-$SHARD_ID
 export SHARD_OUT=/mnt/amc-output-shards/shard-$SHARD_ID
+export CUDA_VISIBLE_DEVICES=0
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 python3.10 -m amc_pipeline.cli run \
   --input "$SHARD_IN" \
@@ -482,10 +507,9 @@ python3.10 -m amc_pipeline.cli run \
   --allow-fallback-format wav
 ```
 
-Repeat with `SHARD_ID=1`, `SHARD_ID=2`, etc. Each shard is independent and
-resumable.
+Then I repeat with `SHARD_ID=1`, `SHARD_ID=2`, etc.
 
-To collect only final redacted call audio into one folder:
+To collect only the final redacted call audio into one folder:
 
 ```bash
 export FINAL_OUT=/mnt/amc-redacted-final
@@ -501,36 +525,36 @@ for d in /mnt/amc-output-shards/shard-*; do
 done
 ```
 
-Keep the shard output folders if you need full per-shard state, reports,
-training segments, and manifests.
+I keep the shard output folders if I need the full state, reports, training
+segments, and manifests from each shard.
 
-## Useful Inspection Commands
+## Commands I Use To Inspect Output
 
-Show the final redacted files:
+Final redacted files:
 
 ```bash
 find "$AMC_OUT" -path '*/audio.*' -type f | head -20
 ```
 
-Show segment manifests:
+Segment manifests:
 
 ```bash
 ls -lh "$AMC_OUT/manifests"
 head -5 "$AMC_OUT/manifests/all_segments.csv"
 ```
 
-Show stage reports:
+Stage reports:
 
 ```bash
 find "$AMC_OUT/.pii_pipeline/reports" -maxdepth 1 -type f -print
 ```
 
-Show recorded failures:
+SQLite failures:
 
 ```bash
 python3.10 - <<'PY'
-import sqlite3
 import os
+import sqlite3
 from pathlib import Path
 
 db = Path(os.environ["AMC_OUT"]) / ".pii_pipeline/state/pipeline.sqlite3"
@@ -540,5 +564,5 @@ for row in conn.execute("select scope, scope_id, error from failures order by cr
 PY
 ```
 
-Progress bars are enabled by default. Add `--no-progress` to any command for
-quiet logs.
+Progress bars are enabled by default. If I want quieter logs, I add
+`--no-progress` to the command.
