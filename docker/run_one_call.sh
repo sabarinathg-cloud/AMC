@@ -14,8 +14,14 @@ rm -rf "$ONE_IN" "$ONE_OUT"
 mkdir -p "$ONE_IN/$YEAR/$CALL_ID" "$ONE_OUT" "$CACHE_ROOT"
 cp "$SRC_ROOT/$YEAR/$CALL_ID/audio.opus" "$ONE_IN/$YEAR/$CALL_ID/audio.opus"
 
+if [[ -n "${AMC_DOCKER_GPU_ARGS+x}" ]]; then
+  read -r -a GPU_ARGS <<< "$AMC_DOCKER_GPU_ARGS"
+else
+  GPU_ARGS=(--gpus all)
+fi
+
 run_stage() {
-  docker run --rm --gpus all \
+  docker run --rm "${GPU_ARGS[@]}" \
     --ipc=host \
     --shm-size=16g \
     -e NVIDIA_VISIBLE_DEVICES=all \

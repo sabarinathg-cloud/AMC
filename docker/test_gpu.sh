@@ -3,7 +3,15 @@ set -euo pipefail
 
 IMAGE="${IMAGE:-amc-pipeline:gpu}"
 
-docker run --rm --gpus all \
+if [[ -n "${AMC_DOCKER_GPU_ARGS+x}" ]]; then
+  read -r -a GPU_ARGS <<< "$AMC_DOCKER_GPU_ARGS"
+else
+  GPU_ARGS=(--gpus all)
+fi
+
+docker run --rm "${GPU_ARGS[@]}" \
+  -e NVIDIA_VISIBLE_DEVICES=all \
+  -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \
   --entrypoint bash \
   "$IMAGE" \
   -lc 'nvidia-smi && python - <<'"'"'PY'"'"'
