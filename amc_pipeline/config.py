@@ -63,6 +63,13 @@ class AlignmentConfig:
 
 
 @dataclass
+class DiscoveryConfig:
+    hash_mode: str = "content"
+    num_shards: int = 1
+    shard_index: int | None = None
+
+
+@dataclass
 class PipelineConfig:
     input_root: Path | None = None
     output_root: Path = Path("amc_output")
@@ -82,6 +89,7 @@ class PipelineConfig:
     masking: MaskingConfig = field(default_factory=MaskingConfig)
     state: StateConfig = field(default_factory=StateConfig)
     alignment: AlignmentConfig = field(default_factory=AlignmentConfig)
+    discovery: DiscoveryConfig = field(default_factory=DiscoveryConfig)
     asr_models: dict[str, ASRModelConfig] = field(default_factory=dict)
     pii_models: dict[str, PIIModelConfig] = field(default_factory=dict)
     consensus_min_models: int = 3
@@ -150,13 +158,14 @@ class PipelineConfig:
     def from_file(cls, path: Path, input_root: Path | None = None, output_root: Path | None = None) -> "PipelineConfig":
         raw = _load_mapping(path)
         cfg = cls(
-            input_root=Path(raw["input_root"]) if raw.get("input_root") else input_root,
-            output_root=Path(raw["output_root"]) if raw.get("output_root") else (output_root or Path("amc_output")),
+            input_root=input_root if input_root is not None else (Path(raw["input_root"]) if raw.get("input_root") else None),
+            output_root=output_root if output_root is not None else (Path(raw["output_root"]) if raw.get("output_root") else Path("amc_output")),
         )
         _merge_dataclass(cfg.audio, raw.get("audio", {}))
         _merge_dataclass(cfg.masking, raw.get("masking", {}))
         _merge_dataclass(cfg.state, raw.get("state", {}))
         _merge_dataclass(cfg.alignment, raw.get("alignment", {}))
+        _merge_dataclass(cfg.discovery, raw.get("discovery", {}))
         for name, values in raw.get("asr_models", {}).items():
             current = cfg.asr_models.get(name, ASRModelConfig())
             _merge_dataclass(current, values or {})
@@ -195,7 +204,8 @@ def _load_mapping(path: Path) -> dict[str, Any]:
 def _parse_minimal_yaml(text: str) -> dict[str, Any]:
     data: dict[str, Any] = {}
     stack: list[tuple[int, dict[str, Any]]] = [(-1, data)]
-    for raw_line in text.splitlines():
+    lines = text.splitlines()
+    for index, raw_line in enumerate(lines):
         if not raw_line.strip() or raw_line.lstrip().startswith("#"):
             continue
         indent = len(raw_line) - len(raw_line.lstrip(" "))
@@ -204,12 +214,23 @@ def _parse_minimal_yaml(text: str) -> dict[str, Any]:
             stack.pop()
         parent = stack[-1][1]
         if raw_value.strip() == "":
-            child: dict[str, Any] = {}
-            parent[key] = child
-            stack.append((indent, child))
+            if _next_yaml_line_is_child(lines, index, indent):
+                child: dict[str, Any] = {}
+                parent[key] = child
+                stack.append((indent, child))
+            else:
+                parent[key] = None
         else:
             parent[key] = _parse_scalar(raw_value.strip())
     return data
+
+
+def _next_yaml_line_is_child(lines: list[str], current_index: int, indent: int) -> bool:
+    for next_line in lines[current_index + 1 :]:
+        if not next_line.strip() or next_line.lstrip().startswith("#"):
+            continue
+        return len(next_line) - len(next_line.lstrip(" ")) > indent
+    return False
 
 
 def _parse_scalar(value: str) -> Any:

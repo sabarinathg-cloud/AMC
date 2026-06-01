@@ -29,6 +29,13 @@ masking:
 alignment:
   backend: whisperx
 
+discovery:
+  # content is safest for duplicate grouping but reads every audio file.
+  # path is fastest for large production scans on stable folder structures.
+  hash_mode: content
+  num_shards: 1
+  shard_index:
+
 state:
   backend: sqlite
   postgres_dsn:

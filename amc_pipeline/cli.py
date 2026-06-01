@@ -36,6 +36,9 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--vad-backend", choices=["silero", "energy"], default=None)
     parser.add_argument("--mask-strategy", choices=["beep", "silence", "noise"], default=None)
     parser.add_argument("--allow-fallback-format", choices=["wav"], default=None)
+    parser.add_argument("--discovery-hash-mode", choices=["content", "path", "fast", "path_size_mtime", "metadata"], default=None)
+    parser.add_argument("--num-shards", type=int, default=None)
+    parser.add_argument("--shard-index", type=int, default=None)
     parser.add_argument("--no-progress", action="store_true")
 
 
@@ -62,6 +65,12 @@ def load_cli_config(args: argparse.Namespace) -> PipelineConfig:
         cfg.masking.strategy = args.mask_strategy
     if getattr(args, "allow_fallback_format", None) == "wav":
         cfg.masking.allow_wav_fallback = True
+    if getattr(args, "discovery_hash_mode", None):
+        cfg.discovery.hash_mode = args.discovery_hash_mode
+    if getattr(args, "num_shards", None) is not None:
+        cfg.discovery.num_shards = args.num_shards
+    if getattr(args, "shard_index", None) is not None:
+        cfg.discovery.shard_index = args.shard_index
     if getattr(args, "no_progress", False):
         cfg.progress_enabled = False
     return cfg

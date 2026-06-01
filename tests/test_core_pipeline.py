@@ -16,7 +16,7 @@ from unittest.mock import patch
 from amc_pipeline.alignment import TokenUniformAligner, _alignment_units_from_whisperx, _digit_expanded_alignment_text
 from amc_pipeline.audio import decode_to_wav
 from amc_pipeline.cli import build_parser, load_cli_config
-from amc_pipeline.config import PipelineConfig
+from amc_pipeline.config import PipelineConfig, _parse_minimal_yaml
 from amc_pipeline.consensus import build_consensus
 from amc_pipeline.discovery import discover_audio_files
 from amc_pipeline.inspection import inspect_audio
@@ -116,6 +116,47 @@ class CorePipelineTests(unittest.TestCase):
             self.assertEqual(meta.channels, 2)
             self.assertEqual(meta.sample_rate, 16000)
             self.assertAlmostEqual(meta.duration_sec, 1.0, places=4)
+
+    def test_discovery_supports_fast_hash_shards_and_symlinked_audio(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "input"
+            source_root = Path(td) / "source"
+            actual = source_root / "audio.wav"
+            write_stereo_wav(actual)
+            link = root / "2022" / "call_link" / "audio.wav"
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.symlink_to(actual)
+            for idx in range(6):
+                write_stereo_wav(root / "2022" / f"call_{idx}" / "audio.wav")
+
+            config = PipelineConfig(input_root=root, output_root=Path(td) / "output")
+            config.discovery.hash_mode = "path"
+            records = discover_audio_files(config)
+
+            by_call = {r.call_id: r for r in records}
+            self.assertIn("call_link", by_call)
+            self.assertEqual(by_call["call_link"].relative_path.as_posix(), "2022/call_link/audio.wav")
+            self.assertEqual(by_call["call_link"].source_path, actual.resolve())
+
+            year_link_root = Path(td) / "year-link-input"
+            year_link_root.mkdir()
+            (year_link_root / "2022").symlink_to(root / "2022")
+            year_link_config = PipelineConfig(input_root=year_link_root, output_root=Path(td) / "year-link-output")
+            year_link_config.discovery.hash_mode = "path"
+            year_link_records = discover_audio_files(year_link_config)
+            self.assertEqual({r.call_id for r in year_link_records}, set(by_call))
+
+            sharded = []
+            for shard_index in range(3):
+                shard_config = PipelineConfig(input_root=root, output_root=Path(td) / f"out-{shard_index}")
+                shard_config.discovery.hash_mode = "path"
+                shard_config.discovery.num_shards = "3"  # type: ignore[assignment]
+                shard_config.discovery.shard_index = str(shard_index)  # type: ignore[assignment]
+                sharded.append({r.call_id for r in discover_audio_files(shard_config)})
+            self.assertEqual(set.union(*sharded), set(by_call))
+            self.assertFalse(sharded[0] & sharded[1])
+            self.assertFalse(sharded[0] & sharded[2])
+            self.assertFalse(sharded[1] & sharded[2])
 
     def test_preprocessing_exports_unmasked_mono_segments_per_channel(self):
         with tempfile.TemporaryDirectory() as td:
@@ -506,6 +547,80 @@ class CorePipelineTests(unittest.TestCase):
             self.assertEqual(cfg.asr_models["cohere"].batch_size, 2)
             self.assertEqual(cfg.asr_models["granite"].batch_size, 3)
             self.assertFalse(cfg.asr_models["whisper"].enabled)
+
+    def test_cli_can_configure_discovery_sharding(self):
+        with tempfile.TemporaryDirectory() as td:
+            parser = build_parser()
+            args = parser.parse_args(
+                [
+                    "run",
+                    "--input",
+                    str(Path(td) / "in"),
+                    "--output",
+                    str(Path(td) / "out"),
+                    "--discovery-hash-mode",
+                    "path",
+                    "--num-shards",
+                    "4",
+                    "--shard-index",
+                    "2",
+                ]
+            )
+
+            cfg = load_cli_config(args)
+
+            self.assertEqual(cfg.discovery.hash_mode, "path")
+            self.assertEqual(cfg.discovery.num_shards, 4)
+            self.assertEqual(cfg.discovery.shard_index, 2)
+
+    def test_cli_paths_override_config_file_paths(self):
+        with tempfile.TemporaryDirectory() as td:
+            config_path = Path(td) / "config.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "input_root: /from-config/input",
+                        "output_root: /from-config/output",
+                        "discovery:",
+                        "  hash_mode: content",
+                    ]
+                )
+            )
+            parser = build_parser()
+            args = parser.parse_args(
+                [
+                    "--config",
+                    str(config_path),
+                    "run",
+                    "--input",
+                    str(Path(td) / "cli-in"),
+                    "--output",
+                    str(Path(td) / "cli-out"),
+                ]
+            )
+
+            cfg = load_cli_config(args)
+
+            self.assertEqual(cfg.input_root, Path(td) / "cli-in")
+            self.assertEqual(cfg.output_root, Path(td) / "cli-out")
+
+    def test_minimal_yaml_parser_keeps_blank_leaf_values_as_none(self):
+        data = _parse_minimal_yaml(
+            "\n".join(
+                [
+                    "discovery:",
+                    "  hash_mode: path",
+                    "  num_shards: 4",
+                    "  shard_index:",
+                    "state:",
+                    "  backend: sqlite",
+                    "  postgres_dsn:",
+                ]
+            )
+        )
+
+        self.assertEqual(data["discovery"]["shard_index"], None)
+        self.assertEqual(data["state"]["postgres_dsn"], None)
 
     def test_qwen_preflight_requires_thinker_config(self):
         with tempfile.TemporaryDirectory() as td:

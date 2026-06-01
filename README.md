@@ -347,6 +347,96 @@ python3.10 -m amc_pipeline.cli run-stage validate --input "$AMC_IN" --output "$A
 python3.10 -m amc_pipeline.cli run-stage manifest --input "$AMC_IN" --output "$AMC_OUT"
 ```
 
+## Recommended Large-Scale Mode
+
+For a large number of calls on N A10 machines with shared storage, the fastest
+safe mode is deterministic call sharding:
+
+- all machines read the same input root
+- each machine gets a different `--shard-index`
+- each machine writes to its own output folder
+- each shard runs all four ASR models for maximum accuracy
+- `--discovery-hash-mode path` avoids reading every audio file during discovery
+- no shared SQLite writes happen during processing
+
+This keeps the same accuracy as the single-machine full run because every shard
+still runs Whisper, Qwen, Cohere, Granite, normalization, consensus, PII,
+WhisperX alignment, and redaction.
+
+Machine 0 of 4:
+
+```bash
+export AMC_IN=/mnt/amc-data
+export NUM_SHARDS=4
+export SHARD_INDEX=0
+export AMC_OUT=/mnt/amc-output-shards/shard-$SHARD_INDEX
+
+python3.10 -m amc_pipeline.cli run-stage preprocess --input "$AMC_IN" --output "$AMC_OUT" --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path --vad-backend silero
+python3.10 -m amc_pipeline.cli run-stage asr --input "$AMC_IN" --output "$AMC_OUT" --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path --models whisper
+python3.10 -m amc_pipeline.cli run-stage asr --input "$AMC_IN" --output "$AMC_OUT" --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path --models qwen --asr-batch-sizes qwen=1
+python3.10 -m amc_pipeline.cli run-stage asr --input "$AMC_IN" --output "$AMC_OUT" --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path --models cohere --asr-batch-sizes cohere=1
+python3.10 -m amc_pipeline.cli run-stage asr --input "$AMC_IN" --output "$AMC_OUT" --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path --models granite --asr-batch-sizes granite=1
+python3.10 -m amc_pipeline.cli run-stage normalize --input "$AMC_IN" --output "$AMC_OUT" --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path
+python3.10 -m amc_pipeline.cli run-stage consensus --input "$AMC_IN" --output "$AMC_OUT" --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path
+python3.10 -m amc_pipeline.cli run-stage pii --input "$AMC_IN" --output "$AMC_OUT" --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path --detectors regex,gliner,piiranha,spacy,rule_name,saved_json
+python3.10 -m amc_pipeline.cli run-stage align --input "$AMC_IN" --output "$AMC_OUT" --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path
+python3.10 -m amc_pipeline.cli run-stage mask-plan --input "$AMC_IN" --output "$AMC_OUT" --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path
+python3.10 -m amc_pipeline.cli run-stage redact --input "$AMC_IN" --output "$AMC_OUT" --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path --mask-strategy beep --allow-fallback-format wav
+python3.10 -m amc_pipeline.cli run-stage validate --input "$AMC_IN" --output "$AMC_OUT" --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path
+python3.10 -m amc_pipeline.cli run-stage manifest --input "$AMC_IN" --output "$AMC_OUT" --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path
+```
+
+For the other machines, only change `SHARD_INDEX`:
+
+```bash
+export SHARD_INDEX=1
+export SHARD_INDEX=2
+export SHARD_INDEX=3
+```
+
+For N machines, set `NUM_SHARDS=N` and use shard indexes from `0` to `N - 1`.
+
+Docker version of the same shard run:
+
+```bash
+export AMC_IN=/mnt/amc-data
+export AMC_OUT=/mnt/amc-output-shards/shard-0
+export MODEL_ROOT=/mnt/amc-data/pipeline/models
+export CACHE_ROOT=/mnt/amc-cache
+export NUM_SHARDS=4
+export SHARD_INDEX=0
+
+docker/run_stage.sh --config /app/docker/config.docker.yaml run-stage preprocess --input /data --output /output --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path --vad-backend silero
+docker/run_stage.sh --config /app/docker/config.docker.yaml run-stage asr --input /data --output /output --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path --models whisper
+docker/run_stage.sh --config /app/docker/config.docker.yaml run-stage asr --input /data --output /output --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path --models qwen --asr-batch-sizes qwen=1
+docker/run_stage.sh --config /app/docker/config.docker.yaml run-stage asr --input /data --output /output --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path --models cohere --asr-batch-sizes cohere=1
+docker/run_stage.sh --config /app/docker/config.docker.yaml run-stage asr --input /data --output /output --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path --models granite --asr-batch-sizes granite=1
+docker/run_stage.sh --config /app/docker/config.docker.yaml run-stage normalize --input /data --output /output --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path
+docker/run_stage.sh --config /app/docker/config.docker.yaml run-stage consensus --input /data --output /output --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path
+docker/run_stage.sh --config /app/docker/config.docker.yaml run-stage pii --input /data --output /output --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path --detectors regex,gliner,piiranha,spacy,rule_name,saved_json
+docker/run_stage.sh --config /app/docker/config.docker.yaml run-stage align --input /data --output /output --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path
+docker/run_stage.sh --config /app/docker/config.docker.yaml run-stage mask-plan --input /data --output /output --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path
+docker/run_stage.sh --config /app/docker/config.docker.yaml run-stage redact --input /data --output /output --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path --mask-strategy beep --allow-fallback-format wav
+docker/run_stage.sh --config /app/docker/config.docker.yaml run-stage validate --input /data --output /output --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path
+docker/run_stage.sh --config /app/docker/config.docker.yaml run-stage manifest --input /data --output /output --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path
+```
+
+Collect final redacted audio from shard output folders:
+
+```bash
+export FINAL_OUT=/mnt/amc-redacted-final
+mkdir -p "$FINAL_OUT"
+
+for shard_dir in /mnt/amc-output-shards/shard-*; do
+  rsync -a \
+    --exclude '/.pii_pipeline/' \
+    --include '*/' \
+    --include 'audio.*' \
+    --exclude '*' \
+    "$shard_dir"/ "$FINAL_OUT"/
+done
+```
+
 ## Resume After Failure
 
 If anything fails, rerun the failed stage with the same `--input` and
