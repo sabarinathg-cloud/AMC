@@ -75,6 +75,8 @@ payload = {
     "hostname": "$HOSTNAME_VALUE",
     "input": "$AMC_IN",
     "output": "$AMC_OUT",
+    "input_files": "${RUN_FILE_COUNT:-}",
+    "input_signature": "${RUN_SIGNATURE:-}",
     "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
 }
 path.write_text(json.dumps(payload, indent=2, sort_keys=True))
@@ -90,15 +92,31 @@ if [[ "$AUTO_PULL" == "1" ]]; then
   ) 9>"$LOCK_DIR/repo_pull.lock"
 fi
 
+read -r RUN_FILE_COUNT RUN_SIGNATURE < <(
+  "$PYTHON_BIN" ops/input_signature.py \
+    --input "$AMC_IN" \
+    --output "$AMC_OUT" \
+    --hash-mode "$HASH_MODE" \
+    --num-shards "$NUM_SHARDS" \
+    --shard-index "$SHARD_INDEX"
+)
+
+write_status "input_signature" "ready" "files=$RUN_FILE_COUNT signature=$RUN_SIGNATURE"
+
 run_stage() {
   local key="$1"
   shift
   local marker="$MARKER_DIR/$key.done"
   local log="$LOG_DIR/$key.log"
   if [[ -f "$marker" && "${FORCE_STAGE:-0}" != "1" ]]; then
-    write_status "$key" "skipped" "stage marker already exists"
-    echo "[$(date -Is)] SKIP $key" | tee -a "$log"
-    return 0
+    local marker_signature
+    marker_signature="$(cat "$marker" 2>/dev/null || true)"
+    if [[ "$marker_signature" == "$RUN_SIGNATURE" ]]; then
+      write_status "$key" "skipped" "stage marker already exists for files=$RUN_FILE_COUNT signature=$RUN_SIGNATURE"
+      echo "[$(date -Is)] SKIP $key signature=$RUN_SIGNATURE files=$RUN_FILE_COUNT" | tee -a "$log"
+      return 0
+    fi
+    echo "[$(date -Is)] RERUN $key input changed old_signature=$marker_signature new_signature=$RUN_SIGNATURE files=$RUN_FILE_COUNT" | tee -a "$log"
   fi
 
   write_status "$key" "running" ""
@@ -123,7 +141,7 @@ run_stage() {
   sync || true
   echo "===== $(date -Is) END $key rc=$rc =====" | tee -a "$log"
   if [[ "$rc" == "0" ]]; then
-    date -Is > "$marker"
+    echo "$RUN_SIGNATURE" > "$marker"
     write_status "$key" "completed" ""
   else
     write_status "$key" "failed" "exit code $rc; see $log"

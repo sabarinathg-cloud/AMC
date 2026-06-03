@@ -37,6 +37,8 @@ def main() -> int:
         "alignment",
         "redacted",
         "failures",
+        "input_files",
+        "input_signature",
         "updated_at",
     ]
     widths = {header: len(header) for header in headers}
@@ -82,6 +84,8 @@ def collect_status(run_root: Path) -> list[dict[str, Any]]:
                 "alignment": counts.get("alignment", ""),
                 "redacted": counts.get("redacted", ""),
                 "failures": counts.get("failures", ""),
+                "input_files": status.get("input_files", ""),
+                "input_signature": status.get("input_signature", ""),
                 "updated_at": status.get("updated_at", ""),
                 "message": status.get("message", ""),
             }

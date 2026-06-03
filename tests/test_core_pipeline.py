@@ -176,6 +176,59 @@ class CorePipelineTests(unittest.TestCase):
             self.assertFalse(sharded[0] & sharded[2])
             self.assertFalse(sharded[1] & sharded[2])
 
+    def test_input_signature_changes_when_subset_expands(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "input"
+            output = Path(td) / "output"
+            script = Path(__file__).resolve().parents[1] / "ops" / "input_signature.py"
+            write_stereo_wav(root / "2026" / "call001" / "audio.wav")
+
+            first = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "--input",
+                    str(root),
+                    "--output",
+                    str(output),
+                    "--hash-mode",
+                    "path",
+                    "--num-shards",
+                    "1",
+                    "--shard-index",
+                    "0",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            write_stereo_wav(root / "2026" / "call002" / "audio.wav")
+            second = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "--input",
+                    str(root),
+                    "--output",
+                    str(output),
+                    "--hash-mode",
+                    "path",
+                    "--num-shards",
+                    "1",
+                    "--shard-index",
+                    "0",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            first_count, first_signature = first.stdout.strip().split()
+            second_count, second_signature = second.stdout.strip().split()
+            self.assertEqual(first_count, "1")
+            self.assertEqual(second_count, "2")
+            self.assertNotEqual(first_signature, second_signature)
+
     def test_preprocessing_exports_unmasked_mono_segments_per_channel(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "input"
