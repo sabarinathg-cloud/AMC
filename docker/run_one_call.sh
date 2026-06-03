@@ -39,9 +39,9 @@ run_stage() {
 run_stage --config /app/docker/config.docker.yaml dry-run --input /data --output /output
 run_stage --config /app/docker/config.docker.yaml run-stage preprocess --input /data --output /output --vad-backend silero
 run_stage --config /app/docker/config.docker.yaml run-stage asr --input /data --output /output --models whisper
-run_stage --config /app/docker/config.docker.yaml run-stage asr --input /data --output /output --models qwen --asr-batch-sizes qwen=1
-run_stage --config /app/docker/config.docker.yaml run-stage asr --input /data --output /output --models cohere --asr-batch-sizes cohere=1
-run_stage --config /app/docker/config.docker.yaml run-stage asr --input /data --output /output --models granite --asr-batch-sizes granite=1
+run_stage --config /app/docker/config.docker.yaml run-stage asr --input /data --output /output --models qwen
+run_stage --config /app/docker/config.docker.yaml run-stage asr --input /data --output /output --models cohere
+run_stage --config /app/docker/config.docker.yaml run-stage asr --input /data --output /output --models granite
 run_stage --config /app/docker/config.docker.yaml run-stage normalize --input /data --output /output
 run_stage --config /app/docker/config.docker.yaml run-stage consensus --input /data --output /output
 run_stage --config /app/docker/config.docker.yaml run-stage pii --input /data --output /output --detectors regex,gliner,piiranha,spacy,rule_name,saved_json

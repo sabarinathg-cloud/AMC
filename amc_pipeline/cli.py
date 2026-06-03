@@ -31,7 +31,7 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--input", type=Path, default=None)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--models", default=None, help="Comma-separated ASR models, for example: whisper,qwen,cohere,granite")
-    parser.add_argument("--asr-batch-sizes", default=None, help="Comma-separated ASR batch overrides, for example: qwen=1,cohere=1,granite=1")
+    parser.add_argument("--asr-batch-sizes", default=None, help="Comma-separated ASR batch count caps, for example: qwen=8,cohere=4,granite=4 (dynamic duration budgets still apply)")
     parser.add_argument("--detectors", default=None, help="Comma-separated PII detectors")
     parser.add_argument("--vad-backend", choices=["silero", "energy"], default=None)
     parser.add_argument("--mask-strategy", choices=["beep", "silence", "noise"], default=None)

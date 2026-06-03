@@ -2,25 +2,69 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
-from contextlib import closing
+from contextlib import closing, contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+
+
+_FETCH_BATCH_SIZE = 1000
 
 
 class SQLiteStateStore:
     def __init__(self, path: Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._local = threading.local()
         self._init_schema()
 
     def connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, isolation_level=None)
-        conn.row_factory = sqlite3.Row
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            try:
+                conn.execute("select 1")
+            except sqlite3.ProgrammingError:
+                self._local.conn = None
+                conn = None
+        if conn is None:
+            conn = sqlite3.connect(self.path, isolation_level=None, check_same_thread=False, timeout=30.0)
+            conn.row_factory = sqlite3.Row
+            conn.execute("pragma journal_mode=WAL")
+            conn.execute("pragma synchronous=NORMAL")
+            conn.execute("pragma busy_timeout=30000")
+            self._local.conn = conn
         return conn
 
+    def _read_connection(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.path, isolation_level=None, check_same_thread=False, timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("pragma busy_timeout=30000")
+        return conn
+
+    @contextmanager
+    def _conn_ctx(self):
+        yield self.connect()
+
+    def close(self) -> None:
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            return
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+        finally:
+            self._local.conn = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def _init_schema(self) -> None:
-        with closing(self.connect()) as conn:
+        with closing(self._read_connection()) as conn:
             conn.executescript(
                 """
                 create table if not exists files (
@@ -92,7 +136,7 @@ class SQLiteStateStore:
         source_path = str(record["source_path"])
         status = str(record.get("status", payload.get("status", "unknown")))
         now = time.time()
-        with closing(self.connect()) as conn:
+        with self._conn_ctx() as conn:
             conn.execute(
                 """
                 insert into files(file_id, source_path, status, payload_json, updated_at)
@@ -108,7 +152,7 @@ class SQLiteStateStore:
 
     def upsert_segment(self, segment_id: str, file_id: str, status: str, payload: dict[str, Any]) -> None:
         now = time.time()
-        with closing(self.connect()) as conn:
+        with self._conn_ctx() as conn:
             conn.execute(
                 """
                 insert into segments(segment_id, file_id, status, payload_json, updated_at)
@@ -124,7 +168,7 @@ class SQLiteStateStore:
 
     def upsert_model_result(self, segment_id: str, model_name: str, status: str, payload: dict[str, Any]) -> None:
         now = time.time()
-        with closing(self.connect()) as conn:
+        with self._conn_ctx() as conn:
             conn.execute(
                 """
                 insert into model_results(segment_id, model_name, status, payload_json, updated_at)
@@ -139,7 +183,7 @@ class SQLiteStateStore:
 
     def record_artifact(self, artifact_id: str, kind: str, path: Path, status: str, payload: dict[str, Any] | None = None) -> None:
         now = time.time()
-        with closing(self.connect()) as conn:
+        with self._conn_ctx() as conn:
             conn.execute(
                 """
                 insert into artifacts(artifact_id, kind, path, status, payload_json, updated_at)
@@ -155,7 +199,7 @@ class SQLiteStateStore:
             )
 
     def record_failure(self, failure_id: str, scope: str, scope_id: str, error: str, retryable: bool = True, traceback: str | None = None) -> None:
-        with closing(self.connect()) as conn:
+        with self._conn_ctx() as conn:
             conn.execute(
                 """
                 insert or replace into failures(failure_id, scope, scope_id, error, traceback, retryable, created_at)
@@ -165,14 +209,14 @@ class SQLiteStateStore:
             )
 
     def request_pause(self, run_id: str, worker_id: str | None = None, global_pause: bool = False) -> None:
-        with closing(self.connect()) as conn:
+        with self._conn_ctx() as conn:
             conn.execute(
                 "insert into pause_requests(run_id, worker_id, global_pause, created_at) values (?, ?, ?, ?)",
                 (run_id, worker_id, int(global_pause), time.time()),
             )
 
     def should_pause(self, run_id: str, worker_id: str | None = None) -> bool:
-        with closing(self.connect()) as conn:
+        with self._conn_ctx() as conn:
             row = conn.execute(
                 """
                 select 1 from pause_requests
@@ -186,7 +230,7 @@ class SQLiteStateStore:
         return row is not None
 
     def set_run_metadata(self, key: str, value: Any) -> None:
-        with closing(self.connect()) as conn:
+        with self._conn_ctx() as conn:
             conn.execute(
                 """
                 insert into run_metadata(key, value_json, updated_at) values (?, ?, ?)
@@ -198,7 +242,7 @@ class SQLiteStateStore:
     def table_count(self, table: str) -> int:
         if table not in {"files", "segments", "model_results", "artifacts", "failures", "leases", "pause_requests", "run_metadata"}:
             raise ValueError(f"Unsupported table: {table}")
-        with closing(self.connect()) as conn:
+        with self._conn_ctx() as conn:
             return int(conn.execute(f"select count(*) from {table}").fetchone()[0])
 
     def fetch_files(self, status: str | None = None) -> list[dict[str, Any]]:
@@ -207,7 +251,7 @@ class SQLiteStateStore:
         if status is not None:
             sql += " where status = ?"
             params = (status,)
-        with closing(self.connect()) as conn:
+        with self._conn_ctx() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [self._decode_row(row) for row in rows]
 
@@ -217,7 +261,7 @@ class SQLiteStateStore:
         if status is not None:
             sql += " where status = ?"
             params = (status,)
-        with closing(self.connect()) as conn:
+        with self._conn_ctx() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [self._decode_row(row) for row in rows]
 
@@ -227,7 +271,7 @@ class SQLiteStateStore:
         if segment_id is not None:
             sql += " where segment_id = ?"
             params = (segment_id,)
-        with closing(self.connect()) as conn:
+        with self._conn_ctx() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [self._decode_row(row) for row in rows]
 
@@ -237,9 +281,60 @@ class SQLiteStateStore:
         if kind is not None:
             sql += " where kind = ?"
             params = (kind,)
-        with closing(self.connect()) as conn:
+        with self._conn_ctx() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [self._decode_row(row) for row in rows]
+
+    def count_files(self, status: str | None = None) -> int:
+        return self._count("files", "status", status)
+
+    def count_segments(self, status: str | None = None) -> int:
+        return self._count("segments", "status", status)
+
+    def count_model_results(self, segment_id: str | None = None) -> int:
+        return self._count("model_results", "segment_id", segment_id)
+
+    def count_artifacts(self, kind: str | None = None) -> int:
+        return self._count("artifacts", "kind", kind)
+
+    def iter_files(self, status: str | None = None, batch_size: int = _FETCH_BATCH_SIZE) -> Iterator[dict[str, Any]]:
+        yield from self._iter_rows("files", "status", status, batch_size)
+
+    def iter_segments(self, status: str | None = None, batch_size: int = _FETCH_BATCH_SIZE) -> Iterator[dict[str, Any]]:
+        yield from self._iter_rows("segments", "status", status, batch_size)
+
+    def iter_model_results(self, segment_id: str | None = None, batch_size: int = _FETCH_BATCH_SIZE) -> Iterator[dict[str, Any]]:
+        yield from self._iter_rows("model_results", "segment_id", segment_id, batch_size)
+
+    def iter_artifacts(self, kind: str | None = None, batch_size: int = _FETCH_BATCH_SIZE) -> Iterator[dict[str, Any]]:
+        yield from self._iter_rows("artifacts", "kind", kind, batch_size)
+
+    def _count(self, table: str, filter_column: str, filter_value: str | None) -> int:
+        sql = f"select count(*) from {table}"
+        params: tuple[Any, ...] = ()
+        if filter_value is not None:
+            sql += f" where {filter_column} = ?"
+            params = (filter_value,)
+        with self._conn_ctx() as conn:
+            return int(conn.execute(sql, params).fetchone()[0])
+
+    def _iter_rows(self, table: str, filter_column: str, filter_value: str | None, batch_size: int) -> Iterator[dict[str, Any]]:
+        sql = f"select * from {table}"
+        params: tuple[Any, ...] = ()
+        if filter_value is not None:
+            sql += f" where {filter_column} = ?"
+            params = (filter_value,)
+        conn = self._read_connection()
+        try:
+            cursor = conn.execute(sql, params)
+            while True:
+                rows = cursor.fetchmany(max(1, batch_size))
+                if not rows:
+                    break
+                for row in rows:
+                    yield self._decode_row(row)
+        finally:
+            conn.close()
 
     @staticmethod
     def _decode_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -322,6 +417,19 @@ class PostgresStateStore:
                         global_pause integer not null,
                         created_at double precision not null,
                         released_at double precision
+                    );
+                    create table if not exists leases (
+                        lease_id text primary key,
+                        worker_id text not null,
+                        stage text not null,
+                        scope_id text not null,
+                        expires_at double precision not null,
+                        payload_json jsonb not null
+                    );
+                    create table if not exists run_metadata (
+                        key text primary key,
+                        value_json jsonb not null,
+                        updated_at double precision not null
                     );
                     """
                 )
@@ -449,6 +557,107 @@ class PostgresStateStore:
                 cur.execute(sql, params)
                 rows = cur.fetchall()
         return [{"artifact_id": r[0], "kind": r[1], "path": r[2], "status": r[3], "payload": r[4]} for r in rows]
+
+    def set_run_metadata(self, key: str, value: Any) -> None:
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    insert into run_metadata(key, value_json, updated_at) values (%s, %s::jsonb, %s)
+                    on conflict(key) do update set value_json=excluded.value_json, updated_at=excluded.updated_at
+                    """,
+                    (key, json.dumps(value, sort_keys=True, default=str), time.time()),
+                )
+
+    def table_count(self, table: str) -> int:
+        if table not in {"files", "segments", "model_results", "artifacts", "failures", "leases", "pause_requests", "run_metadata"}:
+            raise ValueError(f"Unsupported table: {table}")
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"select count(*) from {table}")
+                return int(cur.fetchone()[0])
+
+    def count_files(self, status: str | None = None) -> int:
+        return self._count("files", "status", status)
+
+    def count_segments(self, status: str | None = None) -> int:
+        return self._count("segments", "status", status)
+
+    def count_model_results(self, segment_id: str | None = None) -> int:
+        return self._count("model_results", "segment_id", segment_id)
+
+    def count_artifacts(self, kind: str | None = None) -> int:
+        return self._count("artifacts", "kind", kind)
+
+    def _count(self, table: str, filter_column: str, filter_value: str | None) -> int:
+        sql = f"select count(*) from {table}"
+        params: tuple[Any, ...] = ()
+        if filter_value is not None:
+            sql += f" where {filter_column} = %s"
+            params = (filter_value,)
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                return int(cur.fetchone()[0])
+
+    def iter_files(self, status: str | None = None, batch_size: int = _FETCH_BATCH_SIZE) -> Iterator[dict[str, Any]]:
+        yield from self._iter_payload_table("files", "status", status, batch_size)
+
+    def iter_segments(self, status: str | None = None, batch_size: int = _FETCH_BATCH_SIZE) -> Iterator[dict[str, Any]]:
+        yield from self._iter_payload_table("segments", "status", status, batch_size)
+
+    def iter_model_results(self, segment_id: str | None = None, batch_size: int = _FETCH_BATCH_SIZE) -> Iterator[dict[str, Any]]:
+        sql = "select segment_id, model_name, status, payload_json from model_results"
+        params: tuple[Any, ...] = ()
+        if segment_id is not None:
+            sql += " where segment_id = %s"
+            params = (segment_id,)
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                while True:
+                    rows = cur.fetchmany(max(1, batch_size))
+                    if not rows:
+                        break
+                    for r in rows:
+                        yield {"segment_id": r[0], "model_name": r[1], "status": r[2], "payload": r[3]}
+
+    def iter_artifacts(self, kind: str | None = None, batch_size: int = _FETCH_BATCH_SIZE) -> Iterator[dict[str, Any]]:
+        sql = "select artifact_id, kind, path, status, payload_json from artifacts"
+        params: tuple[Any, ...] = ()
+        if kind is not None:
+            sql += " where kind = %s"
+            params = (kind,)
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                while True:
+                    rows = cur.fetchmany(max(1, batch_size))
+                    if not rows:
+                        break
+                    for r in rows:
+                        yield {"artifact_id": r[0], "kind": r[1], "path": r[2], "status": r[3], "payload": r[4]}
+
+    def _iter_payload_table(self, table: str, filter_column: str, filter_value: str | None, batch_size: int) -> Iterator[dict[str, Any]]:
+        if table not in {"files", "segments"}:
+            raise ValueError(f"Unsupported table: {table}")
+        sql = f"select * from {table}"
+        params: tuple[Any, ...] = ()
+        if filter_value is not None:
+            sql += f" where {filter_column} = %s"
+            params = (filter_value,)
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                names = [d.name for d in cur.description]
+                while True:
+                    rows = cur.fetchmany(max(1, batch_size))
+                    if not rows:
+                        break
+                    for row in rows:
+                        data = dict(zip(names, row))
+                        data["payload"] = data.get("payload_json", {})
+                        yield data
 
     def _upsert_payload(self, table: str, pk_name: str, pk_value: str, columns: dict[str, Any], payload: dict[str, Any]) -> None:
         if table != "segments":

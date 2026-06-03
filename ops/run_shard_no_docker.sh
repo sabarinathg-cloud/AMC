@@ -158,13 +158,18 @@ for stage in $STAGES; do
       run_stage asr_whisper asr --models whisper
       ;;
     asr_qwen)
-      run_stage asr_qwen asr --models qwen --asr-batch-sizes qwen=1
+      # Dynamic duration-budgeted batching (config defaults: count cap 8, ~240s budget).
+      # Override per run with --asr-batch-sizes qwen=N or via config asr_models.qwen.{batch_audio_sec_budget,max_batch_size}.
+      run_stage asr_qwen asr --models qwen
       ;;
     asr_cohere)
-      run_stage asr_cohere asr --models cohere --asr-batch-sizes cohere=1
+      # Dynamic batching (config defaults: count cap 4, ~160s budget). float32 by default;
+      # set asr_models.cohere.dtype: bfloat16 only after ops/asr_parity_check.py passes.
+      run_stage asr_cohere asr --models cohere
       ;;
     asr_granite)
-      run_stage asr_granite asr --models granite --asr-batch-sizes granite=1
+      # Dynamic batching (config defaults: count cap 4, ~160s budget); bf16 + SDPA on CUDA.
+      run_stage asr_granite asr --models granite
       ;;
     normalize)
       run_stage normalize normalize

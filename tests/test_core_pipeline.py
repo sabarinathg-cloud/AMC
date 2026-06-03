@@ -325,6 +325,9 @@ class CorePipelineTests(unittest.TestCase):
             with closing(sqlite3.connect(Path(td) / "state.db")) as conn:
                 file_count = conn.execute("select count(*) from files").fetchone()[0]
             self.assertEqual(file_count, 1)
+            state.connect().close()
+            state.upsert_file({**record, "status": "reopened"})
+            self.assertEqual(state.fetch_files()[0]["status"], "reopened")
             self.assertTrue(state.should_pause(run_id="run1", worker_id="worker1"))
             self.assertFalse(state.should_pause(run_id="run1", worker_id="worker2"))
 

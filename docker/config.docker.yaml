@@ -41,15 +41,20 @@ asr_models:
   qwen:
     enabled: true
     path: /models/qwen3-asr-1.7b
-    batch_size: 1
+    # Dynamic duration-budgeted batching keeps the GPU busy; count cap 8, ~240s budget.
+    batch_size: 8
+    batch_audio_sec_budget: 240
   cohere:
     enabled: true
     path: /models/cohere-transcribe-03-2026
-    batch_size: 1
+    batch_size: 4
+    batch_audio_sec_budget: 160
+    # dtype stays float32 (exact) until ops/asr_parity_check.py clears bfloat16.
   granite:
     enabled: true
     path: /models/granite-4.0-1b-speech
-    batch_size: 1
+    batch_size: 4
+    batch_audio_sec_budget: 160
 
 pii_models:
   regex:

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
-from .audio import decode_to_wav, extract_channel, read_wav, temp_wav_path, write_mono_segment
+from .audio import decode_to_wav, extract_channel, read_wav, write_mono_segment
 from .config import PipelineConfig
 from .models import AudioFileRecord, SegmentRecord
 from .segmentation import split_chunks_on_pauses, vad_intervals
@@ -11,9 +12,18 @@ from .segmentation import split_chunks_on_pauses, vad_intervals
 def preprocess_file(record: AudioFileRecord, config: PipelineConfig) -> list[SegmentRecord]:
     config.ensure_output_dirs()
     working_path = record.source_path
+    decoded_path: Path | None = None
     if record.source_path.suffix.lower() != ".wav":
-        working_path = decode_to_wav(record.source_path, config.cache_dir / "preprocess" / record.file_id / "decoded.wav", config.audio.target_sample_rate)
-    buffer = read_wav(working_path)
+        decoded_path = config.cache_dir / "preprocess" / record.file_id / "decoded.wav"
+        working_path = decode_to_wav(record.source_path, decoded_path, config.audio.target_sample_rate)
+    try:
+        return _segment_buffer(record, config, read_wav(working_path))
+    finally:
+        if decoded_path is not None and not config.retain_decoded_cache:
+            shutil.rmtree(decoded_path.parent, ignore_errors=True)
+
+
+def _segment_buffer(record: AudioFileRecord, config: PipelineConfig, buffer) -> list[SegmentRecord]:
     segments: list[SegmentRecord] = []
     for channel in range(buffer.channels):
         samples = extract_channel(buffer, channel)
@@ -27,7 +37,7 @@ def preprocess_file(record: AudioFileRecord, config: PipelineConfig) -> list[Seg
             silero_repo_or_dir=config.audio.silero_repo_or_dir,
             merge=False,
         )
-        if not intervals and samples:
+        if not intervals and len(samples):
             intervals = [(0.0, len(samples) / buffer.sample_rate)]
         chunks = split_chunks_on_pauses(
             intervals,

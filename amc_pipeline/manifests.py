@@ -9,7 +9,13 @@ from typing import Any
 from .models import SegmentRecord
 
 
-def write_segment_manifests(output_root: Path, segments: list[SegmentRecord], extra_rows: dict[str, dict[str, Any]] | None = None) -> list[Path]:
+def write_segment_manifests(
+    output_root: Path,
+    segments: list[SegmentRecord],
+    extra_rows: dict[str, dict[str, Any]] | None = None,
+    enable_dataframe_exports: bool = True,
+    xlsx_max_rows: int = 1_000_000,
+) -> list[Path]:
     output_root = Path(output_root)
     paths: list[Path] = []
     rows = [_segment_row(output_root, s, extra_rows.get(s.segment_id, {}) if extra_rows else {}) for s in segments]
@@ -23,7 +29,8 @@ def write_segment_manifests(output_root: Path, segments: list[SegmentRecord], ex
         year_dir.mkdir(parents=True, exist_ok=True)
         paths.append(_write_csv(year_dir / "segments.csv", year_rows))
         paths.append(_write_jsonl(year_dir / "segments.jsonl", year_rows))
-    _try_optional_dataframe_exports(global_dir, rows)
+    if enable_dataframe_exports:
+        _try_optional_dataframe_exports(global_dir, rows, xlsx_max_rows)
     return paths
 
 
@@ -49,10 +56,12 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> Path:
     if not rows:
         path.write_text("")
         return path
+    fieldnames = sorted({k for row in rows for k in row})
     with path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=sorted({k for row in rows for k in row}))
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(rows)
+        for row in rows:
+            writer.writerow(row)
     return path
 
 
@@ -63,7 +72,7 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> Path:
     return path
 
 
-def _try_optional_dataframe_exports(global_dir: Path, rows: list[dict[str, Any]]) -> None:
+def _try_optional_dataframe_exports(global_dir: Path, rows: list[dict[str, Any]], xlsx_max_rows: int) -> None:
     if not rows:
         return
     try:
@@ -74,9 +83,10 @@ def _try_optional_dataframe_exports(global_dir: Path, rows: list[dict[str, Any]]
             df.to_parquet(global_dir / "all_segments.parquet", index=False)
         except Exception:
             pass
-        try:
-            df.to_excel(global_dir / "review.xlsx", index=False)
-        except Exception:
-            pass
+        if xlsx_max_rows and len(rows) <= xlsx_max_rows:
+            try:
+                df.to_excel(global_dir / "review.xlsx", index=False)
+            except Exception:
+                pass
     except Exception:
         return

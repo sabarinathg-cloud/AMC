@@ -125,9 +125,9 @@ Run ASR model by model through Docker:
 
 ```bash
 docker/run_stage.sh --config /app/docker/config.docker.yaml run-stage asr --input /data --output /output --models whisper
-docker/run_stage.sh --config /app/docker/config.docker.yaml run-stage asr --input /data --output /output --models qwen --asr-batch-sizes qwen=1
-docker/run_stage.sh --config /app/docker/config.docker.yaml run-stage asr --input /data --output /output --models cohere --asr-batch-sizes cohere=1
-docker/run_stage.sh --config /app/docker/config.docker.yaml run-stage asr --input /data --output /output --models granite --asr-batch-sizes granite=1
+docker/run_stage.sh --config /app/docker/config.docker.yaml run-stage asr --input /data --output /output --models qwen
+docker/run_stage.sh --config /app/docker/config.docker.yaml run-stage asr --input /data --output /output --models cohere
+docker/run_stage.sh --config /app/docker/config.docker.yaml run-stage asr --input /data --output /output --models granite
 ```
 
 Run the known one-call test through Docker:
@@ -219,20 +219,17 @@ python3.10 -m amc_pipeline.cli run-stage asr \
 python3.10 -m amc_pipeline.cli run-stage asr \
   --input "$ONE_IN" \
   --output "$ONE_OUT" \
-  --models qwen \
-  --asr-batch-sizes qwen=1
+  --models qwen
 
 python3.10 -m amc_pipeline.cli run-stage asr \
   --input "$ONE_IN" \
   --output "$ONE_OUT" \
-  --models cohere \
-  --asr-batch-sizes cohere=1
+  --models cohere
 
 python3.10 -m amc_pipeline.cli run-stage asr \
   --input "$ONE_IN" \
   --output "$ONE_OUT" \
-  --models granite \
-  --asr-batch-sizes granite=1
+  --models granite
 
 python3.10 -m amc_pipeline.cli run-stage normalize \
   --input "$ONE_IN" \
@@ -318,7 +315,6 @@ python3.10 -m amc_pipeline.cli run \
   --input "$AMC_IN" \
   --output "$AMC_OUT" \
   --models whisper,qwen,cohere,granite \
-  --asr-batch-sizes qwen=1,cohere=1,granite=1 \
   --detectors regex,gliner,piiranha,spacy,rule_name,saved_json \
   --vad-backend silero \
   --mask-strategy beep \
@@ -334,9 +330,9 @@ export AMC_OUT=/mnt/amc-redacted
 
 python3.10 -m amc_pipeline.cli run-stage preprocess --input "$AMC_IN" --output "$AMC_OUT" --vad-backend silero
 python3.10 -m amc_pipeline.cli run-stage asr --input "$AMC_IN" --output "$AMC_OUT" --models whisper
-python3.10 -m amc_pipeline.cli run-stage asr --input "$AMC_IN" --output "$AMC_OUT" --models qwen --asr-batch-sizes qwen=1
-python3.10 -m amc_pipeline.cli run-stage asr --input "$AMC_IN" --output "$AMC_OUT" --models cohere --asr-batch-sizes cohere=1
-python3.10 -m amc_pipeline.cli run-stage asr --input "$AMC_IN" --output "$AMC_OUT" --models granite --asr-batch-sizes granite=1
+python3.10 -m amc_pipeline.cli run-stage asr --input "$AMC_IN" --output "$AMC_OUT" --models qwen
+python3.10 -m amc_pipeline.cli run-stage asr --input "$AMC_IN" --output "$AMC_OUT" --models cohere
+python3.10 -m amc_pipeline.cli run-stage asr --input "$AMC_IN" --output "$AMC_OUT" --models granite
 python3.10 -m amc_pipeline.cli run-stage normalize --input "$AMC_IN" --output "$AMC_OUT"
 python3.10 -m amc_pipeline.cli run-stage consensus --input "$AMC_IN" --output "$AMC_OUT"
 python3.10 -m amc_pipeline.cli run-stage pii --input "$AMC_IN" --output "$AMC_OUT" --detectors regex,gliner,piiranha,spacy,rule_name,saved_json
@@ -373,9 +369,9 @@ export AMC_OUT=/mnt/amc-output-shards/shard-$SHARD_INDEX
 
 python3.10 -m amc_pipeline.cli run-stage preprocess --input "$AMC_IN" --output "$AMC_OUT" --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path --vad-backend silero
 python3.10 -m amc_pipeline.cli run-stage asr --input "$AMC_IN" --output "$AMC_OUT" --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path --models whisper
-python3.10 -m amc_pipeline.cli run-stage asr --input "$AMC_IN" --output "$AMC_OUT" --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path --models qwen --asr-batch-sizes qwen=1
-python3.10 -m amc_pipeline.cli run-stage asr --input "$AMC_IN" --output "$AMC_OUT" --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path --models cohere --asr-batch-sizes cohere=1
-python3.10 -m amc_pipeline.cli run-stage asr --input "$AMC_IN" --output "$AMC_OUT" --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path --models granite --asr-batch-sizes granite=1
+python3.10 -m amc_pipeline.cli run-stage asr --input "$AMC_IN" --output "$AMC_OUT" --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path --models qwen
+python3.10 -m amc_pipeline.cli run-stage asr --input "$AMC_IN" --output "$AMC_OUT" --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path --models cohere
+python3.10 -m amc_pipeline.cli run-stage asr --input "$AMC_IN" --output "$AMC_OUT" --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path --models granite
 python3.10 -m amc_pipeline.cli run-stage normalize --input "$AMC_IN" --output "$AMC_OUT" --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path
 python3.10 -m amc_pipeline.cli run-stage consensus --input "$AMC_IN" --output "$AMC_OUT" --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path
 python3.10 -m amc_pipeline.cli run-stage pii --input "$AMC_IN" --output "$AMC_OUT" --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path --detectors regex,gliner,piiranha,spacy,rule_name,saved_json
@@ -545,9 +541,9 @@ export SHARD_INDEX=0
 
 docker/run_stage.sh --config /app/docker/config.docker.yaml run-stage preprocess --input /data --output /output --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path --vad-backend silero
 docker/run_stage.sh --config /app/docker/config.docker.yaml run-stage asr --input /data --output /output --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path --models whisper
-docker/run_stage.sh --config /app/docker/config.docker.yaml run-stage asr --input /data --output /output --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path --models qwen --asr-batch-sizes qwen=1
-docker/run_stage.sh --config /app/docker/config.docker.yaml run-stage asr --input /data --output /output --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path --models cohere --asr-batch-sizes cohere=1
-docker/run_stage.sh --config /app/docker/config.docker.yaml run-stage asr --input /data --output /output --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path --models granite --asr-batch-sizes granite=1
+docker/run_stage.sh --config /app/docker/config.docker.yaml run-stage asr --input /data --output /output --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path --models qwen
+docker/run_stage.sh --config /app/docker/config.docker.yaml run-stage asr --input /data --output /output --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path --models cohere
+docker/run_stage.sh --config /app/docker/config.docker.yaml run-stage asr --input /data --output /output --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path --models granite
 docker/run_stage.sh --config /app/docker/config.docker.yaml run-stage normalize --input /data --output /output --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path
 docker/run_stage.sh --config /app/docker/config.docker.yaml run-stage consensus --input /data --output /output --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path
 docker/run_stage.sh --config /app/docker/config.docker.yaml run-stage pii --input /data --output /output --num-shards "$NUM_SHARDS" --shard-index "$SHARD_INDEX" --discovery-hash-mode path --detectors regex,gliner,piiranha,spacy,rule_name,saved_json
@@ -585,8 +581,7 @@ Examples:
 python3.10 -m amc_pipeline.cli run-stage asr \
   --input "$AMC_IN" \
   --output "$AMC_OUT" \
-  --models qwen \
-  --asr-batch-sizes qwen=1
+  --models qwen
 
 python3.10 -m amc_pipeline.cli run-stage align \
   --input "$AMC_IN" \
@@ -619,6 +614,54 @@ python3.10 -m amc_pipeline.cli pause --output "$AMC_OUT" --global
 <output>/.pii_pipeline/state/pipeline.sqlite3  # SQLite mode only
 <output>/.pii_pipeline/reports/
 ```
+
+## ASR Throughput / Batching
+
+The Qwen, Cohere, and Granite adapters use **duration-budgeted dynamic batching**:
+segments are sorted by duration and packed into a batch until either a count cap
+or an audio-seconds budget is hit. This keeps the GPU busy without the OOM risk of
+a fixed large batch (a too-large batch still self-corrects via CUDA-OOM halving).
+
+Do **not** force `--asr-batch-sizes <model>=1` anymore. Batch=1 leaves the GPU
+mostly idle. The run scripts no longer set it; the defaults below apply instead.
+
+Per-model `asr_models.<model>` config knobs (all optional, backward compatible):
+
+| Knob | Default | Meaning |
+| --- | --- | --- |
+| `batch_size` | whisper 32 / qwen 8 / cohere 4 / granite 4 | Count cap fallback (also via `--asr-batch-sizes`). |
+| `max_batch_size` | unset | Count cap; overrides `batch_size` when set. |
+| `batch_audio_sec_budget` | qwen ~240 / cohere ~160 / granite ~160 | Max summed audio seconds per batch. |
+| `dtype` | `auto` (qwen/granite bf16 on CUDA, cohere float32) | `float32` / `float16` / `bfloat16`. |
+| `attn_implementation` | `sdpa` (auto, falls back) | Attention kernel; SDPA is faster and numerically equivalent. |
+| `prefetch` | `true` | Overlap CPU audio loading with GPU `generate` (Cohere/Granite). |
+
+Example `config.yaml`:
+
+```yaml
+asr_models:
+  cohere:
+    batch_audio_sec_budget: 160
+    max_batch_size: 8
+    # dtype: bfloat16   # enable ONLY after the parity check below passes
+  granite:
+    batch_audio_sec_budget: 160
+```
+
+### Quality gate before changing precision
+
+`dtype` and batch-size changes must not change transcripts. SDPA and dynamic
+batching are output-equivalent and on by default. Cohere defaults to **float32**
+(bit-for-bit unchanged). Before enabling `cohere.dtype: bfloat16`, validate on the
+GPU host with the parity harness:
+
+```bash
+python3 ops/asr_parity_check.py --input "$AMC_IN" --output "$AMC_OUT" \
+  --model cohere --limit 50 --check-bf16
+```
+
+It reports exact-match rate and WER for batch=1 vs dynamic batching, and float32
+vs bf16. Only keep bf16 if exact-match is ~1.0 and WER is negligible.
 
 ## Multiple A10 GPU Machines With Shared Storage
 
@@ -724,8 +767,7 @@ Machine 2:
 python3.10 -m amc_pipeline.cli --config "$CFG" run-stage asr \
   --input "$AMC_IN" \
   --output "$AMC_OUT" \
-  --models qwen \
-  --asr-batch-sizes qwen=1
+  --models qwen
 ```
 
 Machine 3:
@@ -734,8 +776,7 @@ Machine 3:
 python3.10 -m amc_pipeline.cli --config "$CFG" run-stage asr \
   --input "$AMC_IN" \
   --output "$AMC_OUT" \
-  --models cohere \
-  --asr-batch-sizes cohere=1
+  --models cohere
 ```
 
 Machine 4:
@@ -744,8 +785,7 @@ Machine 4:
 python3.10 -m amc_pipeline.cli --config "$CFG" run-stage asr \
   --input "$AMC_IN" \
   --output "$AMC_OUT" \
-  --models granite \
-  --asr-batch-sizes granite=1
+  --models granite
 ```
 
 After all four ASR jobs finish, run the rest once from one machine:
@@ -827,7 +867,6 @@ python3.10 -m amc_pipeline.cli run \
   --input "$SHARD_IN" \
   --output "$SHARD_OUT" \
   --models whisper,qwen,cohere,granite \
-  --asr-batch-sizes qwen=1,cohere=1,granite=1 \
   --detectors regex,gliner,piiranha,spacy,rule_name,saved_json \
   --vad-backend silero \
   --mask-strategy beep \

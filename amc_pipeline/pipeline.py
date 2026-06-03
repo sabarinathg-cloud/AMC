@@ -47,7 +47,9 @@ class Pipeline:
             try:
                 meta = inspect_audio(record.source_path)
                 inspected.append({"file_id": record.file_id, "channels": meta.channels, "duration_sec": meta.duration_sec, "sample_rate": meta.sample_rate})
-                self.state.upsert_file({"file_id": record.file_id, "source_path": str(record.source_path), "status": "inspected", "payload": dataclass_to_dict(record)})
+                payload = dataclass_to_dict(record)
+                payload["audio_metadata"] = _compact_audio_metadata(meta)
+                self.state.upsert_file({"file_id": record.file_id, "source_path": str(record.source_path), "status": "inspected", "payload": payload})
             except Exception as exc:
                 errors.append({"file_id": record.file_id, "source_path": str(record.source_path), "error": repr(exc)})
                 self.state.record_failure(f"{record.file_id}:inspect", "file", record.file_id, repr(exc), retryable=True)
@@ -137,32 +139,77 @@ class Pipeline:
 
     def preprocess(self) -> dict[str, Any]:
         records = discover_audio_files(self.config)
-        all_segments = []
-        errors = []
+        all_segments = 0
+        errors: list[dict[str, Any]] = []
         skipped = 0
-        existing_files = {row["file_id"]: row for row in self.state.fetch_files()}
-        existing_segments_by_file: dict[str, list[dict[str, Any]]] = {}
-        for row in self.state.fetch_segments():
-            existing_segments_by_file.setdefault(row["file_id"], []).append(row)
-        for record in iter_progress(records, desc="Preprocess audio", total=len(records), unit="file", enabled=self.config.progress_enabled):
-            if self.state.should_pause(self.config.run_id):
-                break
-            try:
-                if existing_files.get(record.file_id, {}).get("status") == "preprocessed" and existing_segments_by_file.get(record.file_id):
-                    skipped += 1
-                    continue
-                self.state.upsert_file({"file_id": record.file_id, "source_path": str(record.source_path), "status": "preprocessing", "payload": dataclass_to_dict(record)})
-                segments = preprocess_file(record, self.config)
-                all_segments.extend(segments)
-                for segment in segments:
-                    self.state.upsert_segment(segment.segment_id, record.file_id, "preprocessed", dataclass_to_dict(segment))
-                self.state.upsert_file({"file_id": record.file_id, "source_path": str(record.source_path), "status": "preprocessed", "payload": dataclass_to_dict(record)})
-            except Exception as exc:
-                errors.append({"file_id": record.file_id, "source_path": str(record.source_path), "error": repr(exc)})
-                self.state.record_failure(f"{record.file_id}:preprocess", "file", record.file_id, repr(exc), retryable=True)
+        existing_files: dict[str, dict[str, Any]] = {row["file_id"]: row for row in self.state.iter_files()}
+        existing_segment_file_ids: set[str] = {row["file_id"] for row in self.state.iter_segments()}
+        pending: list[AudioFileRecord] = []
+        for record in records:
+            if existing_files.get(record.file_id, {}).get("status") == "preprocessed" and record.file_id in existing_segment_file_ids:
+                skipped += 1
+                continue
+            pending.append(record)
+        workers = self.config.resolved_workers(self.config.preprocess_workers)
+
+        def file_payload(record: AudioFileRecord) -> dict[str, Any]:
+            payload = dataclass_to_dict(record)
+            prior = existing_files.get(record.file_id, {}).get("payload") or {}
+            meta = prior.get("audio_metadata")
+            if meta is None:
+                try:
+                    meta = _compact_audio_metadata(inspect_audio(record.source_path))
+                except Exception:
+                    meta = None
+            if meta is not None:
+                payload["audio_metadata"] = meta
+            return payload
+
+        def persist(record: AudioFileRecord, segments) -> int:
+            for segment in segments:
+                self.state.upsert_segment(segment.segment_id, record.file_id, "preprocessed", dataclass_to_dict(segment))
+            self.state.upsert_file({"file_id": record.file_id, "source_path": str(record.source_path), "status": "preprocessed", "payload": file_payload(record)})
+            return len(segments)
+
+        if workers <= 1 or len(pending) <= 1:
+            for record in iter_progress(pending, desc="Preprocess audio", total=len(pending), unit="file", enabled=self.config.progress_enabled):
+                if self.state.should_pause(self.config.run_id):
+                    break
+                try:
+                    self.state.upsert_file({"file_id": record.file_id, "source_path": str(record.source_path), "status": "preprocessing", "payload": file_payload(record)})
+                    all_segments += persist(record, preprocess_file(record, self.config))
+                except Exception as exc:
+                    errors.append({"file_id": record.file_id, "source_path": str(record.source_path), "error": repr(exc)})
+                    self.state.record_failure(f"{record.file_id}:preprocess", "file", record.file_id, repr(exc), retryable=True)
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+
+            futures = {}
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                for record in pending:
+                    if self.state.should_pause(self.config.run_id):
+                        break
+                    self.state.upsert_file({"file_id": record.file_id, "source_path": str(record.source_path), "status": "preprocessing", "payload": file_payload(record)})
+                    futures[pool.submit(preprocess_file, record, self.config)] = record
+                for future in iter_progress(futures, desc="Preprocess audio", total=len(futures), unit="file", enabled=self.config.progress_enabled):
+                    record = futures[future]
+                    try:
+                        all_segments += persist(record, future.result())
+                    except Exception as exc:
+                        errors.append({"file_id": record.file_id, "source_path": str(record.source_path), "error": repr(exc)})
+                        self.state.record_failure(f"{record.file_id}:preprocess", "file", record.file_id, repr(exc), retryable=True)
         segments_for_manifest = self._load_segments()
-        manifest_paths = write_segment_manifests(self.config.output_root, segments_for_manifest) if segments_for_manifest else []
-        summary = {"stage": "preprocess", "files": len(records), "segments": len(segments_for_manifest), "new_segments": len(all_segments), "skipped_files": skipped, "errors": errors, "manifests": [str(p) for p in manifest_paths]}
+        manifest_paths = (
+            write_segment_manifests(
+                self.config.output_root,
+                segments_for_manifest,
+                enable_dataframe_exports=self.config.manifest_dataframe_exports,
+                xlsx_max_rows=self.config.manifest_xlsx_max_rows,
+            )
+            if segments_for_manifest
+            else []
+        )
+        summary = {"stage": "preprocess", "files": len(records), "segments": len(segments_for_manifest), "new_segments": all_segments, "skipped_files": skipped, "errors": errors, "manifests": [str(p) for p in manifest_paths]}
         self._write_report("preprocess_summary.json", summary)
         return summary
 
@@ -256,10 +303,10 @@ class Pipeline:
         return summary
 
     def normalize(self) -> dict[str, Any]:
-        rows = self.state.fetch_model_results()
+        total = self.state.count_model_results()
         count = 0
         skipped = 0
-        for row in iter_progress(rows, desc="Normalize transcripts", total=len(rows), unit="result", enabled=self.config.progress_enabled):
+        for row in iter_progress(self.state.iter_model_results(), desc="Normalize transcripts", total=total, unit="result", enabled=self.config.progress_enabled):
             payload = row["payload"]
             if "normalized_transcript" in payload:
                 skipped += 1
@@ -273,7 +320,7 @@ class Pipeline:
 
     def consensus(self) -> dict[str, Any]:
         grouped: dict[str, list[ASRResult]] = {}
-        for row in self.state.fetch_model_results():
+        for row in self.state.iter_model_results():
             payload = row["payload"]
             grouped.setdefault(row["segment_id"], []).append(
                 ASRResult(
@@ -291,7 +338,7 @@ class Pipeline:
         skipped = 0
         existing = {
             artifact["payload"].get("segment_id") or artifact["artifact_id"].split(":", 1)[-1]
-            for artifact in self.state.fetch_artifacts("consensus")
+            for artifact in self.state.iter_artifacts("consensus")
             if artifact.get("status") == "completed"
         }
         items = list(grouped.items())
@@ -311,15 +358,15 @@ class Pipeline:
     def pii(self) -> dict[str, Any]:
         detectors = build_enabled_detectors(self.config)
         preflight_detectors(detectors)
-        artifacts = self.state.fetch_artifacts("consensus")
+        total = self.state.count_artifacts("consensus")
         existing = {
             artifact["payload"].get("segment_id") or artifact["artifact_id"].split(":", 1)[-1]
-            for artifact in self.state.fetch_artifacts("pii")
+            for artifact in self.state.iter_artifacts("pii")
             if artifact.get("status") == "completed"
         }
         count = 0
         skipped = 0
-        for artifact in iter_progress(artifacts, desc="Detect PII", total=len(artifacts), unit="segment", enabled=self.config.progress_enabled):
+        for artifact in iter_progress(self.state.iter_artifacts("consensus"), desc="Detect PII", total=total, unit="segment", enabled=self.config.progress_enabled):
             payload = artifact["payload"]
             final_transcript = payload.get("final_transcript", "")
             segment_id = payload.get("segment_id") or artifact["artifact_id"].split(":", 1)[-1]
@@ -329,7 +376,7 @@ class Pipeline:
             span_dicts = self._detect_pii_for_segment(segment_id, final_transcript, detectors)
             self.state.record_artifact(f"pii:{segment_id}", "pii", Path(segment_id), "completed", {"segment_id": segment_id, "spans": span_dicts})
             count += len(span_dicts)
-        summary = {"stage": "pii", "segments": len(artifacts), "processed": len(artifacts) - skipped, "skipped_existing": skipped, "spans": count}
+        summary = {"stage": "pii", "segments": total, "processed": total - skipped, "skipped_existing": skipped, "spans": count}
         self._write_report("pii_summary.json", summary)
         return summary
 
@@ -453,18 +500,67 @@ class Pipeline:
         self._write_report("mask_plan_summary.json", summary)
         return summary
 
+    def _redact_one(self, record: AudioFileRecord, intervals: list[MaskInterval]) -> tuple[Path, str, str | None, Any]:
+        out_path = self.config.output_root / record.relative_path
+        if not intervals:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(record.source_path, out_path)
+            result = validate_audio_pair(record.source_path, out_path)
+            status = "completed" if result.ok else "failed_validation"
+            self._copy_sidecar(record.source_path, out_path)
+            return out_path, status, None, result
+        if record.source_path.suffix.lower() == ".wav":
+            result = redact_wav_with_plan(record.source_path, out_path, intervals, strategy=self.config.masking.strategy)
+            status = "completed" if result.ok else "failed_validation"
+            self._copy_sidecar(record.source_path, out_path)
+            return out_path, status, None, result
+        decoded = temp_wav_path("amc_decode", base_dir=self.config.temp_dir)
+        masked = temp_wav_path("amc_masked", base_dir=self.config.temp_dir)
+        try:
+            decode_to_wav(record.source_path, decoded)
+            result = redact_wav_with_plan(decoded, masked, intervals, strategy=self.config.masking.strategy)
+            final_path = out_path
+            fallback_error = None
+            try:
+                encode_from_wav(masked, out_path, source_path=record.source_path)
+                status = "completed" if result.ok else "failed_validation"
+            except Exception as encode_exc:
+                if not self.config.masking.allow_wav_fallback:
+                    raise
+                fallback_error = repr(encode_exc)
+                final_path = out_path.with_suffix(".wav")
+                encode_from_wav(masked, final_path)
+                status = "completed_with_fallback" if result.ok else "failed_validation"
+        finally:
+            shutil.rmtree(decoded.parent, ignore_errors=True)
+            shutil.rmtree(masked.parent, ignore_errors=True)
+        self._copy_sidecar(record.source_path, final_path)
+        return final_path, status, fallback_error, result
+
+    def _copy_sidecar(self, source_path: Path, output_path: Path) -> None:
+        if not self.config.copy_sidecars:
+            return
+        sidecar = source_path.parent / "metadata.json"
+        if not sidecar.exists():
+            return
+        try:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(sidecar, output_path.parent / "metadata.json")
+        except Exception:
+            pass
+
     def redact(self) -> dict[str, Any]:
-        files = {row["file_id"]: _audio_file_from_payload(row["payload"]) for row in self.state.fetch_files()}
+        files = {row["file_id"]: _audio_file_from_payload(row["payload"]) for row in self.state.iter_files()}
         outputs = []
         failures = []
         skipped = 0
         existing_redacted = {
             artifact["payload"].get("file_id"): artifact
-            for artifact in self.state.fetch_artifacts("redacted")
+            for artifact in self.state.iter_artifacts("redacted")
             if artifact.get("status") in {"completed", "completed_with_fallback"}
         }
-        mask_artifacts = self.state.fetch_artifacts("mask_plan")
-        for artifact in iter_progress(mask_artifacts, desc="Redact audio", total=len(mask_artifacts), unit="file", enabled=self.config.progress_enabled):
+        pending: list[tuple[str, AudioFileRecord, list[MaskInterval]]] = []
+        for artifact in self.state.iter_artifacts("mask_plan"):
             if artifact["status"] != "completed":
                 continue
             file_id = artifact["payload"].get("file_id")
@@ -477,48 +573,44 @@ class Pipeline:
                 outputs.append(existing["payload"].get("path", ""))
                 continue
             intervals = [MaskInterval(**{k: v for k, v in raw.items() if k in {"channel", "start_sec", "end_sec", "reason", "entity_type", "confidence", "source"}}) for raw in artifact["payload"].get("intervals", [])]
+            pending.append((file_id, record, intervals))
+
+        workers = self.config.resolved_workers(self.config.redact_workers)
+
+        def persist(file_id: str, record: AudioFileRecord, final_path: Path, status: str, fallback_error: str | None, result: Any) -> None:
             out_path = self.config.output_root / record.relative_path
-            try:
-                if not intervals:
-                    out_path.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(record.source_path, out_path)
-                    final_path = out_path
-                    fallback_error = None
-                    result = validate_audio_pair(record.source_path, final_path)
-                    status = "completed" if result.ok else "failed_validation"
-                elif record.source_path.suffix.lower() == ".wav":
-                    result = redact_wav_with_plan(record.source_path, out_path, intervals, strategy=self.config.masking.strategy)
-                    status = "completed" if result.ok else "failed_validation"
-                    final_path = out_path
-                    fallback_error = None
-                else:
-                    decoded = temp_wav_path("amc_decode")
-                    masked = temp_wav_path("amc_masked")
-                    decode_to_wav(record.source_path, decoded)
-                    result = redact_wav_with_plan(decoded, masked, intervals, strategy=self.config.masking.strategy)
-                    final_path = out_path
-                    fallback_error = None
+            self.state.record_artifact(
+                f"redacted:{file_id}",
+                "redacted",
+                final_path,
+                status,
+                {"file_id": file_id, "path": str(final_path), "preferred_path": str(out_path), "fallback_error": fallback_error, "validation": dataclass_to_dict(result)},
+            )
+            outputs.append(str(final_path))
+
+        if workers <= 1 or len(pending) <= 1:
+            for file_id, record, intervals in iter_progress(pending, desc="Redact audio", total=len(pending), unit="file", enabled=self.config.progress_enabled):
+                try:
+                    final_path, status, fallback_error, result = self._redact_one(record, intervals)
+                    persist(file_id, record, final_path, status, fallback_error, result)
+                except Exception as exc:
+                    failures.append({"file_id": file_id, "error": repr(exc)})
+                    self.state.record_failure(f"{file_id}:redact", "file", file_id, repr(exc), retryable=True)
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+
+            futures = {}
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                for file_id, record, intervals in pending:
+                    futures[pool.submit(self._redact_one, record, intervals)] = (file_id, record)
+                for future in iter_progress(futures, desc="Redact audio", total=len(futures), unit="file", enabled=self.config.progress_enabled):
+                    file_id, record = futures[future]
                     try:
-                        encode_from_wav(masked, out_path, source_path=record.source_path)
-                        status = "completed" if result.ok else "failed_validation"
-                    except Exception as encode_exc:
-                        if not self.config.masking.allow_wav_fallback:
-                            raise
-                        fallback_error = repr(encode_exc)
-                        final_path = out_path.with_suffix(".wav")
-                        encode_from_wav(masked, final_path)
-                        status = "completed_with_fallback" if result.ok else "failed_validation"
-                self.state.record_artifact(
-                    f"redacted:{file_id}",
-                    "redacted",
-                    final_path,
-                    status,
-                    {"file_id": file_id, "path": str(final_path), "preferred_path": str(out_path), "fallback_error": fallback_error, "validation": dataclass_to_dict(result)},
-                )
-                outputs.append(str(final_path))
-            except Exception as exc:
-                failures.append({"file_id": file_id, "error": repr(exc)})
-                self.state.record_failure(f"{file_id}:redact", "file", file_id, repr(exc), retryable=True)
+                        final_path, status, fallback_error, result = future.result()
+                        persist(file_id, record, final_path, status, fallback_error, result)
+                    except Exception as exc:
+                        failures.append({"file_id": file_id, "error": repr(exc)})
+                        self.state.record_failure(f"{file_id}:redact", "file", file_id, repr(exc), retryable=True)
         summary = {"stage": "redact", "outputs": outputs, "failures": failures, "skipped_existing": skipped}
         self._write_report("redact_summary.json", summary)
         return summary
@@ -541,7 +633,13 @@ class Pipeline:
         return summary
 
     def write_manifests(self, segments) -> dict[str, Any]:
-        paths = write_segment_manifests(self.config.output_root, segments, self._manifest_extras())
+        paths = write_segment_manifests(
+            self.config.output_root,
+            segments,
+            self._manifest_extras(),
+            enable_dataframe_exports=self.config.manifest_dataframe_exports,
+            xlsx_max_rows=self.config.manifest_xlsx_max_rows,
+        )
         return {"paths": [str(p) for p in paths]}
 
     def pause(self, worker_id: str | None = None, global_pause: bool = False) -> dict[str, Any]:
@@ -571,14 +669,18 @@ class Pipeline:
         return segments
 
     def _manifest_extras(self) -> dict[str, dict[str, Any]]:
-        extras: dict[str, dict[str, Any]] = {s.segment_id: {} for s in self._load_segments()}
         segment_by_id = {s.segment_id: s for s in self._load_segments()}
+        extras: dict[str, dict[str, Any]] = {segment_id: {} for segment_id in segment_by_id}
+        file_metadata: dict[str, dict[str, Any]] = {
+            row["file_id"]: (row.get("payload") or {}).get("audio_metadata") or {}
+            for row in self.state.iter_files()
+        }
         file_redacted = {
             artifact["payload"].get("file_id"): artifact
-            for artifact in self.state.fetch_artifacts("redacted")
+            for artifact in self.state.iter_artifacts("redacted")
             if artifact["payload"].get("file_id")
         }
-        for row in self.state.fetch_model_results():
+        for row in self.state.iter_model_results():
             segment_id = row["segment_id"]
             payload = row["payload"]
             model = row["model_name"]
@@ -589,7 +691,7 @@ class Pipeline:
             if model == "whisper":
                 extras[segment_id]["language"] = payload.get("language") or extras[segment_id].get("language", "")
                 extras[segment_id]["language_confidence"] = payload.get("language_confidence") or payload.get("confidence") or extras[segment_id].get("language_confidence", "")
-        for artifact in self.state.fetch_artifacts("consensus"):
+        for artifact in self.state.iter_artifacts("consensus"):
             payload = artifact["payload"]
             segment_id = payload.get("segment_id")
             extras.setdefault(segment_id, {}).update(
@@ -602,19 +704,28 @@ class Pipeline:
                     "selected_model": payload.get("selected_model", ""),
                 }
             )
-        for artifact in self.state.fetch_artifacts("pii"):
+        for artifact in self.state.iter_artifacts("pii"):
             payload = artifact["payload"]
             segment_id = payload.get("segment_id")
             spans = payload.get("spans", [])
             extras.setdefault(segment_id, {})["pii_spans_json"] = json.dumps(spans, sort_keys=True, default=str)
             extras[segment_id]["pii_count"] = len(spans)
-        for artifact in self.state.fetch_artifacts("alignment"):
+        for artifact in self.state.iter_artifacts("alignment"):
             payload = artifact["payload"]
             segment_id = payload.get("segment_id")
             intervals = payload.get("intervals", [])
             extras.setdefault(segment_id, {})["mask_intervals_json"] = json.dumps(intervals, sort_keys=True, default=str)
             extras[segment_id]["alignment_status"] = artifact["status"]
         for segment_id, segment in segment_by_id.items():
+            meta = file_metadata.get(segment.file_id)
+            if meta:
+                extras.setdefault(segment_id, {})
+                extras[segment_id]["source_codec"] = meta.get("codec", "")
+                extras[segment_id]["source_sample_rate"] = meta.get("sample_rate", "")
+                extras[segment_id]["source_channels"] = meta.get("channels", "")
+                extras[segment_id]["source_duration_sec"] = meta.get("duration_sec", "")
+                extras[segment_id]["source_bitrate"] = meta.get("bitrate", "")
+                extras[segment_id]["source_channel_layout"] = meta.get("channel_layout", "")
             redacted = file_redacted.get(segment.file_id)
             if not redacted:
                 continue
@@ -632,6 +743,19 @@ def _segment_from_payload(payload: dict[str, Any]) -> SegmentRecord:
     data["source_path"] = Path(data["source_path"])
     data["segment_audio_path"] = Path(data["segment_audio_path"])
     return SegmentRecord(**{k: data[k] for k in SegmentRecord.__dataclass_fields__ if k in data})
+
+
+def _compact_audio_metadata(meta: Any) -> dict[str, Any]:
+    return {
+        "codec": getattr(meta, "codec", None),
+        "container": getattr(meta, "container", None),
+        "duration_sec": getattr(meta, "duration_sec", None),
+        "sample_rate": getattr(meta, "sample_rate", None),
+        "channels": getattr(meta, "channels", None),
+        "bitrate": getattr(meta, "bitrate", None),
+        "channel_layout": getattr(meta, "channel_layout", None),
+        "format_name": getattr(meta, "format_name", None),
+    }
 
 
 def _audio_file_from_payload(payload: dict[str, Any]) -> AudioFileRecord:

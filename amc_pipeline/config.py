@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,12 @@ class ASRModelConfig:
     path: str | None = None
     batch_size: int = 1
     device: str = "auto"
+    dtype: str = "auto"
+    batch_audio_sec_budget: float | None = None
+    max_batch_size: int | None = None
+    attn_implementation: str | None = None
+    prefetch: bool = True
+    data_parallel: bool = False
 
 
 @dataclass
@@ -95,6 +102,11 @@ class PipelineConfig:
     consensus_min_models: int = 3
     pii_on_all_model_transcripts: bool = False
     copy_sidecars: bool = False
+    retain_decoded_cache: bool = False
+    preprocess_workers: int = 0
+    redact_workers: int = 0
+    manifest_dataframe_exports: bool = True
+    manifest_xlsx_max_rows: int = 1_000_000
     report_mode: str = "internal"
     run_id: str = "default"
     progress_enabled: bool = True
@@ -144,6 +156,11 @@ class PipelineConfig:
         for path in [self.output_root, self.pipeline_dir, self.state_db_path.parent, self.reports_dir, self.cache_dir, self.temp_dir]:
             path.mkdir(parents=True, exist_ok=True)
 
+    def resolved_workers(self, requested: int) -> int:
+        if requested and int(requested) > 0:
+            return int(requested)
+        return max(1, min(4, os.cpu_count() or 1))
+
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["input_root"] = str(self.input_root) if self.input_root else None
@@ -174,7 +191,7 @@ class PipelineConfig:
             current = cfg.pii_models.get(name, PIIModelConfig())
             _merge_dataclass(current, values or {})
             cfg.pii_models[name] = current
-        for key in ["consensus_min_models", "pii_on_all_model_transcripts", "copy_sidecars", "report_mode", "run_id", "progress_enabled"]:
+        for key in ["consensus_min_models", "pii_on_all_model_transcripts", "copy_sidecars", "retain_decoded_cache", "preprocess_workers", "redact_workers", "manifest_dataframe_exports", "manifest_xlsx_max_rows", "report_mode", "run_id", "progress_enabled"]:
             if key in raw:
                 setattr(cfg, key, raw[key])
         if "languages" in raw:

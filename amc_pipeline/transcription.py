@@ -1,23 +1,37 @@
 from __future__ import annotations
 
+import dataclasses
 import importlib
 import importlib.util
 import gc
 import json
 import math
 import os
+import queue
+import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Callable, Iterable, Iterator
 
-from .config import PipelineConfig
+from .config import ASRModelConfig, PipelineConfig
 from .models import ASRResult, SegmentRecord
 from .progress import iter_progress
 
 
 QWEN_REQUIRED_TRANSFORMERS = "4.57.6"
+
+# Per-model dynamic-batching defaults: (max segment count, audio-seconds budget).
+# A batch is closed when either the count cap or the summed audio-seconds budget
+# is reached, so batches stay GPU-friendly regardless of segment length.
+_DEFAULT_BATCH_LIMITS: dict[str, tuple[int, float]] = {
+    "qwen": (8, 240.0),
+    "cohere": (4, 160.0),
+    "granite": (4, 160.0),
+}
+# How many upcoming batches to load on a background thread while the GPU runs.
+_PREFETCH_DEPTH = 2
 
 
 class ASRAdapter:
@@ -122,10 +136,11 @@ class WhisperAdapter(ASRAdapter):
 class QwenAdapter(ASRAdapter):
     name = "qwen"
 
-    def __init__(self, model_path: str, batch_size: int = 8, device: str = "auto"):
-        self.model_path = Path(model_path)
-        self.batch_size = max(1, int(batch_size or 8))
-        self.device = device
+    def __init__(self, cfg: ASRModelConfig):
+        self.model_path = Path(cfg.path or "")
+        self.batch_size = max(1, int(cfg.batch_size or 8))
+        self.device = cfg.device
+        self.cap, self.audio_budget = _resolve_batch_limits(cfg, self.name)
         self._model = None
         self._torch = None
 
@@ -151,7 +166,7 @@ class QwenAdapter(ASRAdapter):
                 str(self.model_path),
                 dtype=qwen_dtype,
                 device_map=qwen_device,
-                max_inference_batch_size=self.batch_size,
+                max_inference_batch_size=self.cap,
                 max_new_tokens=256,
             )
             _set_pad_token_to_eos(self._model)
@@ -163,7 +178,7 @@ class QwenAdapter(ASRAdapter):
         by_id: dict[str, ASRResult] = {}
         for language, group in _segments_by_language(segments).items():
             ordered = sorted(group, key=lambda s: (s.duration_sec, s.segment_id))
-            chunks = list(_chunks(ordered, self.batch_size))
+            chunks = list(_dynamic_batches(ordered, self.audio_budget, self.cap))
             for chunk in iter_progress(chunks, desc=f"Qwen ASR {language}", total=len(chunks), unit="batch", enabled=self.progress_enabled):
                 texts, errors = self._transcribe_paths(model, torch, [str(s.segment_audio_path) for s in chunk], _language_name(language))
                 for segment, text, error in zip(chunk, texts, errors):
@@ -207,10 +222,14 @@ class QwenAdapter(ASRAdapter):
 class CohereAdapter(ASRAdapter):
     name = "cohere"
 
-    def __init__(self, model_path: str, batch_size: int = 4, device: str = "auto"):
-        self.model_path = Path(model_path)
-        self.batch_size = max(1, int(batch_size or 4))
-        self.device = device
+    def __init__(self, cfg: ASRModelConfig):
+        self.model_path = Path(cfg.path or "")
+        self.batch_size = max(1, int(cfg.batch_size or 4))
+        self.device = cfg.device
+        self.dtype_name = cfg.dtype
+        self.attn_implementation = cfg.attn_implementation
+        self.prefetch = bool(cfg.prefetch)
+        self.cap, self.audio_budget = _resolve_batch_limits(cfg, self.name)
         self._processor = None
         self._model = None
         self._torch = None
@@ -226,16 +245,29 @@ class CohereAdapter(ASRAdapter):
         self._load()
         by_id: dict[str, ASRResult] = {}
         for language, group in _segments_by_language(segments).items():
-            chunks = list(_chunks(group, self.batch_size))
-            for chunk in iter_progress(chunks, desc=f"Cohere ASR {language}", total=len(chunks), unit="batch", enabled=self.progress_enabled):
-                texts, errors = self._transcribe_paths([str(s.segment_audio_path) for s in chunk], _language_code(language))
+            ordered = sorted(group, key=lambda s: (s.duration_sec, s.segment_id))
+            chunks = list(_dynamic_batches(ordered, self.audio_budget, self.cap))
+            lang_code = _language_code(language)
+
+            def _load_audios(chunk: list[SegmentRecord]) -> list[list[float]]:
+                with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as pool:
+                    return list(pool.map(lambda s: _load_cohere_audio(s.segment_audio_path), chunk))
+
+            produced = _prefetch_batches(chunks, _load_audios, enabled=self.prefetch)
+            for chunk, audios, load_error in iter_progress(
+                produced, desc=f"Cohere ASR {language}", total=len(chunks), unit="batch", enabled=self.progress_enabled
+            ):
+                if load_error is not None:
+                    texts, errors = self._transcribe_paths([str(s.segment_audio_path) for s in chunk], lang_code)
+                else:
+                    texts, errors = self._transcribe_loaded(audios, lang_code)
                 for segment, text, error in zip(chunk, texts, errors):
                     by_id[segment.segment_id] = ASRResult(
                         segment.segment_id,
                         self.name,
                         text,
                         0.0,
-                        _language_code(language),
+                        lang_code,
                         error=error,
                     )
         return [by_id.get(s.segment_id, ASRResult(s.segment_id, self.name, "", 0.0, error="NOT_RUN")) for s in segments]
@@ -250,10 +282,15 @@ class CohereAdapter(ASRAdapter):
             _clear_cuda(torch)
             self._torch = torch
             self._processor = AutoProcessor.from_pretrained(str(self.model_path), local_files_only=True)
-            self._model = CohereAsrForConditionalGeneration.from_pretrained(
+            # Default stays float32 (bit-for-bit unchanged) until the parity gate
+            # (ops/asr_parity_check.py) clears bf16; users opt in via dtype config.
+            torch_dtype = _resolve_dtype(self.dtype_name, torch, torch.float32)
+            self._model = _load_model_with_attn(
+                CohereAsrForConditionalGeneration,
                 str(self.model_path),
-                device_map="auto" if _wants_cuda(self.device, torch) else None,
-                torch_dtype=torch.float32,
+                attn_implementation=self.attn_implementation,
+                device_map=_resolve_device_map(self.device, torch),
+                torch_dtype=torch_dtype,
                 local_files_only=True,
             )
             self._model.eval()
@@ -261,26 +298,37 @@ class CohereAdapter(ASRAdapter):
             self._dtype = _model_dtype(self._model)
         return self._processor, self._model, self._torch
 
-    def _transcribe_paths(self, paths: list[str], language: str) -> tuple[list[str], list[str | None]]:
+    def _transcribe_loaded(self, audios: list[list[float]], language: str) -> tuple[list[str], list[str | None]]:
         torch = self._torch
         assert torch is not None
         try:
-            return self._transcribe_paths_no_fallback(paths, language)
+            return self._generate_from_audios(audios, language)
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
-            if len(paths) > 1:
-                return _split_and_join(lambda part: self._transcribe_paths(part, language), paths)
+            if len(audios) > 1:
+                return _split_and_join(lambda part: self._transcribe_loaded(part, language), audios)
             return [""], ["CUDA_OUT_OF_MEMORY"]
-        except Exception as exc:
-            if len(paths) > 1:
-                return _split_and_join(lambda part: self._transcribe_paths(part, language), paths)
-            text, err = self._transcribe_single(paths[0], language)
-            return [text], [err if err is not None else None]
+        except Exception:
+            if len(audios) > 1:
+                return _split_and_join(lambda part: self._transcribe_loaded(part, language), audios)
+            text, err = self._generate_single_audio(audios[0], language)
+            return [text], [err]
 
-    def _transcribe_paths_no_fallback(self, paths: list[str], language: str) -> tuple[list[str], list[str | None]]:
+    def _transcribe_paths(self, paths: list[str], language: str) -> tuple[list[str], list[str | None]]:
+        """Path-based slow path used only when prefetch loading raised for a batch."""
+        torch = self._torch
+        assert torch is not None
+        try:
+            audios = [_load_cohere_audio(p) for p in paths]
+        except Exception:
+            return _split_and_join(lambda part: self._transcribe_paths(part, language), paths) if len(paths) > 1 else (
+                [self._generate_single_path(paths[0], language)[0]],
+                [self._generate_single_path(paths[0], language)[1]],
+            )
+        return self._transcribe_loaded(audios, language)
+
+    def _generate_from_audios(self, audios: list[list[float]], language: str) -> tuple[list[str], list[str | None]]:
         processor, model, torch = self._load()
-        with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as pool:
-            audios = list(pool.map(_load_cohere_audio, paths))
         inputs = processor(
             audios,
             sampling_rate=16000,
@@ -293,25 +341,18 @@ class CohereAdapter(ASRAdapter):
         with torch.inference_mode():
             outputs = model.generate(**inputs, max_new_tokens=256)
         texts = _decode_cohere(processor, outputs, audio_chunk_index, language)
-        return _pad_texts(texts, len(paths))
+        return _pad_texts(texts, len(audios))
 
-    def _transcribe_single(self, path: str, language: str) -> tuple[str, str | None]:
-        processor, model, torch = self._load()
+    def _generate_single_audio(self, audio: list[float], language: str) -> tuple[str, str | None]:
         try:
-            audio = _load_cohere_audio(path)
-            inputs = processor(
-                audio,
-                sampling_rate=16000,
-                return_tensors="pt",
-                language=language,
-                punctuation=False,
-            )
-            audio_chunk_index = _clone_for_decode(inputs.get("audio_chunk_index", None) if hasattr(inputs, "get") else None, torch)
-            inputs = _move_inputs_to_device_dtype(inputs, self._device, self._dtype, torch)
-            with torch.inference_mode():
-                outputs = model.generate(**inputs, max_new_tokens=256)
-            texts = _decode_cohere(processor, outputs, audio_chunk_index, language)
+            texts, _ = self._generate_from_audios([audio], language)
             return (texts[0] if texts else ""), None
+        except Exception as exc:
+            return "", repr(exc)
+
+    def _generate_single_path(self, path: str, language: str) -> tuple[str, str | None]:
+        try:
+            return self._generate_single_audio(_load_cohere_audio(path), language)
         except Exception as exc:
             return "", repr(exc)
 
@@ -319,10 +360,14 @@ class CohereAdapter(ASRAdapter):
 class GraniteAdapter(ASRAdapter):
     name = "granite"
 
-    def __init__(self, model_path: str, batch_size: int = 4, device: str = "auto"):
-        self.model_path = Path(model_path)
-        self.batch_size = max(1, int(batch_size or 4))
-        self.device = device
+    def __init__(self, cfg: ASRModelConfig):
+        self.model_path = Path(cfg.path or "")
+        self.batch_size = max(1, int(cfg.batch_size or 4))
+        self.device = cfg.device
+        self.dtype_name = cfg.dtype
+        self.attn_implementation = cfg.attn_implementation
+        self.prefetch = bool(cfg.prefetch)
+        self.cap, self.audio_budget = _resolve_batch_limits(cfg, self.name)
         self._processor = None
         self._model = None
         self._tokenizer = None
@@ -338,12 +383,23 @@ class GraniteAdapter(ASRAdapter):
         _require_import("torch", self.name)
 
     def transcribe_batch(self, segments: list[SegmentRecord]) -> list[ASRResult]:
-        self._load()
+        _, _, _, torch = self._load()
         by_id: dict[str, ASRResult] = {}
         ordered = sorted(segments, key=lambda s: (s.duration_sec, s.segment_id))
-        chunks = list(_chunks(ordered, self.batch_size))
-        for chunk in iter_progress(chunks, desc="Granite ASR", total=len(chunks), unit="batch", enabled=self.progress_enabled):
-            texts, errors = self._transcribe_paths([str(s.segment_audio_path) for s in chunk])
+        chunks = list(_dynamic_batches(ordered, self.audio_budget, self.cap))
+
+        def _load_wavs(chunk: list[SegmentRecord]):
+            with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as pool:
+                return list(pool.map(lambda s: _load_granite_tensor(Path(s.segment_audio_path), torch), chunk))
+
+        produced = _prefetch_batches(chunks, _load_wavs, enabled=self.prefetch)
+        for chunk, wavs, load_error in iter_progress(
+            produced, desc="Granite ASR", total=len(chunks), unit="batch", enabled=self.progress_enabled
+        ):
+            if load_error is not None:
+                texts, errors = self._transcribe_paths([str(s.segment_audio_path) for s in chunk])
+            else:
+                texts, errors = self._transcribe_loaded(wavs)
             for segment, text, error in zip(chunk, texts, errors):
                 by_id[segment.segment_id] = ASRResult(
                     segment.segment_id,
@@ -364,15 +420,21 @@ class GraniteAdapter(ASRAdapter):
             _configure_torch_for_inference(torch)
             _clear_cuda(torch)
             self._torch = torch
-            self._device_str = "cuda" if _wants_cuda(self.device, torch) else "cpu"
-            granite_torch_dtype = torch.bfloat16 if self._device_str == "cuda" else torch.float32
+            if _wants_cuda(self.device, torch):
+                self._device_str = self.device if (self.device and self.device.startswith("cuda")) else "cuda"
+            else:
+                self._device_str = "cpu"
+            default_dtype = torch.bfloat16 if self._device_str.startswith("cuda") else torch.float32
+            granite_torch_dtype = _resolve_dtype(self.dtype_name, torch, default_dtype)
             self._processor = AutoProcessor.from_pretrained(str(self.model_path), local_files_only=True, trust_remote_code=True)
             self._tokenizer = getattr(self._processor, "tokenizer", None)
             if self._tokenizer is not None and getattr(self._tokenizer, "pad_token_id", None) is None:
                 self._tokenizer.pad_token_id = self._tokenizer.eos_token_id
-            self._model = AutoModelForSpeechSeq2Seq.from_pretrained(
+            self._model = _load_model_with_attn(
+                AutoModelForSpeechSeq2Seq,
                 str(self.model_path),
-                device_map=self._device_str if self._device_str == "cuda" else None,
+                attn_implementation=self.attn_implementation,
+                device_map=self._device_str if self._device_str.startswith("cuda") else None,
                 torch_dtype=granite_torch_dtype,
                 local_files_only=True,
                 trust_remote_code=True,
@@ -383,25 +445,35 @@ class GraniteAdapter(ASRAdapter):
             self._prompt = _granite_prompt(self._tokenizer)
         return self._processor, self._model, self._tokenizer, self._torch
 
-    def _transcribe_paths(self, paths: list[str]) -> tuple[list[str], list[str | None]]:
+    def _transcribe_loaded(self, wavs: list) -> tuple[list[str], list[str | None]]:
         torch = self._torch
         assert torch is not None
         try:
-            return self._transcribe_paths_no_fallback(paths)
+            return self._generate_from_wavs(wavs)
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
-            if len(paths) > 1:
-                return _split_and_join(self._transcribe_paths, paths)
+            if len(wavs) > 1:
+                return _split_and_join(self._transcribe_loaded, wavs)
             return [""], ["CUDA_OUT_OF_MEMORY"]
+        except Exception as exc:
+            if len(wavs) > 1:
+                return _split_and_join(self._transcribe_loaded, wavs)
+            return [""], [repr(exc)]
+
+    def _transcribe_paths(self, paths: list[str]) -> tuple[list[str], list[str | None]]:
+        """Path-based slow path used only when prefetch loading raised for a batch."""
+        torch = self._torch
+        assert torch is not None
+        try:
+            wavs = [_load_granite_tensor(Path(p), torch) for p in paths]
         except Exception as exc:
             if len(paths) > 1:
                 return _split_and_join(self._transcribe_paths, paths)
             return [""], [repr(exc)]
+        return self._transcribe_loaded(wavs)
 
-    def _transcribe_paths_no_fallback(self, paths: list[str]) -> tuple[list[str], list[str | None]]:
+    def _generate_from_wavs(self, wavs: list) -> tuple[list[str], list[str | None]]:
         processor, model, tokenizer, torch = self._load()
-        with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as pool:
-            wavs = list(pool.map(lambda p: _load_granite_tensor(Path(p), torch), paths))
         prompts = [self._prompt or _granite_prompt(tokenizer)] * len(wavs)
         inputs = processor(prompts, wavs, device=self._device_str, return_tensors="pt", padding=True)
         inputs = _move_inputs_to_device_dtype(inputs, self._device, self._dtype, torch)
@@ -413,9 +485,89 @@ class GraniteAdapter(ASRAdapter):
         with torch.inference_mode():
             output = model.generate(**inputs, **gen_kwargs)
         texts, errors = _decode_granite_generated_only(output, inputs, tokenizer, processor)
-        if len(texts) != len(paths):
-            return texts[: len(paths)] + [""] * max(0, len(paths) - len(texts)), ["BAD_OUTPUT_LENGTH"] * len(paths)
+        if len(texts) != len(wavs):
+            return texts[: len(wavs)] + [""] * max(0, len(wavs) - len(texts)), ["BAD_OUTPUT_LENGTH"] * len(wavs)
         return texts, errors
+
+
+class DataParallelAdapter(ASRAdapter):
+    """Run one model replica per visible GPU over disjoint segment shards.
+
+    Off by default (config-gated). Only engaged when ``data_parallel`` is set and
+    more than one CUDA device is visible. Each child adapter is pinned to a single
+    ``cuda:N`` device, so all existing per-adapter logic (dynamic batching, prefetch,
+    CUDA-OOM halving) is reused unchanged. Results are merged by segment id, so the
+    final per-segment output is independent of how shards were assigned.
+    """
+
+    def __init__(self, name: str, children: list[ASRAdapter]):
+        self.name = name
+        self._children = children
+
+    def preflight(self) -> None:
+        for child in self._children:
+            child.preflight()
+
+    def transcribe_batch(self, segments: list[SegmentRecord]) -> list[ASRResult]:
+        n = len(self._children)
+        if n <= 1:
+            return self._children[0].transcribe_batch(segments)
+        shards = [segments[i::n] for i in range(n)]  # round-robin balances duration mix
+        merged: dict[str, ASRResult] = {}
+        lock = threading.Lock()
+        errors: list[BaseException] = []
+
+        def _work(child: ASRAdapter, shard: list[SegmentRecord]) -> None:
+            if not shard:
+                return
+            try:
+                child.progress_enabled = False
+                results = child.transcribe_batch(shard)
+            except BaseException as exc:  # noqa: BLE001 - surfaced after join
+                with lock:
+                    errors.append(exc)
+                return
+            with lock:
+                for result in results:
+                    merged[result.segment_id] = result
+
+        threads = [threading.Thread(target=_work, args=(c, s), name=f"asr-dp-{i}") for i, (c, s) in enumerate(zip(self._children, shards))]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        if errors:
+            raise errors[0]
+        return [merged.get(s.segment_id, ASRResult(s.segment_id, self.name, "", 0.0, error="NOT_RUN")) for s in segments]
+
+    def close(self) -> None:
+        for child in self._children:
+            try:
+                child.close()
+            except Exception:
+                pass
+
+
+def _visible_gpu_count() -> int:
+    torch = _optional_import("torch")
+    if torch is None:
+        return 0
+    try:
+        return int(torch.cuda.device_count()) if torch.cuda.is_available() else 0
+    except Exception:
+        return 0
+
+
+def _build_single_adapter(name: str, model_cfg: ASRModelConfig) -> ASRAdapter:
+    if name == "whisper":
+        return WhisperAdapter(model_cfg.path or "", model_cfg.batch_size, model_cfg.device)
+    if name == "qwen":
+        return QwenAdapter(model_cfg)
+    if name == "cohere":
+        return CohereAdapter(model_cfg)
+    if name == "granite":
+        return GraniteAdapter(model_cfg)
+    raise ValueError(f"Unsupported ASR model: {name}")
 
 
 def build_enabled_adapters(config: PipelineConfig) -> list[ASRAdapter]:
@@ -423,16 +575,17 @@ def build_enabled_adapters(config: PipelineConfig) -> list[ASRAdapter]:
     for name, model_cfg in config.asr_models.items():
         if not model_cfg.enabled:
             continue
-        if name == "whisper":
-            adapters.append(WhisperAdapter(model_cfg.path or "", model_cfg.batch_size, model_cfg.device))
-        elif name == "qwen":
-            adapters.append(QwenAdapter(model_cfg.path or "", model_cfg.batch_size, model_cfg.device))
-        elif name == "cohere":
-            adapters.append(CohereAdapter(model_cfg.path or "", model_cfg.batch_size, model_cfg.device))
-        elif name == "granite":
-            adapters.append(GraniteAdapter(model_cfg.path or "", model_cfg.batch_size, model_cfg.device))
-        else:
-            raise ValueError(f"Unsupported ASR model: {name}")
+        # Optional, config-gated multi-GPU data parallelism for the seq2seq models.
+        if getattr(model_cfg, "data_parallel", False) and name in ("qwen", "cohere", "granite"):
+            gpu_count = _visible_gpu_count()
+            if gpu_count > 1:
+                children = [
+                    _build_single_adapter(name, dataclasses.replace(model_cfg, device=f"cuda:{i}"))
+                    for i in range(gpu_count)
+                ]
+                adapters.append(DataParallelAdapter(name, children))
+                continue
+        adapters.append(_build_single_adapter(name, model_cfg))
     return adapters
 
 
@@ -571,6 +724,144 @@ def _set_pad_token_to_eos(model) -> None:
 def _chunks(items: list[SegmentRecord] | list[str], batch_size: int):
     for start in range(0, len(items), max(1, batch_size)):
         yield items[start : start + max(1, batch_size)]
+
+
+def _resolve_batch_limits(cfg: ASRModelConfig, model_name: str) -> tuple[int, float | None]:
+    """Return (max_count, audio_sec_budget) for dynamic batching.
+
+    `max_batch_size` (if set) caps the count; otherwise `batch_size` is the cap.
+    `batch_audio_sec_budget` (if set) caps summed audio seconds; otherwise the
+    per-model default budget applies. Either limit closes a batch.
+    """
+    default_count, default_budget = _DEFAULT_BATCH_LIMITS.get(model_name, (4, None))
+    if cfg.max_batch_size and int(cfg.max_batch_size) > 0:
+        cap = int(cfg.max_batch_size)
+    elif cfg.batch_size and int(cfg.batch_size) > 0:
+        cap = int(cfg.batch_size)
+    else:
+        cap = default_count
+    cap = max(1, cap)
+    if cfg.batch_audio_sec_budget is not None and float(cfg.batch_audio_sec_budget) > 0:
+        budget: float | None = float(cfg.batch_audio_sec_budget)
+    else:
+        budget = default_budget
+    return cap, budget
+
+
+def _dynamic_batches(
+    segments: list[SegmentRecord],
+    audio_sec_budget: float | None,
+    max_count: int | None,
+) -> Iterator[list[SegmentRecord]]:
+    """Pack duration-sorted segments into batches bounded by count and audio seconds.
+
+    The input is assumed sorted by duration. A batch is closed once adding the
+    next segment would exceed the count cap or the audio-seconds budget; a single
+    oversized segment still forms its own batch so nothing is dropped. Output is a
+    partition of the input preserving order, so per-segment results are unaffected.
+    """
+    cap = max(1, int(max_count)) if max_count else None
+    budget = float(audio_sec_budget) if (audio_sec_budget and audio_sec_budget > 0) else None
+    batch: list[SegmentRecord] = []
+    total = 0.0
+    for seg in segments:
+        dur = max(0.0, float(getattr(seg, "duration_sec", 0.0) or 0.0))
+        if batch and (
+            (cap is not None and len(batch) >= cap)
+            or (budget is not None and total + dur > budget)
+        ):
+            yield batch
+            batch = []
+            total = 0.0
+        batch.append(seg)
+        total += dur
+    if batch:
+        yield batch
+
+
+def _prefetch_batches(
+    chunks: list[list[SegmentRecord]],
+    loader: Callable[[list[SegmentRecord]], Any],
+    enabled: bool = True,
+    depth: int = _PREFETCH_DEPTH,
+) -> Iterator[tuple[list[SegmentRecord], Any, Exception | None]]:
+    """Yield (chunk, payload, error) overlapping CPU loading with GPU compute.
+
+    A bounded background thread loads upcoming batches (queue depth `depth`) while
+    the caller runs `generate` on the current one. Ordering is preserved exactly.
+    Per-chunk load failures are surfaced as the `error` element so the caller can
+    fall back to the path-based slow path without aborting the whole run.
+    """
+    if not enabled or len(chunks) <= 1:
+        for chunk in chunks:
+            try:
+                yield chunk, loader(chunk), None
+            except Exception as exc:  # noqa: BLE001 - reported to caller
+                yield chunk, None, exc
+        return
+
+    result_queue: "queue.Queue[tuple[list[SegmentRecord], Any, Exception | None] | object]" = queue.Queue(maxsize=max(1, depth))
+    sentinel = object()
+
+    def _produce() -> None:
+        for chunk in chunks:
+            try:
+                payload = loader(chunk)
+                result_queue.put((chunk, payload, None))
+            except Exception as exc:  # noqa: BLE001 - reported to caller
+                result_queue.put((chunk, None, exc))
+        result_queue.put(sentinel)
+
+    worker = threading.Thread(target=_produce, name="asr-prefetch", daemon=True)
+    worker.start()
+    try:
+        while True:
+            item = result_queue.get()
+            if item is sentinel:
+                break
+            yield item  # type: ignore[misc]
+    finally:
+        worker.join()
+
+
+def _resolve_dtype(name: str | None, torch, default):
+    """Map a config dtype string to a torch dtype; "auto"/unknown -> default."""
+    key = (name or "auto").strip().lower()
+    if key in ("", "auto"):
+        return default
+    mapping = {
+        "float32": torch.float32,
+        "fp32": torch.float32,
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "half": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+    }
+    return mapping.get(key, default)
+
+
+def _resolve_device_map(device: str, torch):
+    """device_map for HF: pin to an explicit cuda:N when given, else "auto"/None."""
+    if not _wants_cuda(device, torch):
+        return None
+    if device and device.startswith("cuda:"):
+        return {"": device}
+    return "auto"
+
+
+def _load_model_with_attn(model_cls, model_path: str, attn_implementation: str | None = None, **kwargs):
+    """Load a HF model, preferring SDPA attention (faster, numerically equivalent).
+
+    SDPA does not change outputs versus eager attention, so this is safe under the
+    no-quality-drop guardrail. If the chosen implementation is unsupported by the
+    model/transformers version, fall back to the default attention silently.
+    """
+    chosen = attn_implementation or "sdpa"
+    try:
+        return model_cls.from_pretrained(model_path, attn_implementation=chosen, **kwargs)
+    except Exception:
+        return model_cls.from_pretrained(model_path, **kwargs)
 
 
 def _segments_by_language(segments: list[SegmentRecord]) -> dict[str, list[SegmentRecord]]:

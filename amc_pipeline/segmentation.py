@@ -6,6 +6,11 @@ import threading
 from dataclasses import dataclass
 from typing import Any
 
+try:  # numpy is preferred but optional; the pure-Python path stays fully functional.
+    import numpy as _np  # type: ignore
+except Exception:  # pragma: no cover - exercised when numpy is absent
+    _np = None
+
 
 _VAD_LOCAL = threading.local()
 _VAD_LOAD_LOCK = threading.Lock()
@@ -18,40 +23,66 @@ class PauseCandidate:
     score: float
 
 
-def rms(samples: list[float]) -> float:
+def rms(samples) -> float:
+    if _np is not None and isinstance(samples, _np.ndarray):
+        if samples.size == 0:
+            return 0.0
+        return float(_np.sqrt(_np.mean(samples.astype(_np.float64) ** 2)))
     if not samples:
         return 0.0
     return math.sqrt(sum(float(x) * float(x) for x in samples) / len(samples))
 
 
 def energy_vad(
-    samples: list[float],
+    samples,
     sample_rate: int,
     threshold_ratio: float = 0.08,
     window_ms: int = 30,
     merge_gap_sec: float = 0.8,
     merge: bool = True,
 ) -> list[tuple[float, float]]:
-    if not samples:
+    n = len(samples)
+    if n == 0:
         return []
     window = max(1, int(sample_rate * window_ms / 1000))
-    global_rms = rms(samples)
-    threshold = max(0.002, global_rms * threshold_ratio)
+    if _np is not None and isinstance(samples, _np.ndarray):
+        active_flags = _windowed_active_flags_numpy(samples, window, threshold_ratio)
+    else:
+        global_rms = rms(samples)
+        threshold = max(0.002, global_rms * threshold_ratio)
+        active_flags = [rms(samples[start : min(n, start + window)]) >= threshold for start in range(0, n, window)]
     intervals: list[tuple[float, float]] = []
     active_start: int | None = None
-    for start in range(0, len(samples), window):
-        end = min(len(samples), start + window)
-        active = rms(samples[start:end]) >= threshold
+    for index, start in enumerate(range(0, n, window)):
+        active = active_flags[index]
         if active and active_start is None:
             active_start = start
         elif not active and active_start is not None:
             intervals.append((active_start / sample_rate, start / sample_rate))
             active_start = None
     if active_start is not None:
-        intervals.append((active_start / sample_rate, len(samples) / sample_rate))
+        intervals.append((active_start / sample_rate, n / sample_rate))
     if merge:
         return merge_intervals(intervals, merge_gap_sec)
     return intervals
+
+
+def _windowed_active_flags_numpy(samples, window: int, threshold_ratio: float) -> list[bool]:
+    arr = samples.astype(_np.float64)
+    n = arr.shape[0]
+    global_rms = float(_np.sqrt(_np.mean(arr ** 2))) if n else 0.0
+    threshold = max(0.002, global_rms * threshold_ratio)
+    squared = arr ** 2
+    num_full = n // window
+    flags: list[bool] = []
+    if num_full:
+        trimmed = squared[: num_full * window].reshape(num_full, window)
+        full_rms = _np.sqrt(trimmed.mean(axis=1))
+        flags = [bool(value >= threshold) for value in full_rms]
+    if num_full * window < n:
+        tail = squared[num_full * window :]
+        flags.append(bool(math.sqrt(float(tail.mean())) >= threshold))
+    return flags
 
 
 def vad_intervals(
