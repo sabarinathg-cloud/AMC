@@ -62,6 +62,24 @@ class StaticASRAdapter:
         type(self).closed = True
 
 
+class CountingWhisperAdapter:
+    name = "whisper"
+    progress_enabled = False
+    calls = 0
+    segment_counts = []
+
+    def preflight(self):
+        return None
+
+    def transcribe_batch(self, segments):
+        type(self).calls += 1
+        type(self).segment_counts.append(len(segments))
+        return [ASRResult(s.segment_id, self.name, "resume safe transcript", 0.9, "en", 0.99) for s in segments]
+
+    def close(self):
+        return None
+
+
 def write_stereo_wav(path: Path, sample_rate: int = 16000, seconds: float = 1.0) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     nframes = int(sample_rate * seconds)
@@ -522,6 +540,49 @@ class CorePipelineTests(unittest.TestCase):
             self.assertIn(("granite", "transcribed"), statuses)
             self.assertTrue(FailingASRAdapter.closed)
             self.assertTrue(StaticASRAdapter.closed)
+
+    def test_stage_resume_skips_completed_items(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "input"
+            out = Path(td) / "out"
+            write_stereo_wav(root / "2026" / "call123" / "audio.wav")
+            config = PipelineConfig(input_root=root, output_root=out)
+            config.audio.vad_backend = "energy"
+            config.progress_enabled = False
+            pipeline = Pipeline(config)
+
+            first_preprocess = pipeline.preprocess()
+            second_preprocess = pipeline.preprocess()
+            self.assertEqual(first_preprocess["new_segments"], 2)
+            self.assertEqual(second_preprocess["new_segments"], 0)
+            self.assertEqual(second_preprocess["skipped_files"], 1)
+
+            CountingWhisperAdapter.calls = 0
+            CountingWhisperAdapter.segment_counts = []
+            with patch("amc_pipeline.pipeline.build_enabled_adapters", return_value=[CountingWhisperAdapter()]):
+                first_asr = pipeline.asr()
+            self.assertEqual(first_asr["models"]["whisper"], 2)
+            self.assertEqual(CountingWhisperAdapter.segment_counts, [2])
+
+            CountingWhisperAdapter.calls = 0
+            CountingWhisperAdapter.segment_counts = []
+            with patch("amc_pipeline.pipeline.build_enabled_adapters", return_value=[CountingWhisperAdapter()]):
+                second_asr = pipeline.asr()
+            self.assertEqual(second_asr["models"]["whisper"], 0)
+            self.assertEqual(second_asr["skipped_existing"]["whisper"], 2)
+            self.assertEqual(CountingWhisperAdapter.calls, 0)
+
+            first_normalize = pipeline.normalize()
+            second_normalize = pipeline.normalize()
+            self.assertEqual(first_normalize["model_results"], 2)
+            self.assertEqual(second_normalize["model_results"], 0)
+            self.assertEqual(second_normalize["skipped_existing"], 2)
+
+            first_consensus = pipeline.consensus()
+            second_consensus = pipeline.consensus()
+            self.assertEqual(first_consensus["processed"], 2)
+            self.assertEqual(second_consensus["processed"], 0)
+            self.assertEqual(second_consensus["skipped_existing"], 2)
 
     def test_cli_can_override_asr_batch_sizes(self):
         with tempfile.TemporaryDirectory() as td:

@@ -139,10 +139,18 @@ class Pipeline:
         records = discover_audio_files(self.config)
         all_segments = []
         errors = []
+        skipped = 0
+        existing_files = {row["file_id"]: row for row in self.state.fetch_files()}
+        existing_segments_by_file: dict[str, list[dict[str, Any]]] = {}
+        for row in self.state.fetch_segments():
+            existing_segments_by_file.setdefault(row["file_id"], []).append(row)
         for record in iter_progress(records, desc="Preprocess audio", total=len(records), unit="file", enabled=self.config.progress_enabled):
             if self.state.should_pause(self.config.run_id):
                 break
             try:
+                if existing_files.get(record.file_id, {}).get("status") == "preprocessed" and existing_segments_by_file.get(record.file_id):
+                    skipped += 1
+                    continue
                 self.state.upsert_file({"file_id": record.file_id, "source_path": str(record.source_path), "status": "preprocessing", "payload": dataclass_to_dict(record)})
                 segments = preprocess_file(record, self.config)
                 all_segments.extend(segments)
@@ -152,8 +160,9 @@ class Pipeline:
             except Exception as exc:
                 errors.append({"file_id": record.file_id, "source_path": str(record.source_path), "error": repr(exc)})
                 self.state.record_failure(f"{record.file_id}:preprocess", "file", record.file_id, repr(exc), retryable=True)
-        manifest_paths = write_segment_manifests(self.config.output_root, all_segments) if all_segments else []
-        summary = {"stage": "preprocess", "files": len(records), "segments": len(all_segments), "errors": errors, "manifests": [str(p) for p in manifest_paths]}
+        segments_for_manifest = self._load_segments()
+        manifest_paths = write_segment_manifests(self.config.output_root, segments_for_manifest) if segments_for_manifest else []
+        summary = {"stage": "preprocess", "files": len(records), "segments": len(segments_for_manifest), "new_segments": len(all_segments), "skipped_files": skipped, "errors": errors, "manifests": [str(p) for p in manifest_paths]}
         self._write_report("preprocess_summary.json", summary)
         return summary
 
@@ -161,11 +170,23 @@ class Pipeline:
         segments = self._load_segments()
         adapters = build_enabled_adapters(self.config)
         counts: dict[str, int] = {}
+        skipped_counts: dict[str, int] = {}
         failed_models: list[dict[str, Any]] = []
         supported = {x.lower() for x in self.config.languages}
         language_by_segment: dict[str, str | None] = {}
         language_confidence_by_segment: dict[str, float | None] = {}
         segment_by_id = {s.segment_id: s for s in segments}
+        existing_results = {
+            (row["segment_id"], row["model_name"]): row
+            for row in self.state.fetch_model_results()
+            if row.get("status") == "transcribed"
+        }
+        for (segment_id, model_name), row in existing_results.items():
+            if model_name != "whisper":
+                continue
+            payload = row["payload"]
+            language_by_segment[segment_id] = payload.get("language")
+            language_confidence_by_segment[segment_id] = payload.get("language_confidence")
         adapters = sorted(adapters, key=lambda a: 0 if a.name == "whisper" else 1)
         for adapter in adapters:
             adapter.progress_enabled = self.config.progress_enabled
@@ -182,6 +203,11 @@ class Pipeline:
                         for s in segments
                         if (language_by_segment.get(s.segment_id) or "").lower() in supported
                     ]
+                skipped_counts[adapter.name] = sum(1 for s in model_segments if (s.segment_id, adapter.name) in existing_results)
+                model_segments = [s for s in model_segments if (s.segment_id, adapter.name) not in existing_results]
+                if not model_segments:
+                    counts[adapter.name] = 0
+                    continue
                 try:
                     adapter.preflight()
                     results = adapter.transcribe_batch(model_segments)
@@ -225,19 +251,23 @@ class Pipeline:
                 payload["language"] = lang
                 payload["status_reason"] = "unsupported_language"
                 self.state.upsert_segment(segment.segment_id, segment.file_id, "skipped_unsupported_language", payload)
-        summary = {"stage": "asr", "segments": len(segments), "models": counts, "model_failures": failed_models, "skipped_unsupported_language": skipped}
+        summary = {"stage": "asr", "segments": len(segments), "models": counts, "skipped_existing": skipped_counts, "model_failures": failed_models, "skipped_unsupported_language": skipped}
         self._write_report("asr_summary.json", summary)
         return summary
 
     def normalize(self) -> dict[str, Any]:
         rows = self.state.fetch_model_results()
         count = 0
+        skipped = 0
         for row in iter_progress(rows, desc="Normalize transcripts", total=len(rows), unit="result", enabled=self.config.progress_enabled):
             payload = row["payload"]
+            if "normalized_transcript" in payload:
+                skipped += 1
+                continue
             payload["normalized_transcript"] = normalize_transcript(payload.get("transcript", ""), remove_fillers=True)
             self.state.upsert_model_result(row["segment_id"], row["model_name"], row["status"], payload)
             count += 1
-        summary = {"stage": "normalize", "model_results": count}
+        summary = {"stage": "normalize", "model_results": count, "skipped_existing": skipped}
         self._write_report("normalize_summary.json", summary)
         return summary
 
@@ -258,13 +288,23 @@ class Pipeline:
                 )
             )
         strong = 0
+        skipped = 0
+        existing = {
+            artifact["payload"].get("segment_id") or artifact["artifact_id"].split(":", 1)[-1]
+            for artifact in self.state.fetch_artifacts("consensus")
+            if artifact.get("status") == "completed"
+        }
         items = list(grouped.items())
         for segment_id, results in iter_progress(items, desc="Build consensus", total=len(items), unit="segment", enabled=self.config.progress_enabled):
+            if segment_id in existing:
+                skipped += 1
+                continue
             result = build_consensus(results, min_successful_models=self.config.consensus_min_models)
             if result.strong:
                 strong += 1
             self.state.record_artifact(f"consensus:{segment_id}", "consensus", Path(segment_id), "completed", dataclass_to_dict(result))
-        summary = {"stage": "consensus", "segments": len(grouped), "strong": strong, "weak": len(grouped) - strong}
+        processed = len(grouped) - skipped
+        summary = {"stage": "consensus", "segments": len(grouped), "processed": processed, "skipped_existing": skipped, "strong": strong, "weak": processed - strong}
         self._write_report("consensus_summary.json", summary)
         return summary
 
@@ -272,15 +312,24 @@ class Pipeline:
         detectors = build_enabled_detectors(self.config)
         preflight_detectors(detectors)
         artifacts = self.state.fetch_artifacts("consensus")
+        existing = {
+            artifact["payload"].get("segment_id") or artifact["artifact_id"].split(":", 1)[-1]
+            for artifact in self.state.fetch_artifacts("pii")
+            if artifact.get("status") == "completed"
+        }
         count = 0
+        skipped = 0
         for artifact in iter_progress(artifacts, desc="Detect PII", total=len(artifacts), unit="segment", enabled=self.config.progress_enabled):
             payload = artifact["payload"]
             final_transcript = payload.get("final_transcript", "")
-            span_dicts = self._detect_pii_for_segment(payload.get("segment_id") or artifact["artifact_id"].split(":", 1)[-1], final_transcript, detectors)
             segment_id = payload.get("segment_id") or artifact["artifact_id"].split(":", 1)[-1]
+            if segment_id in existing:
+                skipped += 1
+                continue
+            span_dicts = self._detect_pii_for_segment(segment_id, final_transcript, detectors)
             self.state.record_artifact(f"pii:{segment_id}", "pii", Path(segment_id), "completed", {"segment_id": segment_id, "spans": span_dicts})
             count += len(span_dicts)
-        summary = {"stage": "pii", "segments": len(artifacts), "spans": count}
+        summary = {"stage": "pii", "segments": len(artifacts), "processed": len(artifacts) - skipped, "skipped_existing": skipped, "spans": count}
         self._write_report("pii_summary.json", summary)
         return summary
 
@@ -318,12 +367,21 @@ class Pipeline:
             raise RuntimeError(f"Unsupported alignment backend: {self.config.alignment.backend}")
         consensus_by_segment = {a["payload"]["segment_id"]: a["payload"] for a in self.state.fetch_artifacts("consensus")}
         segment_by_id = {s.segment_id: s for s in self._load_segments()}
+        existing = {
+            artifact["payload"].get("segment_id") or artifact["artifact_id"].split(":", 1)[-1]
+            for artifact in self.state.fetch_artifacts("alignment")
+            if artifact.get("status") == "completed"
+        }
         aligned = 0
         failures = 0
+        skipped = 0
         pii_artifacts = self.state.fetch_artifacts("pii")
         for artifact in iter_progress(pii_artifacts, desc="Force alignment", total=len(pii_artifacts), unit="segment", enabled=self.config.progress_enabled):
             payload = artifact["payload"]
             segment_id = payload["segment_id"]
+            if segment_id in existing:
+                skipped += 1
+                continue
             segment = segment_by_id.get(segment_id)
             consensus = consensus_by_segment.get(segment_id)
             if segment is None or consensus is None:
@@ -352,7 +410,7 @@ class Pipeline:
                 failures += 1
                 self.state.record_failure(f"{segment_id}:alignment", "segment", segment_id, repr(exc), retryable=True)
                 self.state.record_artifact(f"alignment:{segment_id}", "alignment", Path(segment_id), "failed", {"segment_id": segment_id, "error": repr(exc)})
-        summary = {"stage": "align", "aligned": aligned, "failed": failures}
+        summary = {"stage": "align", "aligned": aligned, "failed": failures, "skipped_existing": skipped}
         self._write_report("align_summary.json", summary)
         return summary
 
@@ -361,6 +419,11 @@ class Pipeline:
         files = {row["file_id"]: _audio_file_from_payload(row["payload"]) for row in self.state.fetch_files()}
         by_file: dict[str, list[dict[str, Any]]] = {file_id: [] for file_id in files}
         failed_file_ids: set[str] = set()
+        existing_file_ids = {
+            artifact["payload"].get("file_id") or artifact["artifact_id"].split(":", 1)[-1]
+            for artifact in self.state.fetch_artifacts("mask_plan")
+            if artifact.get("status") == "completed"
+        }
         alignment_artifacts = self.state.fetch_artifacts("alignment")
         for artifact in iter_progress(alignment_artifacts, desc="Build mask plan", total=len(alignment_artifacts), unit="segment", enabled=self.config.progress_enabled):
             segment_id = artifact["payload"].get("segment_id")
@@ -377,12 +440,16 @@ class Pipeline:
                 full["segment_id"] = segment_id
                 by_file.setdefault(segment.file_id, []).append(full)
         file_items = list(by_file.items())
+        skipped = 0
         for file_id, intervals in iter_progress(file_items, desc="Save mask plans", total=len(file_items), unit="file", enabled=self.config.progress_enabled):
+            if file_id in existing_file_ids:
+                skipped += 1
+                continue
             if file_id in failed_file_ids:
                 self.state.record_artifact(f"mask_plan:{file_id}", "mask_plan", Path(file_id), "failed", {"file_id": file_id, "intervals": [], "error": "alignment_failed"})
                 continue
             self.state.record_artifact(f"mask_plan:{file_id}", "mask_plan", Path(file_id), "completed", {"file_id": file_id, "intervals": intervals})
-        summary = {"stage": "mask_plan", "files": len(by_file) - len(failed_file_ids), "failed_files": len(failed_file_ids), "intervals": sum(len(v) for k, v in by_file.items() if k not in failed_file_ids)}
+        summary = {"stage": "mask_plan", "files": len(by_file) - len(failed_file_ids) - skipped, "failed_files": len(failed_file_ids), "skipped_existing": skipped, "intervals": sum(len(v) for k, v in by_file.items() if k not in failed_file_ids and k not in existing_file_ids)}
         self._write_report("mask_plan_summary.json", summary)
         return summary
 
@@ -390,6 +457,12 @@ class Pipeline:
         files = {row["file_id"]: _audio_file_from_payload(row["payload"]) for row in self.state.fetch_files()}
         outputs = []
         failures = []
+        skipped = 0
+        existing_redacted = {
+            artifact["payload"].get("file_id"): artifact
+            for artifact in self.state.fetch_artifacts("redacted")
+            if artifact.get("status") in {"completed", "completed_with_fallback"}
+        }
         mask_artifacts = self.state.fetch_artifacts("mask_plan")
         for artifact in iter_progress(mask_artifacts, desc="Redact audio", total=len(mask_artifacts), unit="file", enabled=self.config.progress_enabled):
             if artifact["status"] != "completed":
@@ -397,6 +470,11 @@ class Pipeline:
             file_id = artifact["payload"].get("file_id")
             record = files.get(file_id)
             if record is None:
+                continue
+            existing = existing_redacted.get(file_id)
+            if existing and Path(existing["payload"].get("path", "")).exists():
+                skipped += 1
+                outputs.append(existing["payload"].get("path", ""))
                 continue
             intervals = [MaskInterval(**{k: v for k, v in raw.items() if k in {"channel", "start_sec", "end_sec", "reason", "entity_type", "confidence", "source"}}) for raw in artifact["payload"].get("intervals", [])]
             out_path = self.config.output_root / record.relative_path
@@ -441,7 +519,7 @@ class Pipeline:
             except Exception as exc:
                 failures.append({"file_id": file_id, "error": repr(exc)})
                 self.state.record_failure(f"{file_id}:redact", "file", file_id, repr(exc), retryable=True)
-        summary = {"stage": "redact", "outputs": outputs, "failures": failures}
+        summary = {"stage": "redact", "outputs": outputs, "failures": failures, "skipped_existing": skipped}
         self._write_report("redact_summary.json", summary)
         return summary
 

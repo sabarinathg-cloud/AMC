@@ -396,6 +396,138 @@ export SHARD_INDEX=3
 
 For N machines, set `NUM_SHARDS=N` and use shard indexes from `0` to `N - 1`.
 
+### No-Docker SSM Run
+
+Use this mode for the 5-instance A10 fleet when Docker GPU runtime is not
+available. Each instance computes its shard index from the current SSM instance
+list, writes to a separate shard output folder, and records status under the run
+root.
+
+Create a small 2026 review set first:
+
+```bash
+export AWS_REGION=us-east-1
+export PROJECT_TAG=amc-ec2-fleet
+export SMOKE_ROOT=/mnt/amc-runs/2026-smoke-100
+
+ONE_ID=$(aws ssm describe-instance-information \
+  --region "$AWS_REGION" \
+  --filters "Key=tag:Project,Values=$PROJECT_TAG" \
+  --query 'sort_by(InstanceInformationList[?PingStatus==`Online`], &InstanceId)[0].InstanceId' \
+  --output text)
+
+SETUP_ID=$(aws ssm send-command \
+  --region "$AWS_REGION" \
+  --instance-ids "$ONE_ID" \
+  --document-name AWS-RunShellScript \
+  --parameters '{"commands":["cd /mnt/amc-data/AMC","git config --global --add safe.directory /mnt/amc-data/AMC || true","git pull --ff-only","python3.10 ops/create_call_subset.py --source-root /mnt/amc-data --year 2026 --output-root /mnt/amc-runs/2026-smoke-100/input --limit 100 --mode symlink --force"]}' \
+  --query 'Command.CommandId' \
+  --output text)
+
+echo "$SETUP_ID"
+```
+
+Check setup output:
+
+```bash
+aws ssm get-command-invocation \
+  --region "$AWS_REGION" \
+  --command-id "$SETUP_ID" \
+  --instance-id "$ONE_ID" \
+  --query '{Status:Status,StdOut:StandardOutputContent,StdErr:StandardErrorContent}' \
+  --output json
+```
+
+Launch the 5-way smoke run:
+
+```bash
+export AMC_IN=/mnt/amc-runs/2026-smoke-100/input
+export RUN_ROOT=/mnt/amc-runs/2026-smoke-100
+export STAGES="preprocess asr_whisper asr_qwen asr_cohere asr_granite normalize consensus pii align mask_plan redact validate manifest"
+
+CMD_ID=$(bash ops/ssm_submit_no_docker.sh)
+echo "$CMD_ID"
+```
+
+Monitor AWS command status and shard-level pipeline progress:
+
+```bash
+export RUN_ROOT=/mnt/amc-runs/2026-smoke-100
+bash ops/ssm_status_no_docker.sh "$CMD_ID"
+```
+
+Resume the same smoke run after any interruption:
+
+```bash
+export AMC_IN=/mnt/amc-runs/2026-smoke-100/input
+export RUN_ROOT=/mnt/amc-runs/2026-smoke-100
+CMD_ID=$(bash ops/ssm_submit_no_docker.sh)
+echo "$CMD_ID"
+```
+
+Completed stage markers live in:
+
+```bash
+/mnt/amc-runs/2026-smoke-100/outputs/shard-*/.pii_pipeline/stage_markers/
+```
+
+Item-level state lives in:
+
+```bash
+/mnt/amc-runs/2026-smoke-100/outputs/shard-*/.pii_pipeline/state/pipeline.sqlite3
+```
+
+Run the full 2026 folder after the review set passes:
+
+```bash
+export AWS_REGION=us-east-1
+export PROJECT_TAG=amc-ec2-fleet
+export FULL_ROOT=/mnt/amc-runs/2026-full
+
+ONE_ID=$(aws ssm describe-instance-information \
+  --region "$AWS_REGION" \
+  --filters "Key=tag:Project,Values=$PROJECT_TAG" \
+  --query 'sort_by(InstanceInformationList[?PingStatus==`Online`], &InstanceId)[0].InstanceId' \
+  --output text)
+
+SETUP_ID=$(aws ssm send-command \
+  --region "$AWS_REGION" \
+  --instance-ids "$ONE_ID" \
+  --document-name AWS-RunShellScript \
+  --parameters '{"commands":["cd /mnt/amc-data/AMC","git config --global --add safe.directory /mnt/amc-data/AMC || true","git pull --ff-only","python3.10 ops/create_call_subset.py --source-root /mnt/amc-data --year 2026 --output-root /mnt/amc-runs/2026-full/input --limit 100000 --mode symlink --force"]}' \
+  --query 'Command.CommandId' \
+  --output text)
+
+echo "$SETUP_ID"
+```
+
+Launch the full run:
+
+```bash
+export AMC_IN=/mnt/amc-runs/2026-full/input
+export RUN_ROOT=/mnt/amc-runs/2026-full
+export STAGES="preprocess asr_whisper asr_qwen asr_cohere asr_granite normalize consensus pii align mask_plan redact validate manifest"
+
+CMD_ID=$(bash ops/ssm_submit_no_docker.sh)
+echo "$CMD_ID"
+```
+
+Collect final masked audio after all shards complete:
+
+```bash
+export FINAL_OUT=/mnt/amc-redacted-final/2026
+mkdir -p "$FINAL_OUT"
+
+for shard_dir in /mnt/amc-runs/2026-full/outputs/shard-*; do
+  rsync -a \
+    --exclude '/.pii_pipeline/' \
+    --include '*/' \
+    --include 'audio.*' \
+    --exclude '*' \
+    "$shard_dir"/ "$FINAL_OUT"/
+done
+```
+
 Docker version of the same shard run:
 
 ```bash
