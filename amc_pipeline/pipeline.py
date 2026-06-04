@@ -422,6 +422,16 @@ class Pipeline:
         aligned = 0
         failures = 0
         skipped = 0
+        degraded = 0
+        # Supported language roots (e.g. {"en", "es"}). Whisper occasionally misdetects
+        # short/noisy segments as other languages (pt, nn, ...). Forced alignment for those
+        # would fetch a language-specific wav2vec2 model from HuggingFace, which (a) may not
+        # exist / lack safetensors and (b) is pointless for an out-of-scope language.
+        supported_langs = {str(x).lower().replace("_", "-").split("-", 1)[0] for x in self.config.languages}
+        # Uniform fallback needs no language model and still maps PII spans to time
+        # intervals, so masking stays fail-safe (no leak) even when a forced-alignment
+        # model is unavailable or the detected language is unsupported.
+        uniform_fallback = TokenUniformAligner()
         pii_artifacts = self.state.fetch_artifacts("pii")
         for artifact in iter_progress(pii_artifacts, desc="Force alignment", total=len(pii_artifacts), unit="segment", enabled=self.config.progress_enabled):
             payload = artifact["payload"]
@@ -440,8 +450,24 @@ class Pipeline:
             try:
                 transcript = consensus.get("final_transcript", "")
                 if isinstance(aligner, WhisperXAligner):
-                    words = aligner.align_segment(segment, transcript, segment.language or consensus.get("language") or "en")
-                    intervals = TokenUniformAligner().spans_to_intervals(spans, transcript, words, channel=segment.channel, pre_padding_ms=self.config.masking.pre_padding_ms, post_padding_ms=self.config.masking.post_padding_ms)
+                    seg_lang = segment.language or consensus.get("language") or "en"
+                    lang_root = str(seg_lang).lower().replace("_", "-").split("-", 1)[0]
+                    use_uniform = lang_root not in supported_langs
+                    if not use_uniform:
+                        try:
+                            words = aligner.align_segment(segment, transcript, seg_lang)
+                            intervals = TokenUniformAligner().spans_to_intervals(spans, transcript, words, channel=segment.channel, pre_padding_ms=self.config.masking.pre_padding_ms, post_padding_ms=self.config.masking.post_padding_ms)
+                        except RequiredAlignmentError:
+                            raise
+                        except Exception as exc:  # forced-alignment model load/runtime failure
+                            # Degrade to uniform timing for THIS segment instead of crashing the
+                            # stage; spans still get masked and the parent call is not dropped.
+                            self.state.record_failure(f"{segment_id}:alignment", "segment", segment_id, f"whisperx_fallback_uniform: {exc!r}", retryable=True)
+                            use_uniform = True
+                    if use_uniform:
+                        words = uniform_fallback.align(segment_id, transcript, segment.duration_sec)
+                        intervals = uniform_fallback.spans_to_intervals(spans, transcript, words, channel=segment.channel, pre_padding_ms=self.config.masking.pre_padding_ms, post_padding_ms=self.config.masking.post_padding_ms)
+                        degraded += 1
                 else:
                     words = aligner.align(segment_id, transcript, segment.duration_sec)
                     intervals = aligner.spans_to_intervals(spans, transcript, words, channel=segment.channel, pre_padding_ms=self.config.masking.pre_padding_ms, post_padding_ms=self.config.masking.post_padding_ms)
@@ -457,7 +483,7 @@ class Pipeline:
                 failures += 1
                 self.state.record_failure(f"{segment_id}:alignment", "segment", segment_id, repr(exc), retryable=True)
                 self.state.record_artifact(f"alignment:{segment_id}", "alignment", Path(segment_id), "failed", {"segment_id": segment_id, "error": repr(exc)})
-        summary = {"stage": "align", "aligned": aligned, "failed": failures, "skipped_existing": skipped}
+        summary = {"stage": "align", "aligned": aligned, "failed": failures, "degraded_uniform": degraded, "skipped_existing": skipped}
         self._write_report("align_summary.json", summary)
         return summary
 

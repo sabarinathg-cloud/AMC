@@ -537,6 +537,126 @@ class CorePipelineTests(unittest.TestCase):
             self.assertTrue(validation["validations"][0]["ok"])
             self.assertTrue((out / "2022" / "call123" / "audio.wav").exists())
 
+    def test_align_degrades_to_uniform_instead_of_crashing(self):
+        from amc_pipeline import pipeline as pipeline_mod
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "input"
+            out = Path(td) / "out"
+            write_stereo_wav(root / "2022" / "call123" / "audio.wav")
+            config = PipelineConfig(input_root=root, output_root=out)
+            config.audio.vad_backend = "energy"
+            config.alignment.backend = "whisperx"
+            for name, detector in config.pii_models.items():
+                detector.enabled = name == "regex"
+            pipeline = Pipeline(config)
+            pipeline.preprocess()
+
+            transcript = "My name is John Smith and phone is 555-123-4567"
+            for segment_row in pipeline.state.fetch_segments():
+                segment_id = segment_row["segment_id"]
+                for model_name in ["whisper", "qwen", "cohere"]:
+                    result = ASRResult(segment_id=segment_id, model_name=model_name, transcript=transcript, confidence=0.9, language="en")
+                    pipeline.state.upsert_model_result(segment_id, model_name, "transcribed", dataclass_to_dict(result))
+
+            pipeline.normalize()
+            pipeline.consensus()
+            self.assertGreaterEqual(pipeline.pii()["spans"], 1)
+
+            calls = {"align_segment": 0}
+
+            class _FailingAligner:
+                name = "whisperx"
+
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                def preflight(self):
+                    return None
+
+                def align_segment(self, *args, **kwargs):
+                    calls["align_segment"] += 1
+                    raise RuntimeError("forced-alignment model load blocked (CVE-2025-32434)")
+
+            original = pipeline_mod.WhisperXAligner
+            pipeline_mod.WhisperXAligner = _FailingAligner
+            try:
+                summary = pipeline.align()
+            finally:
+                pipeline_mod.WhisperXAligner = original
+
+            # Supported language (en) -> tries the model, fails, degrades to uniform.
+            self.assertGreaterEqual(calls["align_segment"], 1)
+            self.assertEqual(summary["failed"], 0)
+            self.assertGreaterEqual(summary["degraded_uniform"], 1)
+            # Spans still mask and the call is NOT dropped from output.
+            mask_plan = pipeline.mask_plan()
+            self.assertEqual(mask_plan["files"], 1)
+            self.assertGreaterEqual(mask_plan["intervals"], 1)
+
+    def test_align_skips_language_model_for_unsupported_language(self):
+        from amc_pipeline import pipeline as pipeline_mod
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "input"
+            out = Path(td) / "out"
+            write_stereo_wav(root / "2022" / "call123" / "audio.wav")
+            config = PipelineConfig(input_root=root, output_root=out)
+            config.audio.vad_backend = "energy"
+            config.alignment.backend = "whisperx"
+            for name, detector in config.pii_models.items():
+                detector.enabled = name == "regex"
+            pipeline = Pipeline(config)
+            pipeline.preprocess()
+
+            transcript = "My name is John Smith and phone is 555-123-4567"
+            # Whisper misdetected this segment's language as Portuguese (unsupported).
+            for segment_row in pipeline.state.fetch_segments():
+                segment_id = segment_row["segment_id"]
+                for model_name in ["whisper", "qwen", "cohere"]:
+                    result = ASRResult(segment_id=segment_id, model_name=model_name, transcript=transcript, confidence=0.9, language="pt")
+                    pipeline.state.upsert_model_result(segment_id, model_name, "transcribed", dataclass_to_dict(result))
+
+            pipeline.normalize()
+            pipeline.consensus()
+            self.assertGreaterEqual(pipeline.pii()["spans"], 1)
+
+            # The real asr() stage stamps segment.language; here we set it directly to the
+            # misdetected unsupported language so the align stage sees it.
+            for segment_row in pipeline.state.fetch_segments():
+                payload = dict(segment_row["payload"])
+                payload["language"] = "pt"
+                pipeline.state.upsert_segment(segment_row["segment_id"], segment_row["file_id"], segment_row["status"], payload)
+
+            calls = {"align_segment": 0}
+
+            class _RecordingAligner:
+                name = "whisperx"
+
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                def preflight(self):
+                    return None
+
+                def align_segment(self, *args, **kwargs):
+                    calls["align_segment"] += 1
+                    raise AssertionError("must not fetch a language model for unsupported language")
+
+            original = pipeline_mod.WhisperXAligner
+            pipeline_mod.WhisperXAligner = _RecordingAligner
+            try:
+                summary = pipeline.align()
+            finally:
+                pipeline_mod.WhisperXAligner = original
+
+            # Unsupported language must never reach the language-specific model loader.
+            self.assertEqual(calls["align_segment"], 0)
+            self.assertEqual(summary["failed"], 0)
+            self.assertGreaterEqual(summary["degraded_uniform"], 1)
+            mask_plan = pipeline.mask_plan()
+            self.assertGreaterEqual(mask_plan["intervals"], 1)
+
     def test_pipeline_writes_full_output_when_no_pii_is_found(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "input"
