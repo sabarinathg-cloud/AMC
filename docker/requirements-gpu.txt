@@ -14,6 +14,12 @@ scipy>=1.10
 gliner>=0.2.13
 spacy>=3.7,<3.8
 
+# transformers 4.57.x (pinned by the qwen ASR extra) probes for an optional
+# "additional_chat_templates" folder during tokenizer load and only catches the
+# old EntryNotFoundError. huggingface_hub>=1.0 raises RemoteEntryNotFoundError
+# instead, which is uncaught and 404-crashes models like piiranha. Pin to 0.x.
+huggingface_hub>=0.34,<1.0
+
 # Manifests and review exports
 pandas>=2.2
 pyarrow>=15
