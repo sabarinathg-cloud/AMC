@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import shutil
 from pathlib import Path
 
@@ -31,14 +32,26 @@ def main() -> int:
         shutil.rmtree(output_year)
     output_year.mkdir(parents=True, exist_ok=True)
 
+    # Stream directory entries and stop as soon as we have `--limit` calls.
+    # Years can hold ~500K call folders on shared storage; sorting/stat-ing the
+    # whole listing first would stall for minutes. os.scandir is lazy and we
+    # break early, so this is O(limit), not O(total calls).
     audio_files = []
-    for call_dir in sorted(p for p in source_year.iterdir() if p.is_dir()):
-        audio = _first_audio(call_dir)
-        if audio is None:
-            continue
-        audio_files.append(audio)
-        if len(audio_files) >= args.limit:
-            break
+    with os.scandir(source_year) as entries:
+        for entry in entries:
+            if len(audio_files) >= args.limit:
+                break
+            try:
+                if not entry.is_dir(follow_symlinks=True):
+                    continue
+            except OSError:
+                continue
+            audio = _first_audio(Path(entry.path))
+            if audio is None:
+                continue
+            audio_files.append(audio)
+    # Stable ordering of just the small selected set (cheap; keeps manifest deterministic).
+    audio_files.sort(key=lambda p: p.parent.name)
 
     rows = []
     for index, audio in enumerate(audio_files):
