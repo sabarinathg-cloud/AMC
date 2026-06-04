@@ -1,5 +1,8 @@
 # ASR runtimes
-faster-whisper>=1.0.3
+# CTranslate2 >= 4.5.0 links cuDNN 9 to match the torch cu121 wheel; older 4.4.x
+# links cuDNN 8 and fails with "libcudnn_ops_infer.so.8: cannot open shared object file".
+faster-whisper>=1.1.1
+ctranslate2>=4.5.0
 whisperx>=3.3.0
 
 # Audio loading and DSP

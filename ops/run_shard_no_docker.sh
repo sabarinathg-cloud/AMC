@@ -49,6 +49,27 @@ mkdir -p "$AMC_OUT" "$LOG_DIR" "$STATUS_DIR" "$LOCK_DIR" "$MARKER_DIR"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# CTranslate2 (faster-whisper backend) dlopen's cuDNN/cuBLAS at runtime, but the
+# pip-installed CUDA libs live under site-packages/nvidia/*/lib which is not on the
+# default loader path. Surface them so the whisper stage can find libcudnn_*.so.
+# (CTranslate2 >= 4.5.0 links cuDNN 9, matching the torch cu121 wheel.)
+NVIDIA_LIB_DIRS="$("$PYTHON_BIN" - <<'PY'
+import os
+dirs = []
+for mod_name in ("nvidia.cudnn", "nvidia.cublas"):
+    try:
+        mod = __import__(mod_name, fromlist=["__file__"])
+        lib = os.path.join(os.path.dirname(mod.__file__), "lib")
+        if os.path.isdir(lib):
+            dirs.append(lib)
+    except Exception:
+        pass
+print(":".join(dirs))
+PY
+)"
+if [[ -n "$NVIDIA_LIB_DIRS" ]]; then
+  export LD_LIBRARY_PATH="$NVIDIA_LIB_DIRS:${LD_LIBRARY_PATH:-}"
+fi
 # Local scratch for decode/mask WAVs: keep heavy temp I/O off shared NFS.
 export AMC_TEMP_DIR="${AMC_TEMP_DIR:-/tmp/amc-scratch/$INSTANCE_ID/shard-$SHARD_INDEX}"
 mkdir -p "$AMC_TEMP_DIR"
