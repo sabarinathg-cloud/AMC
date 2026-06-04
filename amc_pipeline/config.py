@@ -150,16 +150,25 @@ class PipelineConfig:
 
     @property
     def temp_dir(self) -> Path:
+        # Prefer local scratch (set per-instance by the shard runner) to avoid
+        # writing full-length decoded/masked WAVs over shared NFS during redact.
+        override = os.environ.get("AMC_TEMP_DIR")
+        if override:
+            return Path(override)
         return self.pipeline_dir / "temp"
 
     def ensure_output_dirs(self) -> None:
         for path in [self.output_root, self.pipeline_dir, self.state_db_path.parent, self.reports_dir, self.cache_dir, self.temp_dir]:
             path.mkdir(parents=True, exist_ok=True)
 
-    def resolved_workers(self, requested: int) -> int:
+    def resolved_workers(self, requested: int, max_workers: int | None = None) -> int:
         if requested and int(requested) > 0:
-            return int(requested)
-        return max(1, min(4, os.cpu_count() or 1))
+            value = int(requested)
+        else:
+            value = max(1, min(4, os.cpu_count() or 1))
+        if max_workers is not None:
+            value = max(1, min(value, int(max_workers)))
+        return value
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)

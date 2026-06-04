@@ -49,6 +49,9 @@ mkdir -p "$AMC_OUT" "$LOG_DIR" "$STATUS_DIR" "$LOCK_DIR" "$MARKER_DIR"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# Local scratch for decode/mask WAVs: keep heavy temp I/O off shared NFS.
+export AMC_TEMP_DIR="${AMC_TEMP_DIR:-/tmp/amc-scratch/$INSTANCE_ID/shard-$SHARD_INDEX}"
+mkdir -p "$AMC_TEMP_DIR"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-4}"
@@ -137,7 +140,7 @@ run_stage() {
   local rc=${PIPESTATUS[0]}
   set -e
 
-  rm -rf "$AMC_OUT/.pii_pipeline/temp"/* 2>/dev/null || true
+  rm -rf "$AMC_TEMP_DIR"/* "$AMC_OUT/.pii_pipeline/temp"/* 2>/dev/null || true
   sync || true
   echo "===== $(date -Is) END $key rc=$rc =====" | tee -a "$log"
   if [[ "$rc" == "0" ]]; then
