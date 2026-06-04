@@ -108,12 +108,27 @@ PY
 }
 
 if [[ "$AUTO_PULL" == "1" ]]; then
-  write_status "repo_pull" "running" "updating shared checkout"
-  (
-    flock -w 900 9
+  # On a SHARED (NFS) checkout, concurrent pulls from N hosts race and corrupt
+  # refs ("cannot lock ref refs/remotes/origin/main"); flock does not reliably
+  # serialize across hosts on NFS. So only the lowest-index shard pulls, and the
+  # rest wait for the marker. SSM runs as root without HOME, which breaks git
+  # global config / ref locking, so pin HOME explicitly.
+  export HOME="${HOME:-/root}"
+  PULL_DONE_MARKER="$STATUS_DIR/.repo_pull_done"
+  if [[ "$SHARD_INDEX" == "0" ]]; then
+    write_status "repo_pull" "running" "updating shared checkout (shard 0)"
+    rm -f "$PULL_DONE_MARKER" 2>/dev/null || true
     git config --global --add safe.directory "$REPO_DIR" || true
-    git pull --ff-only
-  ) 9>"$LOCK_DIR/repo_pull.lock"
+    git fetch origin
+    git reset --hard origin/main
+    git rev-parse HEAD > "$PULL_DONE_MARKER"
+  else
+    write_status "repo_pull" "waiting" "waiting for shard 0 to update shared checkout"
+    for _ in $(seq 1 180); do
+      [[ -f "$PULL_DONE_MARKER" ]] && break
+      sleep 2
+    done
+  fi
 fi
 
 read -r RUN_FILE_COUNT RUN_SIGNATURE < <(
