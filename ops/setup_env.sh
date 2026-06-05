@@ -52,16 +52,21 @@ cd "$REPO_DIR" || die "repo not found at $REPO_DIR"
 [[ -f docker/requirements-gpu.txt ]] || die "docker/requirements-gpu.txt missing"
 [[ -f docker/requirements-align.txt ]] || die "docker/requirements-align.txt missing"
 
-# Signature: rebuild when any input pin set or this script's schema changes.
-signature() {
-  cat docker/requirements-gpu.txt docker/requirements-align.txt \
-      docker/constraints-gpu.txt pyproject.toml 2>/dev/null \
-    | sha256sum | awk -v s="$SCHEMA_VERSION" '{print s"-"$1}'
+# Per-venv signatures: rebuild a venv only when ITS pin set (or this script's schema)
+# changes, so editing the align requirements does not force a main rebuild and vice versa.
+sig_of() { cat "$@" 2>/dev/null | sha256sum | awk -v s="$SCHEMA_VERSION" '{print s"-"$1}'; }
+MAIN_SIG="$(sig_of docker/requirements-gpu.txt docker/constraints-gpu.txt pyproject.toml)"
+ALIGN_SIG="$(sig_of docker/requirements-align.txt pyproject.toml)"
+
+venv_sig() {  # $1=venv dir -> expected signature
+  case "$1" in
+    "$ALIGN_VENV") printf '%s' "$ALIGN_SIG" ;;
+    *) printf '%s' "$MAIN_SIG" ;;
+  esac
 }
-SIG="$(signature)"
 
 venv_ready() {  # $1=venv dir
-  [[ -x "$1/bin/python" && -f "$1/.ready" && "$(cat "$1/.ready" 2>/dev/null)" == "$SIG" ]]
+  [[ -x "$1/bin/python" && -f "$1/.ready" && "$(cat "$1/.ready" 2>/dev/null)" == "$(venv_sig "$1")" ]]
 }
 
 build_main() {
@@ -81,7 +86,7 @@ build_main() {
   $pip install --force-reinstall --no-deps huggingface_hub==0.36.2 || die "hf pin (main)"
   $pip install "numpy<2" || die "numpy pin (main)"
   "$MAIN_VENV/bin/python" -m spacy download en_core_web_sm || log "WARN: spacy model download failed (retry later)"
-  echo "$SIG" > "$MAIN_VENV/.ready"
+  echo "$MAIN_SIG" > "$MAIN_VENV/.ready"
   log "MAIN venv ready"
 }
 
@@ -97,7 +102,7 @@ build_align() {
   $pip install -r docker/requirements-align.txt -e "." || die "requirements/editable install (align)"
   $pip install --force-reinstall --no-deps nvidia-cudnn-cu12==9.1.0.70 || die "cudnn pin (align)"
   $pip install "numpy<2" || die "numpy pin (align)"
-  echo "$SIG" > "$ALIGN_VENV/.ready"
+  echo "$ALIGN_SIG" > "$ALIGN_VENV/.ready"
   log "ALIGN venv ready"
 }
 
@@ -157,7 +162,7 @@ am_builder=0
 deadline=$(( $(date +%s) + LOCK_WAIT ))
 while true; do
   if [[ "${FORCE_REBUILD:-0}" != "1" ]] && both_ready; then
-    log "both venvs already built (sig $SIG); skipping build"
+    log "both venvs already built (main $MAIN_SIG / align $ALIGN_SIG); skipping build"
     break
   fi
   if mkdir "$LOCK_DIR" 2>/dev/null; then
@@ -186,11 +191,11 @@ if (( am_builder == 1 )); then
     build_main
     build_align
   else
-    if venv_ready "$MAIN_VENV"; then log "MAIN venv up-to-date (sig $SIG); skipping"; else build_main; fi
-    if venv_ready "$ALIGN_VENV"; then log "ALIGN venv up-to-date (sig $SIG); skipping"; else build_align; fi
+    if venv_ready "$MAIN_VENV"; then log "MAIN venv up-to-date (sig $MAIN_SIG); skipping"; else build_main; fi
+    if venv_ready "$ALIGN_VENV"; then log "ALIGN venv up-to-date (sig $ALIGN_SIG); skipping"; else build_align; fi
   fi
   release_lock   # let waiters proceed to verify in parallel
 fi
 
 verify || die "post-build verification failed"
-log "all environments ready and verified (sig $SIG)"
+log "all environments ready and verified (main $MAIN_SIG / align $ALIGN_SIG)"

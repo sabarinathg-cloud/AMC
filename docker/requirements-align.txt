@@ -20,8 +20,13 @@ whisperx==3.4.2
 pyannote-audio==3.4.0
 transformers==4.56.2
 huggingface_hub==0.35.0
-ctranslate2>=4.5.0
-faster-whisper>=1.1.1
+
+# Do NOT pin ctranslate2 / faster-whisper here. whisperx 3.4.2 requires
+# ctranslate2<4.5.0 (cuDNN 8 line); pinning >=4.5.0 makes the resolver fail. This venv
+# only runs whisperx forced alignment (torch + wav2vec2), never the ctranslate2/
+# faster-whisper transcription path (that runs in the main venv). ctranslate2 loads cuDNN
+# lazily on CUDA model creation, so importing whisperx works without cuDNN 8 present. Let
+# whisperx pull its own compatible ctranslate2/faster-whisper.
 
 # Keep NumPy on the 1.x ABI (same reason as the main env).
 numpy<2
