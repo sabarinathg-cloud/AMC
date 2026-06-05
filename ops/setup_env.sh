@@ -130,22 +130,67 @@ if [[ "${1:-}" == "--verify" ]]; then
   exit 0
 fi
 
+# ---- NFS-safe single-builder election --------------------------------------------------
+# IMPORTANT: flock() does NOT provide mutual exclusion across NFS clients -- advisory locks
+# are not reliably honored between hosts, so a fleet-wide `flock` lets every instance enter
+# the "single builder" section at once and clobber the shared venv. We instead use an atomic
+# `mkdir` lease (the same primitive resume_shard.sh uses for shard claims), refreshed by a
+# background heartbeat, with stale-lease takeover so a dead builder cannot wedge the fleet.
 mkdir -p "$VENV_ROOT"
-exec 9>"$VENV_ROOT/.build.lock"
-log "acquiring build lock (wait up to ${LOCK_WAIT}s)"
-flock -w "$LOCK_WAIT" 9 || die "could not acquire build lock within ${LOCK_WAIT}s"
+LOCK_DIR="$VENV_ROOT/.build.lock.d"
+LEASE="$LOCK_DIR/lease"
+SELF="$(hostname):$$"
+LEASE_TTL="${AMC_ENV_LOCK_TTL:-900}"   # treat builder as dead if its lease is older than this
+HB_PID=""
+write_lease() { printf '%s %s\n' "$(date +%s)" "$SELF" > "$LEASE" 2>/dev/null || true; }
+start_hb() { ( while true; do write_lease; sleep 60; done ) & HB_PID=$!; }
+release_lock() {
+  [[ -n "$HB_PID" ]] && kill "$HB_PID" 2>/dev/null || true
+  HB_PID=""
+  rm -rf "$LOCK_DIR" 2>/dev/null || true
+}
+trap 'release_lock' EXIT INT TERM
 
-if [[ "${FORCE_REBUILD:-0}" == "1" ]]; then
-  log "FORCE_REBUILD=1: rebuilding both venvs"
-  build_main
-  build_align
-else
-  if venv_ready "$MAIN_VENV"; then log "MAIN venv up-to-date (sig $SIG); skipping"; else build_main; fi
-  if venv_ready "$ALIGN_VENV"; then log "ALIGN venv up-to-date (sig $SIG); skipping"; else build_align; fi
+both_ready() { venv_ready "$MAIN_VENV" && venv_ready "$ALIGN_VENV"; }
+
+am_builder=0
+deadline=$(( $(date +%s) + LOCK_WAIT ))
+while true; do
+  if [[ "${FORCE_REBUILD:-0}" != "1" ]] && both_ready; then
+    log "both venvs already built (sig $SIG); skipping build"
+    break
+  fi
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    am_builder=1; write_lease; start_hb
+    log "acquired build lease as $SELF"
+    break
+  fi
+  # Lock is held: wait for the builder, or take over if its lease has gone stale.
+  ep="$(awk 'NR==1{print $1}' "$LEASE" 2>/dev/null)"; ep="${ep:-0}"
+  age=$(( $(date +%s) - ep ))
+  if (( age > LEASE_TTL )); then
+    log "stale build lease (age ${age}s > ${LEASE_TTL}s); taking over"
+    tomb="$LOCK_DIR.dead.$$.$RANDOM"
+    mv "$LOCK_DIR" "$tomb" 2>/dev/null && rm -rf "$tomb" 2>/dev/null || true
+    continue
+  fi
+  if (( $(date +%s) > deadline )); then die "waited ${LOCK_WAIT}s for the build lease; giving up"; fi
+  log "another instance is building (lease age ${age}s); waiting..."
+  sleep 15
+done
+
+if (( am_builder == 1 )); then
+  if [[ "${FORCE_REBUILD:-0}" == "1" ]]; then
+    log "FORCE_REBUILD=1: clearing markers and rebuilding both venvs"
+    rm -f "$MAIN_VENV/.ready" "$ALIGN_VENV/.ready" 2>/dev/null || true
+    build_main
+    build_align
+  else
+    if venv_ready "$MAIN_VENV"; then log "MAIN venv up-to-date (sig $SIG); skipping"; else build_main; fi
+    if venv_ready "$ALIGN_VENV"; then log "ALIGN venv up-to-date (sig $SIG); skipping"; else build_align; fi
+  fi
+  release_lock   # let waiters proceed to verify in parallel
 fi
-
-# Release the lock before verification so other instances can proceed to verify in parallel.
-flock -u 9 || true
 
 verify || die "post-build verification failed"
 log "all environments ready and verified (sig $SIG)"

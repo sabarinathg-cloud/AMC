@@ -490,23 +490,50 @@ aws ssm get-command-invocation \
 ```
 
 Build the environments fleet-wide (once). This replaces the old ad-hoc root `pip`
-install. Send it to **all** online instances: the first one builds both shared venvs
-under a `flock`; the rest wait for the ready marker and then verify imports + CUDA
-locally. It is idempotent, so it is safe to re-send on every deploy.
+install.
+
+IMPORTANT: the repo lives on shared NFS, so do NOT `git pull` from every instance at
+once -- concurrent pulls fight over `.git/refs` ("cannot lock ref" / "Cannot
+fast-forward to multiple branches"). Pull on ONE instance, then build on all.
+
+First, pull once on a single instance:
 
 ```bash
-ALL_IDS=$(aws ssm describe-instance-information \
+ALL_IDS=($(aws ssm describe-instance-information \
   --region "$AWS_REGION" \
   --filters "Key=tag:Project,Values=$PROJECT_TAG" \
   --query 'InstanceInformationList[?PingStatus==`Online`].InstanceId' \
-  --output text | tr '\t' '\n')
+  --output text))
 
+ONE_ID=$(aws ssm describe-instance-information \
+  --region "$AWS_REGION" \
+  --filters "Key=tag:Project,Values=$PROJECT_TAG" \
+  --query 'sort_by(InstanceInformationList[?PingStatus==`Online`], &InstanceId)[0].InstanceId' \
+  --output text)
+
+PULL_ID=$(aws ssm send-command \
+  --region "$AWS_REGION" \
+  --instance-ids "$ONE_ID" \
+  --document-name AWS-RunShellScript \
+  --timeout-seconds 600 \
+  --parameters '{"commands":["cd /mnt/amc-data/AMC","git config --global --add safe.directory /mnt/amc-data/AMC || true","git fetch --prune origin","git reset --hard origin/main","ls -l ops/setup_env.sh"]}' \
+  --query 'Command.CommandId' \
+  --output text)
+
+echo "$PULL_ID"
+```
+
+Then build both shared venvs on **all** online instances (no git pull here): the first
+one builds under a `flock`; the rest wait for the ready marker and then verify imports +
+CUDA locally. It is idempotent, so it is safe to re-send on every deploy.
+
+```bash
 ENV_ID=$(aws ssm send-command \
   --region "$AWS_REGION" \
-  --instance-ids $ALL_IDS \
+  --instance-ids "${ALL_IDS[@]}" \
   --document-name AWS-RunShellScript \
   --timeout-seconds 3600 \
-  --parameters '{"executionTimeout":["3600"],"commands":["cd /mnt/amc-data/AMC","git config --global --add safe.directory /mnt/amc-data/AMC || true","git pull --ff-only","bash ops/setup_env.sh"]}' \
+  --parameters '{"executionTimeout":["3600"],"commands":["cd /mnt/amc-data/AMC","bash ops/setup_env.sh"]}' \
   --query 'Command.CommandId' \
   --output text)
 
@@ -517,7 +544,7 @@ Check the build/verify output per instance (look for `all environments ready and
 verified`):
 
 ```bash
-for id in $ALL_IDS; do
+for id in "${ALL_IDS[@]}"; do
   echo "== $id =="
   aws ssm get-command-invocation --region "$AWS_REGION" \
     --command-id "$ENV_ID" --instance-id "$id" \
