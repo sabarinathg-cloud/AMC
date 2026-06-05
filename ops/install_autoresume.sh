@@ -39,14 +39,80 @@ if [[ -z "$IDS" || "$IDS" == "None" ]]; then
   echo "No online SSM instances found for Project=$PROJECT_TAG" >&2
   exit 2
 fi
-NUM_SHARDS="${NUM_SHARDS:-$(wc -w <<< "$IDS" | tr -d ' ')}"
+ONLINE_COUNT="$(wc -w <<< "$IDS" | tr -d ' ')"
 FIRST_ID="$(awk '{print $1}' <<< "$IDS")"
 
-echo "Instances : $IDS"
-echo "Shards    : $NUM_SHARDS"
+# Shard count is the fixed data-partition count and the CONCURRENCY CAP: at most
+# NUM_SHARDS machines can run at once. It is baked into the call->shard hash and the
+# on-disk state, so it CANNOT change mid-run. Default it well above any fleet size so the
+# run stays elastic -- add machines anytime and they immediately claim unworked shards,
+# with the rest idle only if the fleet ever exceeds NUM_SHARDS. Override by exporting
+# NUM_SHARDS explicitly.
+DEFAULT_SHARDS="${AMC_DEFAULT_SHARDS:-256}"
+if [[ -z "${NUM_SHARDS:-}" ]]; then
+  if (( ONLINE_COUNT > DEFAULT_SHARDS )); then
+    NUM_SHARDS="$ONLINE_COUNT"
+  else
+    NUM_SHARDS="$DEFAULT_SHARDS"
+  fi
+fi
+
+echo "Instances : $IDS ($ONLINE_COUNT online)"
+echo "Shards    : $NUM_SHARDS  (concurrency cap; >= fleet size keeps the run elastic)"
 echo "AMC_IN    : $AMC_IN"
 echo "RUN_ROOT  : $RUN_ROOT"
 echo "Run config: $AMC_RUN_ENV"
+
+# Best-effort sanity check: warn if shards would be so small that per-shard model reloads
+# dominate. calls/shard below ~1000 is wasteful. This is approximate (counts immediate
+# subdirectories of AMC_IN as a proxy for call count) and never blocks the install.
+# Override the estimate with EXPECTED_CALLS, or skip entirely with SKIP_SHARD_CHECK=1.
+if [[ "${SKIP_SHARD_CHECK:-0}" != "1" ]]; then
+  MIN_PER_SHARD="${AMC_MIN_CALLS_PER_SHARD:-1000}"
+  if [[ -n "${EXPECTED_CALLS:-}" ]]; then
+    CALL_EST="$EXPECTED_CALLS"; CAPPED=""
+  else
+    # Bounded scan with early exit at NUM_SHARDS*MIN_PER_SHARD: confirms "healthy" fast
+    # even on a 500K-call directory without a full enumeration.
+    read -r CALL_EST CAPPED < <(python3 - "$AMC_IN" "$NUM_SHARDS" "$MIN_PER_SHARD" <<'PY'
+import os, sys
+amc_in, num_shards, min_per = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+cap = num_shards * min_per
+n = 0; capped = 0
+try:
+    with os.scandir(amc_in) as it:
+        for e in it:
+            if e.name.startswith('.'):
+                continue
+            try:
+                if e.is_dir():
+                    n += 1
+                    if n >= cap:
+                        capped = 1
+                        break
+            except OSError:
+                pass
+except (FileNotFoundError, NotADirectoryError):
+    print("unknown 0"); sys.exit(0)
+print(f"{n} {capped}")
+PY
+)
+  fi
+  if [[ "${CAPPED:-0}" == "1" ]]; then
+    echo "Shard size: OK (>= $MIN_PER_SHARD calls/shard)"
+  elif [[ "$CALL_EST" == "unknown" || -z "$CALL_EST" ]]; then
+    echo "Shard size: could not estimate call count from $AMC_IN (skipping check)"
+  else
+    PER_SHARD=$(( CALL_EST / (NUM_SHARDS > 0 ? NUM_SHARDS : 1) ))
+    if (( PER_SHARD < MIN_PER_SHARD )); then
+      echo "WARNING: ~$CALL_EST calls / $NUM_SHARDS shards = ~$PER_SHARD calls/shard (< $MIN_PER_SHARD)." >&2
+      echo "         Shards this small make per-shard model reloads costly. Consider a smaller" >&2
+      echo "         NUM_SHARDS (>= your max fleet size). Set SKIP_SHARD_CHECK=1 to silence." >&2
+    else
+      echo "Shard size: ~$PER_SHARD calls/shard (estimate from immediate subdirs of AMC_IN)"
+    fi
+  fi
+fi
 
 # Durable run config consumed by ops/resume_shard.sh -> ops/run_shard_no_docker.sh.
 # NOTE: no INSTANCE_IDS here on purpose. Shard assignment is claim-based (lease pool on
