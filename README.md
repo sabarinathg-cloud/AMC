@@ -513,6 +513,88 @@ CMD_ID=$(bash ops/ssm_submit_no_docker.sh)
 echo "$CMD_ID"
 ```
 
+### Auto-Resume After Reboot / Spot Reclaim (systemd)
+
+`ssm_submit_no_docker.sh` is one-shot: if an instance reboots, is spot-reclaimed, or is
+OOM-killed mid-run, nothing relaunches the pipeline. For long fleet runs, install the
+systemd-based auto-resume instead. Each instance then runs its shard to completion and
+**automatically continues from where it left off on the next boot**, with no further SSM
+submits.
+
+Resume is safe because it is idempotent: `run_shard_no_docker.sh` writes a per-stage
+marker only after that stage exits `0`, and every stage skips already-finished work via
+the per-shard SQLite state (segments, model results, artifacts, redacted files). So a
+restart skips completed stages and, inside an interrupted stage, skips the items that
+already finished.
+
+**Instance IDs are not assumed to be stable.** If the fleet is torn down and recreated
+(e.g. nightly), every instance comes up with a new instance ID. Shard assignment is
+therefore **claim-based**, not pinned to instance identity:
+
+- The unit of work is the *shard index* — a deterministic call-id hash partition whose
+  state lives at `$RUN_ROOT/outputs/shard-N` on shared NFS. `NUM_SHARDS` is fixed for the
+  run.
+- On boot, each instance atomically **claims an incomplete shard** from a lease pool at
+  `$RUN_ROOT/shards/` (atomic `mkdir` lock + heartbeat). It runs that shard, then claims
+  the next incomplete one, until none remain.
+- A lease whose heartbeat is older than `AMC_LEASE_TTL` (default 300s) is considered dead
+  and is **stolen** via an atomic rename, so a brand-new instance picks up the shard whose
+  previous owner disappeared and resumes that partition's state in place.
+- Extra instances (more boxes than incomplete shards) idle and re-scan, ready to take over
+  if an owner dies; fewer instances simply process multiple shards in sequence.
+
+```bash
+export AWS_REGION=us-east-1
+export PROJECT_TAG=amc-ec2-fleet
+export AMC_IN=/mnt/amc-runs/2026-review-full/input
+export RUN_ROOT=/mnt/amc-runs/2026-review-full
+export NUM_SHARDS=5          # fixed data-partition count for this run
+# AUTO_PULL=1 makes the single setup instance refresh the shared repo checkout first.
+AUTO_PULL=1 bash ops/install_autoresume.sh
+```
+
+This writes a durable run config to `$RUN_ROOT/run.env` plus the stable pointer
+`/mnt/amc-runs/active.env` (note: **no instance IDs** are stored — claiming is dynamic),
+installs `ops/resume_shard.sh` to `/usr/local/bin/amc_resume_shard.sh` and the
+`amc-shard.service` unit on every online instance, and `systemctl enable --now`s it. The
+unit starts at boot after the network and the shared NFS mount are ready, and is restarted
+on failure.
+
+**Make recreated instances self-install.** A recreated instance has a fresh disk, so the
+local unit and wrapper are gone. Put `ops/userdata_bootstrap.sh` in the launch template /
+launch configuration **user data** so every new instance reinstalls and enables the
+service on first boot (it reads the wrapper + unit from the shared repo and is idempotent):
+
+```bash
+#!/usr/bin/env bash
+# (launch-template user data) — install AMC auto-resume on every new instance
+REPO_DIR=/mnt/amc-data/AMC bash /mnt/amc-data/AMC/ops/userdata_bootstrap.sh
+```
+
+If you cannot edit user data, just re-run `bash ops/install_autoresume.sh` after each
+recreation — it re-pushes the service to whatever instances are currently online.
+
+Monitor (status JSON lives on shared NFS, so one instance shows all shards):
+
+```bash
+FIRST_ID=$(echo "$INSTANCE_IDS" | awk '{print $1}')
+aws ssm send-command --region "$AWS_REGION" --instance-ids "$FIRST_ID" \
+  --document-name AWS-RunShellScript \
+  --parameters "{\"commands\":[\"for f in $RUN_ROOT/status/shard-*.json; do cat \$f; echo; done\"]}" \
+  --query 'Command.CommandId' --output text
+```
+
+Stop the fleet (halts the resume loop on every box without uninstalling):
+
+```bash
+# from any instance with the shared mount:
+touch "$RUN_ROOT/STOP"
+# optionally also: systemctl disable --now amc-shard.service   (per instance)
+```
+
+Resume a stopped fleet: `rm -f "$RUN_ROOT/STOP"` then `systemctl start amc-shard.service`
+on each instance (or just reboot — the enabled unit starts automatically).
+
 Collect final masked audio after all shards complete:
 
 ```bash

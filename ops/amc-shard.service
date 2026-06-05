@@ -1,0 +1,28 @@
+# systemd unit for AMC pipeline shard auto-resume.
+# Installed to /etc/systemd/system/amc-shard.service by ops/install_autoresume.sh.
+#
+# Behaviour:
+#   - Starts at boot (WantedBy=multi-user.target), AFTER the network is online and
+#     remote filesystems (the shared NFS run dir) are mounted.
+#   - Runs the resume wrapper, which loops until this shard completes, then exits 0.
+#   - If the wrapper process itself dies (not a clean completion), systemd restarts it.
+#   - StartLimitIntervalSec=0 disables the start-rate limiter so it never gives up.
+[Unit]
+Description=AMC PII pipeline shard auto-resume
+After=network-online.target remote-fs.target
+Wants=network-online.target remote-fs.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+# Installed locally so boot does not depend on NFS being mounted to find the script;
+# the script itself then waits for NFS + the run config before doing any work.
+ExecStart=/usr/local/bin/amc_resume_shard.sh
+Restart=on-failure
+RestartSec=20
+# Long-running stages (ASR on GPU) must never be killed for "taking too long".
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target
