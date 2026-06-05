@@ -136,6 +136,23 @@ stop_heartbeat() {
 cleanup() { stop_heartbeat; }
 trap cleanup EXIT INT TERM
 
+# ---- ensure the per-stage Python environments exist (idempotent, build-once) --------
+# setup_env.sh builds the main + align venvs on shared storage under a flock (exactly one
+# builder; the rest wait for the ready marker) and then verifies imports + CUDA on THIS
+# instance. On an already-provisioned fleet it is a fast no-op. We gate work on it so a
+# freshly-recreated instance never claims a shard into a missing or broken environment.
+ensure_env() {
+  [[ "${AMC_SKIP_ENV_SETUP:-0}" == "1" ]] && return 0
+  bash "$REPO_DIR/ops/setup_env.sh"
+}
+env_backoff=30
+until ensure_env; do
+  if stop_requested; then log "STOP sentinel present during env setup; exiting"; exit 0; fi
+  log "environment not ready/verified; retrying in ${env_backoff}s"
+  sleep "$env_backoff"
+  env_backoff=$((env_backoff * 2)); (( env_backoff > MAX_BACKOFF )) && env_backoff="$MAX_BACKOFF"
+done
+
 backoff=15
 while true; do
   if stop_requested; then log "STOP sentinel present; exiting"; exit 0; fi

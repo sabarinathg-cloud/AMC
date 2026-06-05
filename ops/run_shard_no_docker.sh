@@ -15,6 +15,24 @@ AUTO_PULL="${AUTO_PULL:-1}"
 INSTANCE_ID="${INSTANCE_ID:-$(curl -fsS --max-time 2 http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || hostname)}"
 HOSTNAME_VALUE="$(hostname)"
 
+# --- Per-stage Python environments (isolated venvs on shared storage) ---
+# Different stages need conflicting dependency versions, so they run in separate venvs
+# built by ops/setup_env.sh: the `align` stage uses the whisperx venv; every other stage
+# uses the main venv. If the venvs are not present yet (un-provisioned host), fall back to
+# PYTHON_BIN so a single-env setup still works.
+VENV_ROOT="${AMC_VENV_ROOT:-/mnt/amc-data/venvs}"
+MAIN_PY="$VENV_ROOT/main/bin/python"
+ALIGN_PY="$VENV_ROOT/align/bin/python"
+[[ -x "$MAIN_PY" ]] || MAIN_PY="$PYTHON_BIN"
+[[ -x "$ALIGN_PY" ]] || ALIGN_PY="$MAIN_PY"
+
+stage_python() {  # $1 = run_stage key
+  case "$1" in
+    align) printf '%s' "$ALIGN_PY" ;;
+    *) printf '%s' "$MAIN_PY" ;;
+  esac
+}
+
 if [[ -z "${SHARD_INDEX:-}" ]]; then
   if [[ -z "${INSTANCE_IDS:-}" ]]; then
     echo "SHARD_INDEX or INSTANCE_IDS is required" >&2
@@ -49,11 +67,14 @@ mkdir -p "$AMC_OUT" "$LOG_DIR" "$STATUS_DIR" "$LOCK_DIR" "$MARKER_DIR"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-# CTranslate2 (faster-whisper backend) dlopen's cuDNN/cuBLAS at runtime, but the
-# pip-installed CUDA libs live under site-packages/nvidia/*/lib which is not on the
-# default loader path. Surface them so the whisper stage can find libcudnn_*.so.
+# CTranslate2 (faster-whisper / whisperx backend) dlopen's cuDNN/cuBLAS at runtime, but
+# the pip-installed CUDA libs live under <venv>/site-packages/nvidia/*/lib which is not on
+# the default loader path. Each venv ships its own matching cuDNN 9 build, so we resolve
+# these dirs PER interpreter (in run_stage) rather than once globally.
 # (CTranslate2 >= 4.5.0 links cuDNN 9, matching the torch cu121 wheel.)
-NVIDIA_LIB_DIRS="$("$PYTHON_BIN" - <<'PY'
+_BASE_LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
+nvidia_lib_dirs() {  # $1 = python interpreter
+  "$1" - <<'PY' 2>/dev/null || true
 import os
 dirs = []
 for mod_name in ("nvidia.cudnn", "nvidia.cublas"):
@@ -66,10 +87,7 @@ for mod_name in ("nvidia.cudnn", "nvidia.cublas"):
         pass
 print(":".join(dirs))
 PY
-)"
-if [[ -n "$NVIDIA_LIB_DIRS" ]]; then
-  export LD_LIBRARY_PATH="$NVIDIA_LIB_DIRS:${LD_LIBRARY_PATH:-}"
-fi
+}
 # Local scratch for decode/mask WAVs: keep heavy temp I/O off shared NFS.
 export AMC_TEMP_DIR="${AMC_TEMP_DIR:-/tmp/amc-scratch/$INSTANCE_ID/shard-$SHARD_INDEX}"
 mkdir -p "$AMC_TEMP_DIR"
@@ -132,7 +150,7 @@ if [[ "$AUTO_PULL" == "1" ]]; then
 fi
 
 read -r RUN_FILE_COUNT RUN_SIGNATURE < <(
-  "$PYTHON_BIN" ops/input_signature.py \
+  "$MAIN_PY" ops/input_signature.py \
     --input "$AMC_IN" \
     --output "$AMC_OUT" \
     --hash-mode "$HASH_MODE" \
@@ -158,16 +176,26 @@ run_stage() {
     echo "[$(date -Is)] RERUN $key input changed old_signature=$marker_signature new_signature=$RUN_SIGNATURE files=$RUN_FILE_COUNT" | tee -a "$log"
   fi
 
+  local py ld
+  py="$(stage_python "$key")"
+  ld="$(nvidia_lib_dirs "$py")"
+  if [[ -n "$ld" ]]; then
+    ld="$ld:$_BASE_LD_LIBRARY_PATH"
+  else
+    ld="$_BASE_LD_LIBRARY_PATH"
+  fi
+
   write_status "$key" "running" ""
   {
     echo
     echo "===== $(date -Is) START $key shard=$SHARD_INDEX/$NUM_SHARDS instance=$INSTANCE_ID host=$HOSTNAME_VALUE ====="
+    echo "interpreter: $py"
     nvidia-smi || true
     free -h || true
   } 2>&1 | tee -a "$log"
 
   set +e
-  "$PYTHON_BIN" -m amc_pipeline.cli run-stage "$@" \
+  LD_LIBRARY_PATH="$ld" "$py" -m amc_pipeline.cli run-stage "$@" \
     --input "$AMC_IN" \
     --output "$AMC_OUT" \
     --num-shards "$NUM_SHARDS" \

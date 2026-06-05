@@ -1,9 +1,27 @@
+# ===========================================================================
+# "main" environment requirements (all stages EXCEPT align).
+# Stages: preprocess, asr_whisper, asr_qwen, asr_cohere, asr_granite,
+#         normalize, consensus, pii, mask_plan, redact, validate, manifest.
+#
+# whisperx is intentionally NOT here. It (via pyannote-audio) drags a torch
+# 2.8 / numpy>=2.1 / transformers stack that conflicts with the qwen-asr pin
+# (transformers==4.57.6) and our torch 2.5.1 + numpy<2 + ctranslate2/cuDNN9
+# stack. whisperx lives in its own isolated venv; see requirements-align.txt
+# and ops/setup_env.sh.
+# ===========================================================================
+
 # ASR runtimes
 # CTranslate2 >= 4.5.0 links cuDNN 9 to match the torch cu121 wheel; older 4.4.x
 # links cuDNN 8 and fails with "libcudnn_ops_infer.so.8: cannot open shared object file".
 faster-whisper>=1.1.1
 ctranslate2>=4.5.0
-whisperx>=3.3.0
+
+# NumPy must stay < 2: spaCy/thinc, ctranslate2, and onnxruntime (gliner) ship wheels
+# built against the NumPy 1.x ABI. NumPy 2.x triggers "numpy.dtype size changed, may
+# indicate binary incompatibility" crashes on import. torch/torchvision/torchaudio are
+# installed separately from the cu121 index and must be version-matched
+# (torch 2.5.1 <-> torchvision 0.20.1 <-> torchaudio 2.5.1).
+numpy<2
 
 # Audio loading and DSP
 librosa>=0.10.2

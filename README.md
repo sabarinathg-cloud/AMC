@@ -61,6 +61,59 @@ nvidia-smi
 ffmpeg -version
 ```
 
+The single-env install above works for one machine, but the stages actually need
+**two isolated environments** (see next section). For any multi-machine / GPU run,
+use `ops/setup_env.sh` instead of installing into the base interpreter.
+
+## Environments (two isolated venvs)
+
+The pipeline stages need mutually-incompatible dependency versions, so one environment
+cannot hold all of them. `ops/setup_env.sh` builds two virtualenvs and the orchestrator
+picks the right one per stage automatically.
+
+| venv | stages | key pins |
+| --- | --- | --- |
+| `main` | preprocess, asr_whisper, asr_qwen, asr_cohere, asr_granite, normalize, consensus, pii, mask_plan, redact, validate, manifest | `torch 2.5.1+cu121`, `torchvision 0.20.1`, `torchaudio 2.5.1`, `transformers 4.57.6`, `accelerate 1.12.0`, `qwen-asr 0.0.6`, `faster-whisper>=1.1.1`, `ctranslate2>=4.5.0`, `nvidia-cudnn-cu12 9.1.0.70`, `huggingface_hub 0.36.2`, `gliner`, `spacy`, `numpy<2` |
+| `align` | align (whisperx forced alignment) | `whisperx 3.4.2`, `pyannote-audio 3.4.0`, `transformers 4.56.2`, `huggingface_hub 0.35.0`, `torch 2.5.1+cu121`, `numpy<2` |
+
+Why two:
+
+- `qwen-asr==0.0.6` hard-pins `transformers==4.57.6` + `accelerate==1.12.0` and is
+  documented to require a fresh, isolated environment. Cohere/Granite ASR also need
+  transformers 4.57.x.
+- `whisperx` (align only) pulls `pyannote-audio` + a different transformers/hf set. The
+  current whisperx (3.8.x) demands `torch~=2.8` and `numpy>=2.1`, which conflicts with the
+  ASR stack. We pin the last torch-2.5.1-compatible line (`whisperx==3.4.2`,
+  `pyannote-audio==3.4.0`, `transformers==4.56.2`, `huggingface_hub==0.35.0`).
+
+Build both venvs (run this once per fleet — the venvs live on shared storage and are
+reused by every instance):
+
+```bash
+cd /mnt/amc-data/AMC
+bash ops/setup_env.sh          # build-if-needed on $AMC_VENV_ROOT (default /mnt/amc-data/venvs), then verify
+bash ops/setup_env.sh --verify # re-check imports + CUDA only
+FORCE_REBUILD=1 bash ops/setup_env.sh   # rebuild from scratch
+```
+
+Key properties:
+
+- **Build once, reuse everywhere.** Both venvs are created under `$AMC_VENV_ROOT`
+  (default `/mnt/amc-data/venvs`) on shared NFS, so recreated instances (new IDs, fresh
+  local disks) do not reinstall multi-GB wheels — they import from the shared venv.
+- **Safe under a boot storm.** A `flock` ensures exactly one builder; other instances wait
+  for the ready marker, then each runs the import/CUDA verification locally.
+- **Signature-gated rebuilds.** A hash of `requirements-gpu.txt`, `requirements-align.txt`,
+  `constraints-gpu.txt`, and `pyproject.toml` keys the `.ready` marker. Change a pin →
+  automatic rebuild on the next run; otherwise it is a fast no-op.
+- **Self-provisioning.** `ops/resume_shard.sh` (the systemd auto-resume worker) calls
+  `setup_env.sh` before claiming any shard, so a fresh instance builds/verifies the env
+  automatically. The manual SSM smoke path does not, so run `setup_env.sh` first there.
+
+Override the location with `AMC_VENV_ROOT=/some/shared/path`. To skip env setup in the
+resume worker (e.g. for a single-env debug box) set `AMC_SKIP_ENV_SETUP=1`;
+`run_shard_no_docker.sh` then falls back to `PYTHON_BIN` for every stage.
+
 ## Docker GPU Runtime
 
 Docker is supported for the GPU runtime. Model weights are not copied into the
@@ -434,6 +487,42 @@ aws ssm get-command-invocation \
   --instance-id "$ONE_ID" \
   --query '{Status:Status,StdOut:StandardOutputContent,StdErr:StandardErrorContent}' \
   --output json
+```
+
+Build the environments fleet-wide (once). This replaces the old ad-hoc root `pip`
+install. Send it to **all** online instances: the first one builds both shared venvs
+under a `flock`; the rest wait for the ready marker and then verify imports + CUDA
+locally. It is idempotent, so it is safe to re-send on every deploy.
+
+```bash
+ALL_IDS=$(aws ssm describe-instance-information \
+  --region "$AWS_REGION" \
+  --filters "Key=tag:Project,Values=$PROJECT_TAG" \
+  --query 'InstanceInformationList[?PingStatus==`Online`].InstanceId' \
+  --output text | tr '\t' '\n')
+
+ENV_ID=$(aws ssm send-command \
+  --region "$AWS_REGION" \
+  --instance-ids $ALL_IDS \
+  --document-name AWS-RunShellScript \
+  --timeout-seconds 3600 \
+  --parameters '{"executionTimeout":["3600"],"commands":["cd /mnt/amc-data/AMC","git config --global --add safe.directory /mnt/amc-data/AMC || true","git pull --ff-only","bash ops/setup_env.sh"]}' \
+  --query 'Command.CommandId' \
+  --output text)
+
+echo "$ENV_ID"
+```
+
+Check the build/verify output per instance (look for `all environments ready and
+verified`):
+
+```bash
+for id in $ALL_IDS; do
+  echo "== $id =="
+  aws ssm get-command-invocation --region "$AWS_REGION" \
+    --command-id "$ENV_ID" --instance-id "$id" \
+    --query '{Status:Status,Out:StandardOutputContent,Err:StandardErrorContent}' --output text | tail -n 20
+done
 ```
 
 Launch the 5-way smoke run:

@@ -1,0 +1,31 @@
+# ===========================================================================
+# "align" environment requirements (the `align` stage only).
+#
+# Why isolated: whisperx pulls pyannote-audio + pytorch-lightning + a specific
+# transformers/huggingface_hub set. The current whisperx (3.8.x) demands
+# torch~=2.8 and numpy>=2.1, which is incompatible with the rest of the
+# pipeline (torch 2.5.1 + numpy<2 + ctranslate2/cuDNN9 + transformers 4.57.6
+# pinned by qwen-asr). So align gets its own venv pinned to the last
+# torch-2.5.1-compatible whisperx line.
+#
+# This pin set is the community-validated combination for torch 2.5.1:
+#   whisperx==3.4.2, pyannote-audio==3.4.0, transformers==4.56.2,
+#   huggingface-hub==0.35.0  (see m-bain/whisperX issue #1333).
+#
+# torch/torchaudio/torchvision (cu121) and nvidia-cudnn are installed
+# separately by ops/setup_env.sh, not from this file.
+# ===========================================================================
+
+whisperx==3.4.2
+pyannote-audio==3.4.0
+transformers==4.56.2
+huggingface_hub==0.35.0
+ctranslate2>=4.5.0
+faster-whisper>=1.1.1
+
+# Keep NumPy on the 1.x ABI (same reason as the main env).
+numpy<2
+
+# Audio IO used by the alignment stage.
+librosa>=0.10.2
+soundfile>=0.12.1
