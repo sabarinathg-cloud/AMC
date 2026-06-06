@@ -101,7 +101,8 @@ build_align() {
   # Install the editable package WITHOUT the qwen extra so the 4.57.6 pin does not leak in.
   $pip install -r docker/requirements-align.txt -e "." || die "requirements/editable install (align)"
   $pip install --force-reinstall --no-deps nvidia-cudnn-cu12==9.1.0.70 || die "cudnn pin (align)"
-  $pip install "numpy<2" || die "numpy pin (align)"
+  # NOTE: no numpy<2 pin here. whisperx 3.4.2 + pyannote + librosa need numpy>=2; only the
+  # main venv (spaCy/thinc, ctranslate2, onnxruntime) requires the NumPy 1.x ABI.
   echo "$ALIGN_SIG" > "$ALIGN_VENV/.ready"
   log "ALIGN venv ready"
 }

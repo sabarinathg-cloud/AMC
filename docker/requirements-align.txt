@@ -28,8 +28,10 @@ huggingface_hub==0.35.0
 # lazily on CUDA model creation, so importing whisperx works without cuDNN 8 present. Let
 # whisperx pull its own compatible ctranslate2/faster-whisper.
 
-# Keep NumPy on the 1.x ABI (same reason as the main env).
-numpy<2
+# NOTE: do NOT pin numpy<2 here. Unlike the main venv (whose spaCy/thinc, ctranslate2,
+# and onnxruntime/gliner need the NumPy 1.x ABI), the align venv has none of those.
+# whisperx 3.4.2 + pyannote-audio + librosa require numpy>=2, and the community-validated
+# whisperx 3.4.2 set runs on numpy 2.x. Let the resolver choose numpy (it lands on 2.x).
 
 # Audio IO used by the alignment stage.
 librosa>=0.10.2
