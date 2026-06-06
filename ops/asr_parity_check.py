@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -38,7 +39,7 @@ from amc_pipeline.config import ASRModelConfig, PipelineConfig
 from amc_pipeline.normalization import normalize_transcript
 from amc_pipeline.pipeline import _segment_from_payload
 from amc_pipeline.state import PostgresStateStore, SQLiteStateStore
-from amc_pipeline.transcription import CohereAdapter, GraniteAdapter, QwenAdapter
+from amc_pipeline.transcription import CohereAdapter, GraniteAdapter, QwenAdapter, WhisperAdapter
 
 
 ADAPTERS = {"qwen": QwenAdapter, "cohere": CohereAdapter, "granite": GraniteAdapter}
@@ -81,6 +82,7 @@ def _load_segments(config: PipelineConfig, limit: int):
 
 def _run(adapter, segments) -> dict[str, str]:
     adapter.progress_enabled = True
+    t0 = time.time()
     try:
         adapter.preflight()
         results = adapter.transcribe_batch(segments)
@@ -89,6 +91,10 @@ def _run(adapter, segments) -> dict[str, str]:
             adapter.close()
         except Exception:
             pass
+    elapsed = time.time() - t0
+    audio = sum(max(0.0, float(getattr(s, "duration_sec", 0.0) or 0.0)) for s in segments)
+    rtfx = (audio / elapsed) if elapsed > 0 else 0.0
+    print(f"    elapsed={elapsed:.1f}s  audio={audio:.1f}s  RTFx={rtfx:.1f}x")
     return {r.segment_id: (r.transcript or "") for r in results}
 
 
@@ -141,7 +147,7 @@ def main() -> int:
     parser.add_argument("--config")
     parser.add_argument("--input")
     parser.add_argument("--output")
-    parser.add_argument("--model", required=True, choices=sorted(ADAPTERS))
+    parser.add_argument("--model", required=True, choices=sorted({*ADAPTERS, "whisper"}))
     parser.add_argument("--limit", type=int, default=50)
     parser.add_argument("--budget", type=float, default=None, help="audio-seconds budget for the dynamic run")
     parser.add_argument("--max-batch", type=int, default=None, help="count cap for the dynamic run")
@@ -158,6 +164,27 @@ def main() -> int:
         print("no segments found in state; run the preprocess stage first", file=sys.stderr)
         return 2
     print(f"model={args.model} segments={len(segments)} (path={base.path})")
+
+    # Whisper has no dynamic-batching axis; its A/B is segment packing on vs off.
+    if args.model == "whisper":
+        def _mk(batched: bool) -> WhisperAdapter:
+            adapter = WhisperAdapter(base.path or "", base.batch_size or 0, base.device)
+            adapter.batched = batched
+            return adapter
+
+        print("\n== running whisper per-segment (AMC_WHISPER_BATCHED=0 baseline) ==")
+        baseline = _run(_mk(False), segments)
+        print("== running whisper packed (default) ==")
+        packed = _run(_mk(True), segments)
+        _compare("whisper_persegment_vs_packed", baseline, packed)
+        print(
+            "\nNote: packing intentionally adds cross-segment context, so non-zero drift\n"
+            "is EXPECTED (and usually improves accuracy). Validate that:\n"
+            "  - packed RTFx is clearly higher (it's faster),\n"
+            "  - worst-drift examples are real re-wordings, not empty/hallucinated text.\n"
+            "True WER vs ground truth needs labeled references, not this drift check."
+        )
+        return 0
 
     adapter_cls = ADAPTERS[args.model]
 
