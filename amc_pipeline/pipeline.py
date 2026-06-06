@@ -134,7 +134,7 @@ class Pipeline:
         if stage == "validate":
             return self.validate()
         if stage == "manifest":
-            return self.write_manifests(self._load_segments())
+            return self.write_manifests()
         raise ValueError(f"Unsupported stage: {stage}")
 
     def preprocess(self) -> dict[str, Any]:
@@ -198,18 +198,21 @@ class Pipeline:
                     except Exception as exc:
                         errors.append({"file_id": record.file_id, "source_path": str(record.source_path), "error": repr(exc)})
                         self.state.record_failure(f"{record.file_id}:preprocess", "file", record.file_id, repr(exc), retryable=True)
-        segments_for_manifest = self._load_segments()
+        segment_count = self.state.count_segments()
         manifest_paths = (
             write_segment_manifests(
                 self.config.output_root,
-                segments_for_manifest,
+                self._iter_segment_records(),
                 enable_dataframe_exports=self.config.manifest_dataframe_exports,
                 xlsx_max_rows=self.config.manifest_xlsx_max_rows,
+                write_csv=self.config.manifest_write_csv,
+                write_per_year=self.config.manifest_write_per_year,
+                parquet_batch_size=self.config.manifest_parquet_batch_size,
             )
-            if segments_for_manifest
+            if segment_count
             else []
         )
-        summary = {"stage": "preprocess", "files": len(records), "segments": len(segments_for_manifest), "new_segments": all_segments, "skipped_files": skipped, "errors": errors, "manifests": [str(p) for p in manifest_paths]}
+        summary = {"stage": "preprocess", "files": len(records), "segments": segment_count, "new_segments": all_segments, "skipped_files": skipped, "errors": errors, "manifests": [str(p) for p in manifest_paths]}
         self._write_report("preprocess_summary.json", summary)
         return summary
 
@@ -661,13 +664,21 @@ class Pipeline:
         self._write_report("validation_summary.json", summary)
         return summary
 
-    def write_manifests(self, segments) -> dict[str, Any]:
+    def write_manifests(self, segments=None) -> dict[str, Any]:
+        # Stream segments straight from the state store (the durable source of truth) so the
+        # manifest stage never materializes the full row list or a pandas DataFrame. extra_rows
+        # is the in-memory join table (transcripts/pii/mask/redacted by segment id); the row
+        # values themselves are produced lazily and flushed in Parquet row-group batches.
+        seg_iter = self._iter_segment_records() if segments is None else segments
         paths = write_segment_manifests(
             self.config.output_root,
-            segments,
+            seg_iter,
             self._manifest_extras(),
             enable_dataframe_exports=self.config.manifest_dataframe_exports,
             xlsx_max_rows=self.config.manifest_xlsx_max_rows,
+            write_csv=self.config.manifest_write_csv,
+            write_per_year=self.config.manifest_write_per_year,
+            parquet_batch_size=self.config.manifest_parquet_batch_size,
         )
         return {"paths": [str(p) for p in paths]}
 
@@ -690,16 +701,18 @@ class Pipeline:
         return path
 
     def _load_segments(self) -> list[SegmentRecord]:
-        segments = []
-        for row in self.state.fetch_segments():
+        return list(self._iter_segment_records())
+
+    def _iter_segment_records(self):
+        # Streaming variant of _load_segments: yields SegmentRecord without materializing the
+        # full list, so the manifest stage stays memory-bounded at millions of rows.
+        for row in self.state.iter_segments():
             payload = dict(row["payload"])
             payload["status"] = row.get("status", payload.get("status", "preprocessed"))
-            segments.append(_segment_from_payload(payload))
-        return segments
+            yield _segment_from_payload(payload)
 
     def _manifest_extras(self) -> dict[str, dict[str, Any]]:
-        segment_by_id = {s.segment_id: s for s in self._load_segments()}
-        extras: dict[str, dict[str, Any]] = {segment_id: {} for segment_id in segment_by_id}
+        extras: dict[str, dict[str, Any]] = {}
         file_metadata: dict[str, dict[str, Any]] = {
             row["file_id"]: (row.get("payload") or {}).get("audio_metadata") or {}
             for row in self.state.iter_files()
@@ -745,8 +758,13 @@ class Pipeline:
             intervals = payload.get("intervals", [])
             extras.setdefault(segment_id, {})["mask_intervals_json"] = json.dumps(intervals, sort_keys=True, default=str)
             extras[segment_id]["alignment_status"] = artifact["status"]
-        for segment_id, segment in segment_by_id.items():
-            meta = file_metadata.get(segment.file_id)
+        # Join file-level metadata + redacted artifacts onto each segment. Stream the segment
+        # rows (segment_id + file_id only) instead of materializing a {segment_id: SegmentRecord}
+        # map -- the latter was a second full in-memory copy of every segment.
+        for row in self.state.iter_segments():
+            segment_id = row["segment_id"]
+            file_id = row.get("file_id") or (row.get("payload") or {}).get("file_id")
+            meta = file_metadata.get(file_id)
             if meta:
                 extras.setdefault(segment_id, {})
                 extras[segment_id]["source_codec"] = meta.get("codec", "")
@@ -755,7 +773,7 @@ class Pipeline:
                 extras[segment_id]["source_duration_sec"] = meta.get("duration_sec", "")
                 extras[segment_id]["source_bitrate"] = meta.get("bitrate", "")
                 extras[segment_id]["source_channel_layout"] = meta.get("channel_layout", "")
-            redacted = file_redacted.get(segment.file_id)
+            redacted = file_redacted.get(file_id)
             if not redacted:
                 continue
             redacted_path = Path(redacted["payload"].get("path", ""))

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import re
 from dataclasses import dataclass
 
@@ -137,6 +138,61 @@ class PiiranhaDetector(PIIDetector):
         return resolve_overlaps(spans)
 
 
+# spaCy's DATE/CARDINAL entities frequently fire on tokens that are NOT PII: relative time
+# references ("today", "tonight"), durations ("two years"), and bare numbers the tagger
+# mislabels as dates ("49"). Masking those is pure over-redaction -- it bleeps ordinary speech
+# and adds no privacy value -- so we drop low-value temporal/numeric spans. Real PII dates
+# (a date of birth, an explicit calendar date, a 4-digit year, a slash/dash date) are kept.
+#
+# NOTE: the spaCy detector assigns a FLAT confidence (its configured threshold) to every span,
+# so raising the threshold cannot single out DATE -- it would drop PERSON/ORG/LOCATION too.
+# An allowlist is the correct lever; toggle it off via AMC_MASK_RELATIVE_DATES=1.
+_NON_PII_TEMPORAL_WORDS = frozenset({
+    "today", "tonight", "tomorrow", "yesterday", "now", "then", "soon", "later",
+    "currently", "recently", "lately", "nowadays", "always", "never", "ago",
+    "morning", "afternoon", "evening", "night", "midnight", "noon", "midday",
+    "day", "days", "week", "weeks", "month", "months", "year", "years",
+    "weekday", "weekdays", "weekend", "weekends",
+    "daily", "weekly", "monthly", "quarterly", "yearly", "annually", "annual",
+    "hour", "hours", "minute", "minutes", "second", "seconds", "moment", "moments",
+    "decade", "decades", "century",
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+})
+# A real calendar date carries a month name or a 4-digit year; if a phrase has neither it is a
+# relative reference / duration, not PII.
+_MONTHS_RE = (
+    "january|february|march|april|may|june|july|august|september|october|november|december|"
+    "jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec"
+)
+_HAS_MONTH_OR_YEAR_RE = re.compile(rf"\b(?:{_MONTHS_RE})\b|\b\d{{4}}\b", re.IGNORECASE)
+# "this/last/next/each/every/few/<n> ..." openers that introduce relative time spans.
+_RELATIVE_DATE_RE = re.compile(
+    r"^(?:the\s+)?(?:this|that|these|those|last|next|past|coming|recent|each|every|"
+    r"few|couple|several|some|a|an|one|two|three|four|five|six|seven|eight|nine|ten|\d+)\b",
+    re.IGNORECASE,
+)
+_BARE_SMALL_INT_RE = re.compile(r"^\d{1,2}$")
+
+
+def _is_low_value_temporal(entity_type: str, text: str) -> bool:
+    """True for DATE/NUMBER spans that carry no PII (relative time, durations, bare small ints)."""
+    if entity_type not in ("DATE", "NUMBER"):
+        return False
+    norm = (text or "").strip().lower().strip(".,!?;:'\"")
+    if not norm:
+        return True
+    if norm in _NON_PII_TEMPORAL_WORDS:
+        return True
+    # bare 1-2 digit integers spaCy mislabels as dates ("49", "9"); a real DOB year is 4 digits
+    # and slash/dash dates are caught by the regex detector.
+    if _BARE_SMALL_INT_RE.match(norm):
+        return True
+    # relative/duration phrases ("two years", "last week", "a few days") with no month/year.
+    if _RELATIVE_DATE_RE.match(norm) and not _HAS_MONTH_OR_YEAR_RE.search(norm):
+        return True
+    return False
+
+
 class SpacyDetector(PIIDetector):
     name = "spacy"
 
@@ -153,6 +209,9 @@ class SpacyDetector(PIIDetector):
         self.model_name_or_path = model_name_or_path
         self.threshold = threshold
         self._nlp = None
+        # Drop relative/non-PII DATE & NUMBER spans by default; set AMC_MASK_RELATIVE_DATES=1
+        # to restore the old behavior of masking every spaCy DATE/CARDINAL hit.
+        self.drop_relative_dates = os.environ.get("AMC_MASK_RELATIVE_DATES", "0") != "1"
 
     def preflight(self) -> None:
         if importlib.util.find_spec("spacy") is None:
@@ -171,9 +230,12 @@ class SpacyDetector(PIIDetector):
         for ent in doc.ents:
             if ent.label_ not in self.LABEL_MAP:
                 continue
+            mapped = self.LABEL_MAP[ent.label_]
+            if self.drop_relative_dates and _is_low_value_temporal(mapped, ent.text):
+                continue
             spans.append(
                 PIISpan(
-                    self.LABEL_MAP[ent.label_],
+                    mapped,
                     ent.text,
                     int(ent.start_char),
                     int(ent.end_char),

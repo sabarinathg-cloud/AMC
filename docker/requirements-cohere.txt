@@ -1,0 +1,33 @@
+# ===========================================================================
+# "cohere" environment requirements (the `asr_cohere` stage only).
+#
+# Why isolated: Cohere ASR (CohereLabs/cohere-transcribe-03-2026) exposes
+# `CohereAsrForConditionalGeneration`, which was added to transformers in
+# 5.4.0. The main venv is hard-pinned to transformers==4.57.6 by qwen-asr,
+# so cohere CANNOT coexist with qwen/granite/whisper in one env -- it gets
+# its own venv, exactly like whisperx/align. With this venv absent the
+# asr_cohere stage falls back to the main venv and errors per-segment
+# (ImportError), degrading to a 3-model consensus instead of failing.
+#
+# torch/torchaudio/torchvision (cu121) and nvidia-cudnn are installed
+# separately by ops/setup_env.sh, not from this file.
+# ===========================================================================
+
+# CohereAsrForConditionalGeneration landed in transformers 5.4.0. Pin the floor;
+# the resolver pulls a matching tokenizers/safetensors/huggingface_hub set.
+transformers>=5.4.0
+
+# device_map="auto" model load + generate.
+accelerate>=1.0.0
+
+# Cohere processor/tokenizer dependencies.
+sentencepiece>=0.2.0
+protobuf>=4.25
+
+# Audio IO used by the cohere adapter (_load_cohere_audio).
+librosa>=0.10.2
+soundfile>=0.12.1
+
+# NOTE: do NOT pin numpy<2 here. The NumPy 1.x ABI is only required by the main
+# venv (spaCy/thinc, ctranslate2, onnxruntime/gliner). transformers 5.x + librosa
+# run on numpy>=2; let the resolver choose (it lands on 2.x).

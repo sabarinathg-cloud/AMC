@@ -62,31 +62,36 @@ ffmpeg -version
 ```
 
 The single-env install above works for one machine, but the stages actually need
-**two isolated environments** (see next section). For any multi-machine / GPU run,
+**three isolated environments** (see next section). For any multi-machine / GPU run,
 use `ops/setup_env.sh` instead of installing into the base interpreter.
 
-## Environments (two isolated venvs)
+## Environments (three isolated venvs)
 
 The pipeline stages need mutually-incompatible dependency versions, so one environment
-cannot hold all of them. `ops/setup_env.sh` builds two virtualenvs and the orchestrator
+cannot hold all of them. `ops/setup_env.sh` builds three virtualenvs and the orchestrator
 picks the right one per stage automatically.
 
 | venv | stages | key pins |
 | --- | --- | --- |
-| `main` | preprocess, asr_whisper, asr_qwen, asr_cohere, asr_granite, normalize, consensus, pii, mask_plan, redact, validate, manifest | `torch 2.5.1+cu121`, `torchvision 0.20.1`, `torchaudio 2.5.1`, `transformers 4.57.6`, `accelerate 1.12.0`, `qwen-asr 0.0.6`, `faster-whisper>=1.1.1`, `ctranslate2>=4.5.0`, `nvidia-cudnn-cu12 9.1.0.70`, `huggingface_hub 0.36.2`, `gliner`, `spacy`, `numpy<2` |
+| `main` | preprocess, asr_whisper, asr_qwen, asr_granite, normalize, consensus, pii, mask_plan, redact, validate, manifest | `torch 2.5.1+cu121`, `torchvision 0.20.1`, `torchaudio 2.5.1`, `transformers 4.57.6`, `accelerate 1.12.0`, `qwen-asr 0.0.6`, `faster-whisper>=1.1.1`, `ctranslate2>=4.5.0`, `nvidia-cudnn-cu12 9.1.0.70`, `huggingface_hub 0.36.2`, `gliner`, `spacy`, `numpy<2` |
 | `align` | align (whisperx forced alignment) | `whisperx 3.4.2`, `pyannote-audio 3.4.0`, `transformers 4.56.2`, `huggingface_hub 0.35.0`, `torch 2.5.1+cu121`, `numpy<2` |
+| `cohere` | asr_cohere (Cohere Transcribe) | `transformers>=5.4.0`, `accelerate`, `sentencepiece`, `protobuf`, `torch 2.5.1+cu121`, `nvidia-cudnn-cu12 9.1.0.70` |
 
-Why two:
+Why three:
 
 - `qwen-asr==0.0.6` hard-pins `transformers==4.57.6` + `accelerate==1.12.0` and is
-  documented to require a fresh, isolated environment. Cohere/Granite ASR also need
-  transformers 4.57.x.
+  documented to require a fresh, isolated environment. Whisper/Granite ASR also run on the
+  4.57.x stack in `main`.
 - `whisperx` (align only) pulls `pyannote-audio` + a different transformers/hf set. The
   current whisperx (3.8.x) demands `torch~=2.8` and `numpy>=2.1`, which conflicts with the
   ASR stack. We pin the last torch-2.5.1-compatible line (`whisperx==3.4.2`,
   `pyannote-audio==3.4.0`, `transformers==4.56.2`, `huggingface_hub==0.35.0`).
+- Cohere ASR (`CohereAsrForConditionalGeneration`) was added in **transformers 5.4.0** — a
+  major-version jump incompatible with the 4.57.6 that qwen-asr pins. So `asr_cohere` gets
+  its own venv. If the `cohere` venv is missing, `asr_cohere` falls back to `main` and
+  errors per-segment (graceful 3-model consensus) rather than failing the stage.
 
-Build both venvs (run this once per fleet — the venvs live on shared storage and are
+Build all venvs (run this once per fleet — the venvs live on shared storage and are
 reused by every instance):
 
 ```bash
@@ -98,14 +103,16 @@ FORCE_REBUILD=1 bash ops/setup_env.sh   # rebuild from scratch
 
 Key properties:
 
-- **Build once, reuse everywhere.** Both venvs are created under `$AMC_VENV_ROOT`
+- **Build once, reuse everywhere.** All venvs are created under `$AMC_VENV_ROOT`
   (default `/mnt/amc-data/venvs`) on shared NFS, so recreated instances (new IDs, fresh
   local disks) do not reinstall multi-GB wheels — they import from the shared venv.
-- **Safe under a boot storm.** A `flock` ensures exactly one builder; other instances wait
-  for the ready marker, then each runs the import/CUDA verification locally.
-- **Signature-gated rebuilds.** A hash of `requirements-gpu.txt`, `requirements-align.txt`,
-  `constraints-gpu.txt`, and `pyproject.toml` keys the `.ready` marker. Change a pin →
-  automatic rebuild on the next run; otherwise it is a fast no-op.
+- **Safe under a boot storm.** An NFS-safe `mkdir` lease (with heartbeat + stale-lease
+  takeover) ensures exactly one builder; other instances wait for the ready marker, then
+  each runs the import/CUDA verification locally.
+- **Signature-gated, per-venv rebuilds.** Each venv keys its `.ready` marker on a hash of
+  *its own* requirements (`requirements-gpu.txt`+`constraints-gpu.txt` for main,
+  `requirements-align.txt` for align, `requirements-cohere.txt` for cohere) plus
+  `pyproject.toml`. Change a pin → only that venv rebuilds; otherwise it is a fast no-op.
 - **Self-provisioning.** `ops/resume_shard.sh` (the systemd auto-resume worker) calls
   `setup_env.sh` before claiming any shard, so a fresh instance builds/verifies the env
   automatically. The manual SSM smoke path does not, so run `setup_env.sh` first there.
@@ -296,6 +303,12 @@ python3.10 -m amc_pipeline.cli run-stage pii \
   --input "$ONE_IN" \
   --output "$ONE_OUT" \
   --detectors regex,gliner,piiranha,spacy,rule_name,saved_json
+
+# DATE over-masking control: by default the spaCy detector drops low-value temporal/numeric
+# spans that are NOT PII (relative refs like "today"/"tonight", durations like "two years",
+# and bare 1-2 digit numbers it mislabels as dates). Real dates — a DOB, an explicit calendar
+# date, a 4-digit year, slash/dash dates — are still masked. To restore masking every spaCy
+# DATE/CARDINAL hit, set AMC_MASK_RELATIVE_DATES=1 on the pii stage.
 
 python3.10 -m amc_pipeline.cli run-stage align \
   --input "$ONE_IN" \
@@ -803,15 +816,40 @@ python3.10 -m amc_pipeline.cli pause --output "$AMC_OUT" --global
 ```text
 <output>/<year>/<call_id>/audio.opus
 <output>/<year>/segments/<call_id>/*.wav
-<output>/<year>/manifests/segments.csv
-<output>/<year>/manifests/segments.jsonl
-<output>/manifests/all_segments.csv
-<output>/manifests/all_segments.jsonl
-<output>/manifests/all_segments.parquet
-<output>/manifests/review.xlsx
+<output>/<year>/manifests/segments.csv       # per-year duplicate; lean mode skips (see below)
+<output>/<year>/manifests/segments.jsonl     # per-year duplicate; lean mode skips
+<output>/manifests/all_segments.csv           # lean mode skips (single multi-GB CSV)
+<output>/manifests/all_segments.jsonl         # ALWAYS written: durable, stream-readable record
+<output>/manifests/all_segments.parquet       # the dataset (string-typed cols; readers coerce)
+<output>/manifests/review.xlsx                 # only when row count <= manifest_xlsx_max_rows
 <output>/.pii_pipeline/state/pipeline.sqlite3  # SQLite mode only
 <output>/.pii_pipeline/reports/
 ```
+
+### Manifest scaling + crash-safety
+
+The manifest stage is built to scale to millions of segments per shard and to survive
+interruptions without losing data or restarting:
+
+- **Streaming, bounded memory.** Rows are streamed straight from the state store and the
+  Parquet file is written in row-group batches (`pyarrow.parquet.ParquetWriter`,
+  `manifest_parquet_batch_size`, default 50k). It never builds the full row list or a pandas
+  DataFrame, so peak memory stays flat regardless of row count (fits a 16 GB box).
+- **Lean mode (default on the fleet).** `ops/run_shard_no_docker.sh` runs the manifest stage
+  with `--manifest-no-csv --manifest-no-per-year`, so at scale it writes only `all_segments.jsonl`
+  (durable) + `all_segments.parquet` (dataset) and skips the single multi-GB CSV and the per-year
+  duplicates. Set `AMC_MANIFEST_LEAN=0` to restore CSV + per-year for small/manual runs (the
+  Python default still keeps them on, so direct CLI/tests are unchanged).
+- **Atomic, crash-safe writes.** Every manifest file is written to a temp sibling and
+  `os.replace`'d into place only after it is fully written. A crash/kill/OOM mid-write never
+  leaves a partial or corrupt file — `ops/merge_shards.sh` and any reader only ever see the
+  previous complete file or the new complete file.
+- **Resume from where you left off — by design.** The manifest stage reads exclusively from the
+  durable SQLite state store (WAL mode, one autocommit per segment/transcript/artifact), so a
+  re-run after any interruption simply regenerates every manifest from scratch. More broadly:
+  heavy stages (asr/redact/...) persist each unit to the state store as it completes, and the
+  shard's stage marker is written *only* on success — so an interrupted run resumes the failed
+  stage and skips every unit already in the store. Nothing needs to start from the beginning.
 
 ## ASR Throughput / Batching
 

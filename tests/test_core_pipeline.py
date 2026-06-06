@@ -21,9 +21,10 @@ from amc_pipeline.consensus import build_consensus
 from amc_pipeline.discovery import discover_audio_files
 from amc_pipeline.inspection import inspect_audio
 from amc_pipeline.masking import redact_wav_with_plan
-from amc_pipeline.models import ASRResult, AlignmentWord, MaskInterval, PIISpan
+from amc_pipeline.manifests import write_segment_manifests
+from amc_pipeline.models import ASRResult, AlignmentWord, MaskInterval, PIISpan, SegmentRecord
 from amc_pipeline.normalization import normalize_transcript
-from amc_pipeline.pii_detection import RegexPIIDetector
+from amc_pipeline.pii_detection import RegexPIIDetector, _is_low_value_temporal
 from amc_pipeline.pipeline import Pipeline, _expand_numeric_pii_context
 from amc_pipeline.preprocessing import preprocess_file
 from amc_pipeline.segmentation import split_chunks_on_pauses
@@ -476,6 +477,20 @@ class CorePipelineTests(unittest.TestCase):
         self.assertEqual(expanded.text, "212-537-0830")
         self.assertEqual(expanded.entity_type, "PHONE")
 
+    def test_low_value_temporal_dates_are_dropped(self):
+        # Relative time refs, durations, and bare small ints carry no PII -> filtered out.
+        for text in ["today", "Today.", "tonight", "yesterday", "now", "this week",
+                     "last month", "two years", "a few days", "49", "9", "every day"]:
+            self.assertTrue(_is_low_value_temporal("DATE", text), f"{text!r} should be dropped")
+        self.assertTrue(_is_low_value_temporal("NUMBER", "49"))
+
+    def test_real_dates_are_kept(self):
+        # Calendar dates, DOB years, and explicit months are PII -> retained.
+        for text in ["March 5th", "1999", "January 1990", "12/05/1987", "March 2020"]:
+            self.assertFalse(_is_low_value_temporal("DATE", text), f"{text!r} should be kept")
+        # Non temporal entity types are never touched by this filter.
+        self.assertFalse(_is_low_value_temporal("PERSON_NAME", "today"))
+
     def test_cli_dry_run_writes_summary(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "input"
@@ -881,6 +896,66 @@ class CorePipelineTests(unittest.TestCase):
 
         with patch("amc_pipeline.transcription.version", return_value="4.57.6"):
             _require_qwen_runtime_versions()
+
+    def _mk_segment(self, i, year="2024"):
+        return SegmentRecord(
+            segment_id=f"seg{i}", file_id=f"f{i}", call_id=f"c{i}", year=year, channel=i % 2,
+            source_path=Path(f"/in/{year}/c/audio.opus"),
+            segment_audio_path=Path(f"/out/{year}/segments/c/seg{i}.wav"),
+            start_sec=float(i), end_sec=float(i) + 1.0, start_sample=i, end_sample=i + 1,
+            duration_sec=1.0, duration_samples=16000, sample_rate=16000, language="en",
+        )
+
+    def test_manifest_streaming_unions_columns_and_supports_lean_mode(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "out"
+            out.mkdir()
+            segs = [self._mk_segment(i, "2024" if i % 2 else "2025") for i in range(5)]
+            # Only even segments carry PII -> the writer must still emit a stable column union.
+            extras = {}
+            for i, s in enumerate(segs):
+                e = {"whisper_transcript": f"hi {i}", "final_transcript": f"hi {i}"}
+                if i % 2 == 0:
+                    e["pii_spans_json"] = json.dumps([{"entity_type": "DATE", "text": "today"}])
+                    e["pii_count"] = 1
+                extras[s.segment_id] = e
+
+            write_segment_manifests(out, iter(segs), extras, parquet_batch_size=2)
+            md = out / "manifests"
+            with (md / "all_segments.csv").open(newline="") as f:
+                rows = list(csv.DictReader(f))
+            self.assertEqual(len(rows), 5)
+            self.assertIn("pii_spans_json", rows[0])  # union column present even for no-PII rows
+            self.assertEqual(len((md / "all_segments.jsonl").read_text().splitlines()), 5)
+            self.assertTrue((out / "2024" / "manifests" / "segments.jsonl").exists())
+            self.assertFalse(list(md.rglob(".*tmp*")))  # atomic: no temp litter
+
+            lean = Path(td) / "lean"
+            lean.mkdir()
+            write_segment_manifests(lean, iter(segs), extras, write_csv=False, write_per_year=False)
+            self.assertTrue((lean / "manifests" / "all_segments.jsonl").exists())
+            self.assertFalse((lean / "manifests" / "all_segments.csv").exists())
+            self.assertFalse((lean / "2024").exists())
+
+    def test_manifest_write_is_crash_safe(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "out"
+            out.mkdir()
+            write_segment_manifests(out, [self._mk_segment(99)], {"seg99": {"final_transcript": "keep"}})
+            md = out / "manifests"
+            before = (md / "all_segments.jsonl").read_text()
+
+            def boom():
+                yield self._mk_segment(0)
+                raise RuntimeError("simulated crash mid-write")
+
+            with self.assertRaises(RuntimeError):
+                write_segment_manifests(out, boom(), {})
+
+            # Prior complete manifest must survive; no partial/corrupt file, no temp litter.
+            self.assertEqual((md / "all_segments.jsonl").read_text(), before)
+            self.assertIn("keep", before)
+            self.assertFalse(list(md.rglob(".*tmp*")))
 
     def test_manifest_stage_includes_transcripts_pii_and_redacted_paths(self):
         with tempfile.TemporaryDirectory() as td:

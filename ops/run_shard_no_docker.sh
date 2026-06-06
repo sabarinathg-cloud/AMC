@@ -23,12 +23,20 @@ HOSTNAME_VALUE="$(hostname)"
 VENV_ROOT="${AMC_VENV_ROOT:-/mnt/amc-data/venvs}"
 MAIN_PY="$VENV_ROOT/main/bin/python"
 ALIGN_PY="$VENV_ROOT/align/bin/python"
+COHERE_PY="$VENV_ROOT/cohere/bin/python"
 [[ -x "$MAIN_PY" ]] || MAIN_PY="$PYTHON_BIN"
 [[ -x "$ALIGN_PY" ]] || ALIGN_PY="$MAIN_PY"
+# Cohere ASR needs transformers>=5.4.0 (CohereAsrForConditionalGeneration), which is
+# incompatible with the main venv's transformers==4.57.6 (hard-pinned by qwen-asr). It runs
+# in its own isolated venv. If that venv is absent, fall back to MAIN_PY -- the cohere model
+# will simply error per-segment (ImportError) and the run degrades to a 3-model consensus,
+# exactly the prior behavior, instead of failing the stage.
+[[ -x "$COHERE_PY" ]] || COHERE_PY="$MAIN_PY"
 
 stage_python() {  # $1 = run_stage key
   case "$1" in
     align) printf '%s' "$ALIGN_PY" ;;
+    asr_cohere) printf '%s' "$COHERE_PY" ;;
     *) printf '%s' "$MAIN_PY" ;;
   esac
 }
@@ -283,7 +291,14 @@ for stage in $STAGES; do
       run_stage validate validate
       ;;
     manifest)
-      run_stage manifest manifest
+      # At scale (default) skip the multi-GB single CSV and the per-year duplicates; JSONL stays
+      # as the durable record and Parquet as the dataset (ops/merge_shards.sh reads those).
+      # Set AMC_MANIFEST_LEAN=0 to restore CSV + per-year for small/manual runs.
+      if [[ "${AMC_MANIFEST_LEAN:-1}" == "1" ]]; then
+        run_stage manifest manifest --manifest-no-csv --manifest-no-per-year
+      else
+        run_stage manifest manifest
+      fi
       ;;
     *)
       echo "Unknown stage key: $stage" >&2

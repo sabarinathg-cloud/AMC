@@ -81,7 +81,9 @@ for d in "${shards[@]}"; do
 import sys
 import pandas as pd
 src, dst = sys.argv[1], sys.argv[2]
-df = pd.read_json(src, lines=True)
+# Match the pipeline's all-string Parquet schema so this fallback part unions cleanly with the
+# parts the manifest stage wrote (the pipeline emits every column as a string).
+df = pd.read_json(src, lines=True).astype("string")
 try:
     df.to_parquet(dst, index=False, compression="zstd")
 except Exception:

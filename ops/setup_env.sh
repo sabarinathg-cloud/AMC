@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Build the AMC pipeline Python environments.
 #
-# WHY TWO ENVIRONMENTS
+# WHY THREE ENVIRONMENTS
 #   The pipeline stages need mutually-incompatible dependency sets, so a single env
 #   cannot satisfy all of them:
-#     * The ASR stages (qwen/cohere/granite) require `qwen-asr==0.0.6`, which HARD-PINS
+#     * The ASR stages (qwen/granite) require `qwen-asr==0.0.6`, which HARD-PINS
 #       `transformers==4.57.6` + `accelerate==1.12.0` and is documented to need a
 #       "fresh, isolated environment".
 #     * `whisperx` (the `align` stage) pulls pyannote-audio + a torch/transformers stack;
@@ -12,11 +12,15 @@
 #       with our torch 2.5.1 + numpy<2 + ctranslate2/cuDNN9 stack. The torch-2.5.1-safe
 #       line is whisperx==3.4.2 with transformers==4.56.2 and huggingface_hub==0.35.0 --
 #       different versions than the ASR stages use.
+#     * Cohere ASR (`asr_cohere`) needs `CohereAsrForConditionalGeneration`, added in
+#       transformers 5.4.0 -- a major-version jump that is incompatible with the 4.57.6
+#       pinned by qwen-asr. So cohere cannot share the main venv either.
 #   So we build:
-#     main  -> every stage except align   (transformers 4.57.6, hf 0.36.2, faster-whisper,
-#              gliner, spacy, torch 2.5.1+cu121)
-#     align -> the align stage only        (whisperx 3.4.2, pyannote 3.4.0,
-#              transformers 4.56.2, hf 0.35.0, torch 2.5.1+cu121)
+#     main   -> every stage except align + asr_cohere (transformers 4.57.6, hf 0.36.2,
+#               faster-whisper, gliner, spacy, torch 2.5.1+cu121)
+#     align  -> the align stage only        (whisperx 3.4.2, pyannote 3.4.0,
+#               transformers 4.56.2, hf 0.35.0, torch 2.5.1+cu121)
+#     cohere -> the asr_cohere stage only   (transformers>=5.4.0, torch 2.5.1+cu121)
 #
 # WHERE
 #   Both venvs are built ONCE on shared storage ($AMC_VENV_ROOT, default
@@ -44,6 +48,7 @@ SCHEMA_VERSION="v1"   # bump to force a rebuild independent of requirement file 
 
 MAIN_VENV="$VENV_ROOT/main"
 ALIGN_VENV="$VENV_ROOT/align"
+COHERE_VENV="$VENV_ROOT/cohere"
 
 log() { echo "[$(date -Is)] setup_env: $*"; }
 die() { log "ERROR: $*"; exit 1; }
@@ -51,16 +56,19 @@ die() { log "ERROR: $*"; exit 1; }
 cd "$REPO_DIR" || die "repo not found at $REPO_DIR"
 [[ -f docker/requirements-gpu.txt ]] || die "docker/requirements-gpu.txt missing"
 [[ -f docker/requirements-align.txt ]] || die "docker/requirements-align.txt missing"
+[[ -f docker/requirements-cohere.txt ]] || die "docker/requirements-cohere.txt missing"
 
 # Per-venv signatures: rebuild a venv only when ITS pin set (or this script's schema)
 # changes, so editing the align requirements does not force a main rebuild and vice versa.
 sig_of() { cat "$@" 2>/dev/null | sha256sum | awk -v s="$SCHEMA_VERSION" '{print s"-"$1}'; }
 MAIN_SIG="$(sig_of docker/requirements-gpu.txt docker/constraints-gpu.txt pyproject.toml)"
 ALIGN_SIG="$(sig_of docker/requirements-align.txt pyproject.toml)"
+COHERE_SIG="$(sig_of docker/requirements-cohere.txt pyproject.toml)"
 
 venv_sig() {  # $1=venv dir -> expected signature
   case "$1" in
     "$ALIGN_VENV") printf '%s' "$ALIGN_SIG" ;;
+    "$COHERE_VENV") printf '%s' "$COHERE_SIG" ;;
     *) printf '%s' "$MAIN_SIG" ;;
   esac
 }
@@ -107,6 +115,26 @@ build_align() {
   log "ALIGN venv ready"
 }
 
+build_cohere() {
+  log "building COHERE venv at $COHERE_VENV"
+  rm -rf "$COHERE_VENV"
+  "$PYTHON_BIN" -m venv "$COHERE_VENV" || die "venv create failed (cohere)"
+  local pip="$COHERE_VENV/bin/python -m pip"
+  $pip install --upgrade pip wheel setuptools || die "pip upgrade (cohere)"
+  $pip install --index-url "$TORCH_INDEX" torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
+    || die "torch install (cohere)"
+  # Install the editable package WITHOUT the qwen extra so the 4.57.6 pin does not leak in;
+  # requirements-cohere.txt pulls transformers>=5.4.0 (CohereAsrForConditionalGeneration).
+  $pip install -r docker/requirements-cohere.txt -e "." || die "requirements/editable install (cohere)"
+  # Match the cuDNN 9 ABI of the torch 2.5.1+cu121 wheel (same pin as main/align) so a stray
+  # newer nvidia-cudnn pulled transitively cannot trip CUDNN_STATUS_NOT_INITIALIZED.
+  $pip install --force-reinstall --no-deps nvidia-cudnn-cu12==9.1.0.70 || die "cudnn pin (cohere)"
+  # NOTE: no numpy<2 pin here (no ctranslate2/spaCy/onnxruntime in this venv). transformers 5.x
+  # + librosa want numpy>=2; let the resolver choose.
+  echo "$COHERE_SIG" > "$COHERE_VENV/.ready"
+  log "COHERE venv ready"
+}
+
 verify() {
   local rc=0
   log "verifying MAIN venv ($MAIN_VENV)"
@@ -125,12 +153,22 @@ print("  ALIGN ok: torch", torch.__version__, "cuda", torch.cuda.is_available(),
       "whisperx", getattr(whisperx, "__version__", "?"), "tf", transformers.__version__, "hf", h.__version__)
 assert torch.cuda.is_available(), "CUDA not available in ALIGN venv"
 PY
+  log "verifying COHERE venv ($COHERE_VENV)"
+  "$COHERE_VENV/bin/python" - <<'PY' || rc=1
+import torch, transformers
+from transformers import CohereAsrForConditionalGeneration  # noqa: F401  (the whole point)
+import amc_pipeline  # noqa: F401
+print("  COHERE ok: torch", torch.__version__, "cuda", torch.cuda.is_available(),
+      "tf", transformers.__version__)
+assert torch.cuda.is_available(), "CUDA not available in COHERE venv"
+PY
   return "$rc"
 }
 
 if [[ "${1:-}" == "--verify" ]]; then
   venv_ready "$MAIN_VENV" || die "MAIN venv not ready/stale; run without --verify to build"
   venv_ready "$ALIGN_VENV" || die "ALIGN venv not ready/stale; run without --verify to build"
+  venv_ready "$COHERE_VENV" || die "COHERE venv not ready/stale; run without --verify to build"
   verify || die "verification failed"
   log "verification passed"
   exit 0
@@ -157,13 +195,13 @@ release_lock() {
 }
 trap 'release_lock' EXIT INT TERM
 
-both_ready() { venv_ready "$MAIN_VENV" && venv_ready "$ALIGN_VENV"; }
+both_ready() { venv_ready "$MAIN_VENV" && venv_ready "$ALIGN_VENV" && venv_ready "$COHERE_VENV"; }
 
 am_builder=0
 deadline=$(( $(date +%s) + LOCK_WAIT ))
 while true; do
   if [[ "${FORCE_REBUILD:-0}" != "1" ]] && both_ready; then
-    log "both venvs already built (main $MAIN_SIG / align $ALIGN_SIG); skipping build"
+    log "all venvs already built (main $MAIN_SIG / align $ALIGN_SIG / cohere $COHERE_SIG); skipping build"
     break
   fi
   if mkdir "$LOCK_DIR" 2>/dev/null; then
@@ -187,16 +225,18 @@ done
 
 if (( am_builder == 1 )); then
   if [[ "${FORCE_REBUILD:-0}" == "1" ]]; then
-    log "FORCE_REBUILD=1: clearing markers and rebuilding both venvs"
-    rm -f "$MAIN_VENV/.ready" "$ALIGN_VENV/.ready" 2>/dev/null || true
+    log "FORCE_REBUILD=1: clearing markers and rebuilding all venvs"
+    rm -f "$MAIN_VENV/.ready" "$ALIGN_VENV/.ready" "$COHERE_VENV/.ready" 2>/dev/null || true
     build_main
     build_align
+    build_cohere
   else
     if venv_ready "$MAIN_VENV"; then log "MAIN venv up-to-date (sig $MAIN_SIG); skipping"; else build_main; fi
     if venv_ready "$ALIGN_VENV"; then log "ALIGN venv up-to-date (sig $ALIGN_SIG); skipping"; else build_align; fi
+    if venv_ready "$COHERE_VENV"; then log "COHERE venv up-to-date (sig $COHERE_SIG); skipping"; else build_cohere; fi
   fi
   release_lock   # let waiters proceed to verify in parallel
 fi
 
 verify || die "post-build verification failed"
-log "all environments ready and verified (main $MAIN_SIG / align $ALIGN_SIG)"
+log "all environments ready and verified (main $MAIN_SIG / align $ALIGN_SIG / cohere $COHERE_SIG)"

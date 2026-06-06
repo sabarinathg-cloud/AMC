@@ -40,6 +40,9 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--num-shards", type=int, default=None)
     parser.add_argument("--shard-index", type=int, default=None)
     parser.add_argument("--no-progress", action="store_true")
+    parser.add_argument("--manifest-no-csv", action="store_true", help="Manifest stage: skip the single all_segments.csv (keep JSONL + Parquet). Use at scale.")
+    parser.add_argument("--manifest-no-per-year", action="store_true", help="Manifest stage: skip the per-year segments.{jsonl,csv} duplicates. Use at scale.")
+    parser.add_argument("--manifest-parquet-batch-size", type=int, default=None, help="Manifest stage: rows per Parquet row group (memory/throughput knob)")
 
 
 def load_cli_config(args: argparse.Namespace) -> PipelineConfig:
@@ -73,6 +76,12 @@ def load_cli_config(args: argparse.Namespace) -> PipelineConfig:
         cfg.discovery.shard_index = args.shard_index
     if getattr(args, "no_progress", False):
         cfg.progress_enabled = False
+    if getattr(args, "manifest_no_csv", False):
+        cfg.manifest_write_csv = False
+    if getattr(args, "manifest_no_per_year", False):
+        cfg.manifest_write_per_year = False
+    if getattr(args, "manifest_parquet_batch_size", None) is not None:
+        cfg.manifest_parquet_batch_size = args.manifest_parquet_batch_size
     return cfg
 
 
