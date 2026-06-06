@@ -121,9 +121,9 @@ class PipelineConfig:
         if not self.asr_models:
             self.asr_models = {
                 "whisper": ASRModelConfig(True, str(DEFAULT_MODEL_ROOT / "whisper-large-v3"), 32),
-                "qwen": ASRModelConfig(True, str(DEFAULT_MODEL_ROOT / "qwen3-asr-1.7b"), 8),
-                "cohere": ASRModelConfig(True, str(DEFAULT_MODEL_ROOT / "cohere-transcribe-03-2026"), 4),
-                "granite": ASRModelConfig(True, str(DEFAULT_MODEL_ROOT / "granite-4.0-1b-speech"), 4),
+                "qwen": ASRModelConfig(True, str(DEFAULT_MODEL_ROOT / "qwen3-asr-1.7b"), 64),
+                "cohere": ASRModelConfig(True, str(DEFAULT_MODEL_ROOT / "cohere-transcribe-03-2026"), 64),
+                "granite": ASRModelConfig(True, str(DEFAULT_MODEL_ROOT / "granite-4.0-1b-speech"), 64),
             }
         if not self.pii_models:
             self.pii_models = {
