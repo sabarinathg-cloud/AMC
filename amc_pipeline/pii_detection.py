@@ -9,6 +9,26 @@ from .models import PIISpan
 from .config import PipelineConfig
 
 
+def _pii_device() -> tuple[str, int]:
+    """Resolve the device for the neural PII detectors.
+
+    The PII stage runs after ASR, so the GPU is idle and free to use. Returns
+    ``(torch_device_str, hf_pipeline_index)`` -- e.g. ("cuda", 0) or ("cpu", -1).
+    Override with AMC_PII_DEVICE=cpu|cuda|auto (default auto -> cuda if present).
+    """
+    pref = os.environ.get("AMC_PII_DEVICE", "auto").strip().lower()
+    if pref == "cpu":
+        return ("cpu", -1)
+    try:
+        import torch  # type: ignore
+
+        if pref in ("auto", "cuda", "gpu") and torch.cuda.is_available():
+            return ("cuda", 0)
+    except Exception:
+        pass
+    return ("cpu", -1)
+
+
 class PIIDetector:
     name = "base"
 
@@ -17,6 +37,13 @@ class PIIDetector:
 
     def detect(self, text: str) -> list[PIISpan]:
         raise NotImplementedError
+
+    def detect_batch(self, texts: list[str]) -> list[list[PIISpan]]:
+        """Detect PII for many texts at once, returning one span list per input
+        (aligned to ``texts``). The default loops ``detect`` so non-batched
+        detectors (e.g. regex) keep working; neural detectors override this to
+        run a single batched forward pass and saturate the GPU."""
+        return [self.detect(t) for t in texts]
 
 
 class RegexPIIDetector(PIIDetector):
@@ -81,6 +108,9 @@ class GLiNERDetector(PIIDetector):
         self.model_name_or_path = model_name_or_path
         self.threshold = threshold
         self._model = None
+        self._device = "cpu"
+        # How many texts to push through the model per forward pass (GPU memory bound).
+        self.batch_size = max(1, int(os.environ.get("AMC_PII_GLINER_BATCH", "32")))
 
     def preflight(self) -> None:
         if importlib.util.find_spec("gliner") is None:
@@ -91,17 +121,40 @@ class GLiNERDetector(PIIDetector):
             from gliner import GLiNER  # type: ignore
 
             self._model = GLiNER.from_pretrained(self.model_name_or_path)
+            device, _ = _pii_device()
+            if device != "cpu":
+                try:
+                    self._model = self._model.to(device)
+                    self._device = device
+                except Exception:
+                    self._device = "cpu"
         return self._model
 
-    def detect(self, text: str) -> list[PIISpan]:
-        model = self._load()
-        raw = model.predict_entities(str(text), self.LABELS, threshold=self.threshold)
+    def _spans_from_raw(self, raw) -> list[PIISpan]:
         return resolve_overlaps(
             [
                 PIISpan(str(e["label"]).upper().replace(" ", "_"), str(e["text"]), int(e["start"]), int(e["end"]), float(e.get("score", 0.0)), self.name, dict(e))
                 for e in raw
             ]
         )
+
+    def detect(self, text: str) -> list[PIISpan]:
+        model = self._load()
+        raw = model.predict_entities(str(text), self.LABELS, threshold=self.threshold)
+        return self._spans_from_raw(raw)
+
+    def detect_batch(self, texts: list[str]) -> list[list[PIISpan]]:
+        model = self._load()
+        texts = [str(t or "") for t in texts]
+        batch_fn = getattr(model, "batch_predict_entities", None)
+        if batch_fn is None:  # older gliner without batching -> per-text fallback
+            return [self._spans_from_raw(model.predict_entities(t, self.LABELS, threshold=self.threshold)) for t in texts]
+        out: list[list[PIISpan]] = []
+        for start in range(0, len(texts), self.batch_size):
+            chunk = texts[start : start + self.batch_size]
+            for raw in batch_fn(chunk, self.LABELS, threshold=self.threshold):
+                out.append(self._spans_from_raw(raw))
+        return out
 
 
 class PiiranhaDetector(PIIDetector):
@@ -111,6 +164,8 @@ class PiiranhaDetector(PIIDetector):
         self.model_name_or_path = model_name_or_path
         self.threshold = threshold
         self._pipe = None
+        # Texts per forward pass through the HF pipeline (GPU memory bound).
+        self.batch_size = max(1, int(os.environ.get("AMC_PII_PIIRANHA_BATCH", "64")))
 
     def preflight(self) -> None:
         if importlib.util.find_spec("transformers") is None:
@@ -120,13 +175,19 @@ class PiiranhaDetector(PIIDetector):
         if self._pipe is None:
             from transformers import pipeline  # type: ignore
 
-            self._pipe = pipeline("token-classification", model=self.model_name_or_path, tokenizer=self.model_name_or_path, aggregation_strategy="simple")
+            _, hf_index = _pii_device()
+            self._pipe = pipeline(
+                "token-classification",
+                model=self.model_name_or_path,
+                tokenizer=self.model_name_or_path,
+                aggregation_strategy="simple",
+                device=hf_index,
+            )
         return self._pipe
 
-    def detect(self, text: str) -> list[PIISpan]:
-        pipe = self._load()
+    def _spans_from_items(self, text: str, items) -> list[PIISpan]:
         spans: list[PIISpan] = []
-        for item in pipe(str(text)):
+        for item in items:
             score = float(item.get("score", 0.0))
             if score < self.threshold:
                 continue
@@ -136,6 +197,20 @@ class PiiranhaDetector(PIIDetector):
                 label = str(item.get("entity_group", item.get("entity", "PII"))).upper()
                 spans.append(PIISpan(label, str(text)[start:end], start, end, score, self.name, dict(item)))
         return resolve_overlaps(spans)
+
+    def detect(self, text: str) -> list[PIISpan]:
+        pipe = self._load()
+        text = str(text)
+        return self._spans_from_items(text, pipe(text))
+
+    def detect_batch(self, texts: list[str]) -> list[list[PIISpan]]:
+        pipe = self._load()
+        texts = [str(t or "") for t in texts]
+        if not texts:
+            return []
+        # A list input makes the HF pipeline batch internally (one result list per text).
+        results = pipe(texts, batch_size=self.batch_size)
+        return [self._spans_from_items(text, items) for text, items in zip(texts, results)]
 
 
 # spaCy's DATE/CARDINAL entities frequently fire on tokens that are NOT PII: relative time
@@ -205,6 +280,9 @@ class SpacyDetector(PIIDetector):
         "CARDINAL": "NUMBER",
     }
 
+    # NER only needs tok2vec + ner; the tagger/parser/lemmatizer are pure overhead here.
+    _NER_ONLY_EXCLUDE = ["tagger", "parser", "lemmatizer", "attribute_ruler", "morphologizer"]
+
     def __init__(self, model_name_or_path: str = "en_core_web_sm", threshold: float = 0.60):
         self.model_name_or_path = model_name_or_path
         self.threshold = threshold
@@ -212,6 +290,7 @@ class SpacyDetector(PIIDetector):
         # Drop relative/non-PII DATE & NUMBER spans by default; set AMC_MASK_RELATIVE_DATES=1
         # to restore the old behavior of masking every spaCy DATE/CARDINAL hit.
         self.drop_relative_dates = os.environ.get("AMC_MASK_RELATIVE_DATES", "0") != "1"
+        self.pipe_batch_size = max(1, int(os.environ.get("AMC_PII_SPACY_BATCH", "256")))
 
     def preflight(self) -> None:
         if importlib.util.find_spec("spacy") is None:
@@ -221,11 +300,14 @@ class SpacyDetector(PIIDetector):
         if self._nlp is None:
             import spacy  # type: ignore
 
-            self._nlp = spacy.load(self.model_name_or_path)
+            try:
+                self._nlp = spacy.load(self.model_name_or_path, exclude=self._NER_ONLY_EXCLUDE)
+            except Exception:
+                # A component name may not exist in this model; fall back to a full load.
+                self._nlp = spacy.load(self.model_name_or_path)
         return self._nlp
 
-    def detect(self, text: str) -> list[PIISpan]:
-        doc = self._load()(str(text or ""))
+    def _spans_from_doc(self, doc) -> list[PIISpan]:
         spans: list[PIISpan] = []
         for ent in doc.ents:
             if ent.label_ not in self.LABEL_MAP:
@@ -245,6 +327,14 @@ class SpacyDetector(PIIDetector):
                 )
             )
         return resolve_overlaps(spans)
+
+    def detect(self, text: str) -> list[PIISpan]:
+        return self._spans_from_doc(self._load()(str(text or "")))
+
+    def detect_batch(self, texts: list[str]) -> list[list[PIISpan]]:
+        nlp = self._load()
+        docs = nlp.pipe([str(t or "") for t in texts], batch_size=self.pipe_batch_size)
+        return [self._spans_from_doc(doc) for doc in docs]
 
 
 def resolve_overlaps(spans: list[PIISpan]) -> list[PIISpan]:

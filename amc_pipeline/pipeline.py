@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import traceback
@@ -369,6 +370,24 @@ class Pipeline:
         }
         count = 0
         skipped = 0
+        # Buffer segments and run each detector once over the whole batch so the neural
+        # NER models (GLiNER/Piiranha on GPU, spaCy via nlp.pipe) saturate the device
+        # instead of doing one tiny forward pass per segment. Output is byte-identical to
+        # the per-segment path: results are scattered back in the same candidate/detector
+        # order before dedupe.
+        batch_size = max(1, int(os.environ.get("AMC_PII_SEGMENT_BATCH", "128")))
+        buffer: list[tuple[str, str]] = []
+
+        def _flush() -> int:
+            if not buffer:
+                return 0
+            n = 0
+            for (segment_id, _), span_dicts in zip(buffer, self._detect_pii_for_batch(buffer, detectors)):
+                self.state.record_artifact(f"pii:{segment_id}", "pii", Path(segment_id), "completed", {"segment_id": segment_id, "spans": span_dicts})
+                n += len(span_dicts)
+            buffer.clear()
+            return n
+
         for artifact in iter_progress(self.state.iter_artifacts("consensus"), desc="Detect PII", total=total, unit="segment", enabled=self.config.progress_enabled):
             payload = artifact["payload"]
             final_transcript = payload.get("final_transcript", "")
@@ -376,33 +395,58 @@ class Pipeline:
             if segment_id in existing:
                 skipped += 1
                 continue
-            span_dicts = self._detect_pii_for_segment(segment_id, final_transcript, detectors)
-            self.state.record_artifact(f"pii:{segment_id}", "pii", Path(segment_id), "completed", {"segment_id": segment_id, "spans": span_dicts})
-            count += len(span_dicts)
+            buffer.append((segment_id, final_transcript))
+            if len(buffer) >= batch_size:
+                count += _flush()
+        count += _flush()
         summary = {"stage": "pii", "segments": total, "processed": total - skipped, "skipped_existing": skipped, "spans": count}
         self._write_report("pii_summary.json", summary)
         return summary
 
-    def _detect_pii_for_segment(self, segment_id: str, final_transcript: str, detectors) -> list[dict[str, Any]]:
+    def _candidates_for_segment(self, segment_id: str, final_transcript: str) -> list[tuple[str, str]]:
         candidates: list[tuple[str, str]] = [("final", final_transcript)]
         if self.config.pii_on_all_model_transcripts:
             for row in self.state.fetch_model_results(segment_id):
                 text = row["payload"].get("transcript", "")
                 if text:
                     candidates.append((row["model_name"], text))
-        span_dicts: list[dict[str, Any]] = []
-        for source_name, transcript in candidates:
-            for detector in detectors:
-                for span in detector.detect(transcript):
-                    mapped = _map_span_to_final(span, transcript, final_transcript)
-                    if mapped is None:
-                        continue
-                    mapped = _expand_numeric_pii_context(mapped, final_transcript)
-                    data = dataclass_to_dict(mapped)
-                    data["transcript_source"] = source_name
-                    data["detector_source"] = span.source
-                    span_dicts.append(data)
-        return _dedupe_pii_dicts(span_dicts)
+        return candidates
+
+    def _detect_pii_for_batch(self, items: list[tuple[str, str]], detectors) -> list[list[dict[str, Any]]]:
+        # Build a flat list of every candidate transcript across the batch, remembering which
+        # (segment, source) each one belongs to, so we can run each detector once over all of them.
+        flat_texts: list[str] = []
+        per_item: list[list[tuple[str, str, int]]] = []  # [(source_name, transcript, flat_index), ...] per item
+        for segment_id, final_transcript in items:
+            refs: list[tuple[str, str, int]] = []
+            for source_name, transcript in self._candidates_for_segment(segment_id, final_transcript):
+                refs.append((source_name, transcript, len(flat_texts)))
+                flat_texts.append(transcript)
+            per_item.append(refs)
+
+        # One batched forward pass per detector over the whole flat list.
+        detector_spans: list[list[list[PIISpan]]] = [detector.detect_batch(flat_texts) for detector in detectors]
+
+        out: list[list[dict[str, Any]]] = []
+        for (segment_id, final_transcript), refs in zip(items, per_item):
+            span_dicts: list[dict[str, Any]] = []
+            for source_name, transcript, flat_idx in refs:
+                for det_idx, detector in enumerate(detectors):
+                    for span in detector_spans[det_idx][flat_idx]:
+                        mapped = _map_span_to_final(span, transcript, final_transcript)
+                        if mapped is None:
+                            continue
+                        mapped = _expand_numeric_pii_context(mapped, final_transcript)
+                        data = dataclass_to_dict(mapped)
+                        data["transcript_source"] = source_name
+                        data["detector_source"] = span.source
+                        span_dicts.append(data)
+            out.append(_dedupe_pii_dicts(span_dicts))
+        return out
+
+    def _detect_pii_for_segment(self, segment_id: str, final_transcript: str, detectors) -> list[dict[str, Any]]:
+        # Single-segment path (kept for callers/tests); delegates to the batched implementation.
+        return self._detect_pii_for_batch([(segment_id, final_transcript)], detectors)[0]
 
     def align(self) -> dict[str, Any]:
         if self.config.alignment.backend == "torchaudio_ctc":
