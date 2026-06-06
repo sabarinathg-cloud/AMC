@@ -179,6 +179,12 @@ def main() -> int:
         help="Whisper only: a second model dir to A/B against the configured one, "
         "both on the WER-safe per-segment path (e.g. large-v3 vs large-v3-turbo).",
     )
+    parser.add_argument(
+        "--fullfile",
+        action="store_true",
+        help="Whisper only: A/B per-segment baseline vs the full-call batched path "
+        "(AMC_WHISPER_FULLFILE_BATCH). Drift should be benign; speed ~4-5x.",
+    )
     args = parser.parse_args()
 
     config = _load_config(args)
@@ -196,10 +202,25 @@ def main() -> int:
     #   default            : per-segment (WER-safe) vs packed (fast, opt-in)
     #   --compare-path PATH : per-segment large-v3 vs per-segment PATH (e.g. turbo)
     if args.model == "whisper":
-        def _mk(batched: bool, path: str | None = None) -> WhisperAdapter:
+        def _mk(batched: bool, path: str | None = None, fullfile: bool = False) -> WhisperAdapter:
             adapter = WhisperAdapter(path or base.path or "", base.batch_size or 0, base.device)
             adapter.batched = batched
+            adapter.fullfile = fullfile
             return adapter
+
+        if args.fullfile:
+            print("\n== model A: per-segment (WER-safe baseline) ==")
+            baseline = _run(_mk(False), segments)
+            print("== model B: full-call batched (AMC_WHISPER_FULLFILE_BATCH) ==")
+            candidate = _run(_mk(False, fullfile=True), segments)
+            _compare("whisper_persegment_vs_fullfile", baseline, candidate)
+            print(
+                "\nNote: full-call batching rebuilds the call timeline from real segment\n"
+                "offsets (true silences), so VAD cuts at segment boundaries and words map\n"
+                "back cleanly. Adopt if RTFx is clearly higher AND drift is benign\n"
+                "(spacing/casing/punctuation) with NO dropped or invented words."
+            )
+            return 0
 
         if args.compare_path:
             print(f"\n== model A: per-segment (path={base.path}) ==")
