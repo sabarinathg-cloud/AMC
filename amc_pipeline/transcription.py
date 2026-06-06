@@ -490,8 +490,15 @@ class CohereAdapter(ASRAdapter):
 
     def _generate_from_audios(self, audios: list[list[float]], language: str) -> tuple[list[str], list[str | None]]:
         processor, model, torch = self._load()
+        # The Cohere feature extractor calls `.shape` on each raw waveform, so it
+        # needs ndarray inputs -- plain Python lists raise
+        # AttributeError("'list' object has no attribute 'shape'"). numpy ships
+        # with transformers, so this is always importable in the cohere venv.
+        import numpy as np  # type: ignore
+
+        np_audios = [np.asarray(a, dtype=np.float32) for a in audios]
         inputs = processor(
-            audios,
+            np_audios,
             sampling_rate=16000,
             return_tensors="pt",
             language=language,
