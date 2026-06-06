@@ -38,26 +38,37 @@ resolve_out() {
   if [[ -n "${RUN_ROOT:-}" && -n "${SHARD_INDEX:-}" ]]; then
     printf '%s' "$RUN_ROOT/outputs/shard-$SHARD_INDEX"; return
   fi
-  # Auto-discover: among all state DBs, pick the one with the most segments.
+  # Auto-discover via BOUNDED globs (never walk the whole mount: AMC_IN is the Lustre root,
+  # so os.walk would crawl every input audio + output segment WAV). State DBs always live at
+  # <out>/.pii_pipeline/state/pipeline.sqlite3 with <out> = <RUN_ROOT>/outputs/shard-N. We only
+  # glob those fixed-shape paths at a few known depths, then pick the DB with the most segments.
   "$MAIN_PY" - "$AMC_IN" <<'PY'
-import os, sqlite3, sys
+import glob, os, sqlite3, sys
 root = sys.argv[1] if len(sys.argv) > 1 else "/mnt/amc-data"
+suffix = os.path.join("outputs", "shard-*", ".pii_pipeline", "state", "pipeline.sqlite3")
+patterns = [
+    os.path.join(root, "amc-runs", "*", suffix),  # RUN_ROOT=/mnt/amc-data/amc-runs/<run>
+    os.path.join(root, "*", suffix),               # RUN_ROOT=/mnt/amc-data/<run>
+    os.path.join(root, suffix),                    # RUN_ROOT=/mnt/amc-data
+    os.path.join(root, "*", "*", suffix),          # one extra nesting level, just in case
+]
+seen, candidates = set(), []
+for pat in patterns:
+    for db in glob.glob(pat):
+        if db not in seen:
+            seen.add(db)
+            candidates.append(db)
 best, best_n = None, 0
-for dirpath, dirnames, filenames in os.walk(root):
-    if "pipeline.sqlite3" in filenames and os.sep + "outputs" + os.sep in dirpath + os.sep:
-        db = os.path.join(dirpath, "pipeline.sqlite3")
-        try:
-            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-            n = con.execute("select count(*) from segments").fetchone()[0]
-            con.close()
-        except Exception:
-            n = 0
-        if n > best_n:
-            best, best_n = db, n
-    # Do not descend into model weights / cache trees (speed + avoid huge dirs).
-    dirnames[:] = [d for d in dirnames if d not in (".git", "models", "cache", "huggingface", "torch")]
+for db in candidates:
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        n = con.execute("select count(*) from segments").fetchone()[0]
+        con.close()
+    except Exception:
+        n = 0
+    if n > best_n:
+        best, best_n = db, n
 if best:
-    # db path is <out>/.pii_pipeline/state/pipeline.sqlite3 -> strip the trailing 3 components.
     out = os.path.dirname(os.path.dirname(os.path.dirname(best)))
     sys.stderr.write(f"auto-selected run with {best_n} segments: {out}\n")
     print(out)
