@@ -45,12 +45,14 @@ resolve_out() {
   "$MAIN_PY" - "$AMC_IN" <<'PY'
 import glob, os, sqlite3, sys
 root = sys.argv[1] if len(sys.argv) > 1 else "/mnt/amc-data"
+# Scan ONLY the runs subtree. A bare root/* or root/*/* glob walks the whole data
+# root (500K+ input files on Lustre) and hangs for many minutes; runs live under
+# amc-runs/<run>/outputs/shard-N, so glob just that (bounded by run count).
+runs_root = os.environ.get("AMC_RUNS_ROOT") or os.path.join(root, "amc-runs")
 suffix = os.path.join("outputs", "shard-*", ".pii_pipeline", "state", "pipeline.sqlite3")
 patterns = [
-    os.path.join(root, "amc-runs", "*", suffix),  # RUN_ROOT=/mnt/amc-data/amc-runs/<run>
-    os.path.join(root, "*", suffix),               # RUN_ROOT=/mnt/amc-data/<run>
-    os.path.join(root, suffix),                    # RUN_ROOT=/mnt/amc-data
-    os.path.join(root, "*", "*", suffix),          # one extra nesting level, just in case
+    os.path.join(runs_root, "*", suffix),       # RUN_ROOT=/mnt/amc-data/amc-runs/<run>
+    os.path.join(runs_root, "*", "*", suffix),  # one extra nesting level, just in case
 ]
 seen, candidates = set(), []
 for pat in patterns:
@@ -77,8 +79,8 @@ PY
 
 OUT="$(resolve_out)"
 if [[ -z "$OUT" ]]; then
-  echo "FATAL: no run found with segments under $AMC_IN. Set AMC_OUT or RUN_ROOT+SHARD_INDEX," \
-       "or run the preprocess stage first." >&2
+  echo "FATAL: no run found with segments under ${AMC_RUNS_ROOT:-$AMC_IN/amc-runs}. Set AMC_OUT" \
+       "or RUN_ROOT+SHARD_INDEX (or AMC_RUNS_ROOT if runs live elsewhere), or run preprocess first." >&2
   exit 3
 fi
 echo "sweep output dir: $OUT"
