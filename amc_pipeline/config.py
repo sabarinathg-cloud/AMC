@@ -120,10 +120,13 @@ class PipelineConfig:
     def __post_init__(self) -> None:
         if not self.asr_models:
             self.asr_models = {
-                "whisper": ASRModelConfig(True, str(DEFAULT_MODEL_ROOT / "whisper-large-v3"), 64),
-                "qwen": ASRModelConfig(True, str(DEFAULT_MODEL_ROOT / "qwen3-asr-1.7b"), 32),
-                "cohere": ASRModelConfig(True, str(DEFAULT_MODEL_ROOT / "cohere-transcribe-03-2026"), 32),
-                "granite": ASRModelConfig(True, str(DEFAULT_MODEL_ROOT / "granite-4.0-1b-speech"), 8),
+                # Batch caps from the ops/asr_batch_sweep.py sweep (A10G, caps 8-128). All four
+                # max throughput at cap=128 within ~8.3 GB peak; whisper/cohere are byte-identical
+                # across caps, qwen/granite show ~1-2.6% benign batching drift absorbed by consensus.
+                "whisper": ASRModelConfig(True, str(DEFAULT_MODEL_ROOT / "whisper-large-v3"), 128),
+                "qwen": ASRModelConfig(True, str(DEFAULT_MODEL_ROOT / "qwen3-asr-1.7b"), 128),
+                "cohere": ASRModelConfig(True, str(DEFAULT_MODEL_ROOT / "cohere-transcribe-03-2026"), 128),
+                "granite": ASRModelConfig(True, str(DEFAULT_MODEL_ROOT / "granite-4.0-1b-speech"), 128),
             }
         if not self.pii_models:
             self.pii_models = {
