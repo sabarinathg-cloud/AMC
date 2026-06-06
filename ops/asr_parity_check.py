@@ -152,6 +152,11 @@ def main() -> int:
     parser.add_argument("--budget", type=float, default=None, help="audio-seconds budget for the dynamic run")
     parser.add_argument("--max-batch", type=int, default=None, help="count cap for the dynamic run")
     parser.add_argument("--check-bf16", action="store_true", help="Cohere only: also compare float32 vs bfloat16")
+    parser.add_argument(
+        "--compare-path",
+        help="Whisper only: a second model dir to A/B against the configured one, "
+        "both on the WER-safe per-segment path (e.g. large-v3 vs large-v3-turbo).",
+    )
     args = parser.parse_args()
 
     config = _load_config(args)
@@ -165,24 +170,39 @@ def main() -> int:
         return 2
     print(f"model={args.model} segments={len(segments)} (path={base.path})")
 
-    # Whisper has no dynamic-batching axis; its A/B is segment packing on vs off.
+    # Whisper has no dynamic-batching axis. Two A/B modes:
+    #   default            : per-segment (WER-safe) vs packed (fast, opt-in)
+    #   --compare-path PATH : per-segment large-v3 vs per-segment PATH (e.g. turbo)
     if args.model == "whisper":
-        def _mk(batched: bool) -> WhisperAdapter:
-            adapter = WhisperAdapter(base.path or "", base.batch_size or 0, base.device)
+        def _mk(batched: bool, path: str | None = None) -> WhisperAdapter:
+            adapter = WhisperAdapter(path or base.path or "", base.batch_size or 0, base.device)
             adapter.batched = batched
             return adapter
 
+        if args.compare_path:
+            print(f"\n== model A: per-segment (path={base.path}) ==")
+            baseline = _run(_mk(False), segments)
+            print(f"== model B: per-segment (path={args.compare_path}) ==")
+            candidate = _run(_mk(False, args.compare_path), segments)
+            _compare("whisper_modelA_vs_modelB_persegment", baseline, candidate)
+            print(
+                "\nNote: this compares two MODELS on the same WER-safe per-segment path.\n"
+                "Adopt model B (e.g. large-v3-turbo) if RTFx is clearly higher AND drift\n"
+                "is benign (spacing/casing/punctuation), with NO dropped or invented words.\n"
+                "True WER vs ground truth needs labeled references, not this drift check."
+            )
+            return 0
+
         print("\n== running whisper per-segment (AMC_WHISPER_BATCHED=0 baseline) ==")
         baseline = _run(_mk(False), segments)
-        print("== running whisper packed (default) ==")
+        print("== running whisper packed (AMC_WHISPER_BATCHED=1, opt-in) ==")
         packed = _run(_mk(True), segments)
         _compare("whisper_persegment_vs_packed", baseline, packed)
         print(
-            "\nNote: packing intentionally adds cross-segment context, so non-zero drift\n"
-            "is EXPECTED (and usually improves accuracy). Validate that:\n"
-            "  - packed RTFx is clearly higher (it's faster),\n"
-            "  - worst-drift examples are real re-wordings, not empty/hallucinated text.\n"
-            "True WER vs ground truth needs labeled references, not this drift check."
+            "\nNote: packing adds cross-segment context/silence, so drift is EXPECTED.\n"
+            "Per-segment is the default because packing can hallucinate filler on very\n"
+            "short clips. Validate worst-drift examples are real re-wordings, not\n"
+            "empty/hallucinated text. True WER needs labeled references, not this check."
         )
         return 0
 

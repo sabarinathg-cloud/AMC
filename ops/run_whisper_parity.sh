@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
-# Whisper packing A/B on a GPU host: per-segment (AMC_WHISPER_BATCHED=0) vs the
-# default packed path, on segments already in a run's state DB. Reports transcript
-# drift + RTFx (speed) for each path. Run after preprocess has produced segments.
+# Whisper A/B on a GPU host, on segments already in a run's state DB. Reports
+# transcript drift + RTFx (speed). Run after preprocess has produced segments.
+#
+# Two modes:
+#   default            -- per-segment (WER-safe) vs packed (fast, opt-in)
+#   WHISPER_PATH=<dir>  -- per-segment large-v3 vs per-segment <dir> (e.g. turbo),
+#                          the WER-safe speed lever (#6).
 #
 # Usage (host or via SSM):
 #   bash ops/run_whisper_parity.sh
@@ -9,8 +13,9 @@
 #   AMC_OUT=/mnt/amc-data/amc-runs/<run>/outputs/shard-0 bash ops/run_whisper_parity.sh
 #   RUN_ROOT=/mnt/amc-data/amc-runs/<run> SHARD_INDEX=0 bash ops/run_whisper_parity.sh
 #
-# Optionally A/B the turbo model too: fetch it first (ops/fetch_whisper_model.sh),
-# then set WHISPER_PATH=/mnt/amc-data/pipeline/models/whisper-large-v3-turbo here.
+# Compare large-v3 vs turbo (fetch turbo first via ops/fetch_whisper_model.sh):
+#   WHISPER_PATH=/mnt/amc-data/pipeline/models/whisper-large-v3-turbo \
+#     bash ops/run_whisper_parity.sh
 if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi
 set -Eeuo pipefail
 
@@ -96,11 +101,21 @@ STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 LOG="$LOG_DIR/whisper_parity_${STAMP}.log"
 echo "writing log to: $LOG"
 
+EXTRA_ARGS=()
+if [[ -n "${WHISPER_PATH:-}" ]]; then
+  if [[ ! -d "$WHISPER_PATH" ]]; then
+    echo "FATAL: WHISPER_PATH=$WHISPER_PATH is not a directory (run ops/fetch_whisper_model.sh first)" >&2
+    exit 4
+  fi
+  echo "compare model B (per-segment): $WHISPER_PATH"
+  EXTRA_ARGS+=(--compare-path "$WHISPER_PATH")
+fi
+
 set +e
 LD_LIBRARY_PATH="$ld" PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}" \
   "$MAIN_PY" ops/asr_parity_check.py \
     --input "$AMC_IN" --output "$OUT" \
-    --model whisper --limit "$LIMIT" 2>&1 | tee -a "$LOG"
+    --model whisper --limit "$LIMIT" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} 2>&1 | tee -a "$LOG"
 rc=${PIPESTATUS[0]}
 set -e
 
