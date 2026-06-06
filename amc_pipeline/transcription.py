@@ -95,6 +95,7 @@ class WhisperAdapter(ASRAdapter):
         # legacy one-transcribe-per-segment path for parity A/B comparisons.
         self.batched = os.environ.get("AMC_WHISPER_BATCHED", "1") != "0"
         self._model = None
+        self._base = None
         self._internal_batch_size = 0
 
     def preflight(self) -> None:
@@ -119,6 +120,10 @@ class WhisperAdapter(ASRAdapter):
                 cpu_threads=max(1, (os.cpu_count() or 1) // 2),
                 num_workers=4,
             )
+            # Pack path uses the base model directly (one forward pass per ~30s pack
+            # with word timestamps); the batched pipeline is kept for the per-segment
+            # fallback path.
+            self._base = base
             self._model = BatchedInferencePipeline(model=base)
         return self._model
 
@@ -195,40 +200,54 @@ class WhisperAdapter(ASRAdapter):
                 parts.append(gap)
         audio = np.concatenate(parts) if parts else np.zeros(int(0.1 * sr), dtype=np.float32)
 
-        out, info = model.transcribe(
+        # Deterministic mapping: transcribe the whole pack with WORD timestamps and
+        # vad_filter OFF, then assign each word to the segment window its timestamp
+        # falls in. This never relies on the internal VAD re-splitting the pack (its
+        # default 2s min-silence merges our gaps), so no segment can be dropped or
+        # merged into a neighbour.
+        out, info = self._base.transcribe(
             audio,
             language=None,
             beam_size=5,
-            batch_size=self._internal_batch_size,
-            vad_filter=True,
+            vad_filter=False,
+            word_timestamps=True,
             condition_on_previous_text=False,
-            without_timestamps=False,
         )
         lang = getattr(info, "language", None)
         lang_prob = float(getattr(info, "language_probability", 0.0) or 0.0)
         dur_after_vad = getattr(info, "duration_after_vad", None)
 
+        def _assign(mid: float) -> SegmentRecord:
+            for seg, w_start, w_end in windows:
+                if w_start <= mid < w_end:
+                    return seg
+            return min(windows, key=lambda w: abs(0.5 * (w[1] + w[2]) - mid))[0]
+
         buckets: dict[str, list[tuple[float, str]]] = {seg.segment_id: [] for seg, _s, _e in pack}
         for ws in out:
-            text = (getattr(ws, "text", "") or "").strip()
-            if not text:
-                continue
-            ws_start = float(getattr(ws, "start", 0.0) or 0.0)
-            ws_end = float(getattr(ws, "end", ws_start) or ws_start)
-            best_seg, best_ov = None, 0.0
-            for seg, w_start, w_end in windows:
-                ov = min(ws_end, w_end) - max(ws_start, w_start)
-                if ov > best_ov:
-                    best_ov, best_seg = ov, seg
-            if best_seg is None:
-                # Landed entirely in a silence gap: attach to the nearest segment.
-                mid = 0.5 * (ws_start + ws_end)
-                best_seg = min(windows, key=lambda w: abs(0.5 * (w[1] + w[2]) - mid))[0]
-            buckets[best_seg.segment_id].append((ws_start, text))
+            words = getattr(ws, "words", None)
+            if words:
+                for w in words:
+                    token = getattr(w, "word", "") or ""
+                    if not token.strip():
+                        continue
+                    w_start = float(getattr(w, "start", 0.0) or 0.0)
+                    w_end = float(getattr(w, "end", w_start) or w_start)
+                    seg = _assign(0.5 * (w_start + w_end))
+                    buckets[seg.segment_id].append((w_start, token))
+            else:
+                # No word timestamps (degenerate): fall back to segment-level overlap.
+                text = (getattr(ws, "text", "") or "").strip()
+                if not text:
+                    continue
+                ws_start = float(getattr(ws, "start", 0.0) or 0.0)
+                ws_end = float(getattr(ws, "end", ws_start) or ws_start)
+                seg = _assign(0.5 * (ws_start + ws_end))
+                buckets[seg.segment_id].append((ws_start, " " + text))
 
         for seg, _s, _e in pack:
             ordered = sorted(buckets.get(seg.segment_id, []), key=lambda x: x[0])
-            transcript = " ".join(t for _, t in ordered).strip()
+            transcript = "".join(t for _, t in ordered).strip()
             by_id[seg.segment_id] = ASRResult(
                 seg.segment_id,
                 self.name,
