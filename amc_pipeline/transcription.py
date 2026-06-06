@@ -33,6 +33,15 @@ _DEFAULT_BATCH_LIMITS: dict[str, tuple[int, float]] = {
 # How many upcoming batches to load on a background thread while the GPU runs.
 _PREFETCH_DEPTH = 2
 
+# Whisper segment packing (#5). Whisper is trained on 30s windows; feeding it the
+# raw sub-second VAD clips one at a time is out-of-distribution (worse WER, and
+# slow because every call pays the full encode/decode + VAD overhead). We instead
+# concatenate consecutive same-call segments into ~`_WHISPER_PACK_WINDOW_SEC`
+# super-clips separated by `_WHISPER_PACK_GAP_SEC` of silence, run one batched
+# transcribe per pack, then map the timestamped output back to each segment.
+_WHISPER_PACK_WINDOW_SEC = 28.0
+_WHISPER_PACK_GAP_SEC = 0.6
+
 
 class ASRAdapter:
     name = "base"
@@ -69,10 +78,22 @@ class FixtureASRAdapter(ASRAdapter):
 class WhisperAdapter(ASRAdapter):
     name = "whisper"
 
-    def __init__(self, model_path: str, batch_size: int = 0, device: str = "auto"):
+    def __init__(
+        self,
+        model_path: str,
+        batch_size: int = 0,
+        device: str = "auto",
+        pack_window_sec: float = _WHISPER_PACK_WINDOW_SEC,
+        pack_gap_sec: float = _WHISPER_PACK_GAP_SEC,
+    ):
         self.model_path = Path(model_path)
         self.batch_size = batch_size
         self.device = device
+        self.pack_window_sec = max(1.0, float(pack_window_sec))
+        self.pack_gap_sec = max(0.0, float(pack_gap_sec))
+        # Segment packing (#5) is the default; AMC_WHISPER_BATCHED=0 restores the
+        # legacy one-transcribe-per-segment path for parity A/B comparisons.
+        self.batched = os.environ.get("AMC_WHISPER_BATCHED", "1") != "0"
         self._model = None
         self._internal_batch_size = 0
 
@@ -103,34 +124,147 @@ class WhisperAdapter(ASRAdapter):
 
     def transcribe_batch(self, segments: list[SegmentRecord]) -> list[ASRResult]:
         model = self._load()
-        results: list[ASRResult] = []
-        for segment in iter_progress(segments, desc="Whisper ASR", total=len(segments), unit="segment", enabled=self.progress_enabled):
+        np = _optional_import("numpy") if self.batched else None
+        if np is None:
+            # Legacy / fallback: one transcribe per segment (still drops the
+            # redundant VAD pass per #1 since each clip is already a VAD segment).
+            return [
+                self._transcribe_one(model, seg)
+                for seg in iter_progress(
+                    segments, desc="Whisper ASR", total=len(segments), unit="segment", enabled=self.progress_enabled
+                )
+            ]
+
+        by_id: dict[str, ASRResult] = {}
+        packs = list(self._pack_segments(segments))
+        for pack in iter_progress(packs, desc="Whisper ASR", total=len(packs), unit="pack", enabled=self.progress_enabled):
             try:
-                out, info = model.transcribe(
-                    str(segment.segment_audio_path),
-                    language=None,
-                    beam_size=5,
-                    batch_size=self._internal_batch_size,
-                    vad_filter=True,
-                    condition_on_previous_text=False,
-                    without_timestamps=True,
-                )
-                text = " ".join(x.text.strip() for x in out).strip()
-                language_probability = float(getattr(info, "language_probability", 0.0) or 0.0)
-                results.append(
-                    ASRResult(
-                        segment.segment_id,
-                        self.name,
-                        text,
-                        language_probability,
-                        getattr(info, "language", None),
-                        language_probability,
-                        raw={"duration_after_vad": getattr(info, "duration_after_vad", None)},
-                    )
-                )
-            except Exception as exc:
-                results.append(ASRResult(segment.segment_id, self.name, "", 0.0, error=repr(exc)))
-        return results
+                self._transcribe_pack(model, np, pack, by_id)
+            except Exception:
+                # A single bad pack must not drop a whole batch of segments; retry
+                # those segments one at a time on the simple path.
+                for seg, _start, _end in pack:
+                    by_id[seg.segment_id] = self._transcribe_one(model, seg)
+        return [
+            by_id.get(s.segment_id, ASRResult(s.segment_id, self.name, "", 0.0, error="NOT_RUN"))
+            for s in segments
+        ]
+
+    def _pack_segments(
+        self, segments: list[SegmentRecord]
+    ) -> Iterator[list[tuple[SegmentRecord, float, float]]]:
+        """Group consecutive same-call segments into ~`pack_window_sec` clips.
+
+        Segments are grouped by call and ordered by start time so the packed audio
+        approximates the original call (good context => better WER). Each yielded
+        pack is a list of ``(segment, start_sec_in_pack, end_sec_in_pack)`` using
+        nominal durations; the exact end is recomputed from decoded samples when
+        the pack audio is built.
+        """
+        by_call: dict[str, list[SegmentRecord]] = {}
+        for seg in segments:
+            by_call.setdefault(seg.call_id or seg.file_id or "", []).append(seg)
+        for call_segs in by_call.values():
+            call_segs.sort(key=lambda s: (float(getattr(s, "start_sec", 0.0) or 0.0), s.segment_id))
+            pack: list[tuple[SegmentRecord, float, float]] = []
+            cursor = 0.0
+            for seg in call_segs:
+                dur = max(0.0, float(getattr(seg, "duration_sec", 0.0) or 0.0))
+                if pack and cursor + dur > self.pack_window_sec:
+                    yield pack
+                    pack = []
+                    cursor = 0.0
+                pack.append((seg, cursor, cursor + dur))
+                cursor += dur + self.pack_gap_sec
+            if pack:
+                yield pack
+
+    def _transcribe_pack(self, model, np, pack, by_id: dict[str, ASRResult]) -> None:
+        sr = 16000
+        gap = np.zeros(int(self.pack_gap_sec * sr), dtype=np.float32)
+        parts: list[Any] = []
+        windows: list[tuple[SegmentRecord, float, float]] = []
+        for seg, _start, _end in pack:
+            samples = np.asarray(_load_mono_samples(Path(seg.segment_audio_path)), dtype=np.float32)
+            if samples.size == 0:
+                samples = np.zeros(int(0.1 * sr), dtype=np.float32)
+            start = sum(p.size for p in parts) / sr
+            parts.append(samples)
+            windows.append((seg, start, start + samples.size / sr))
+            if gap.size:
+                parts.append(gap)
+        audio = np.concatenate(parts) if parts else np.zeros(int(0.1 * sr), dtype=np.float32)
+
+        out, info = model.transcribe(
+            audio,
+            language=None,
+            beam_size=5,
+            batch_size=self._internal_batch_size,
+            vad_filter=True,
+            condition_on_previous_text=False,
+            without_timestamps=False,
+        )
+        lang = getattr(info, "language", None)
+        lang_prob = float(getattr(info, "language_probability", 0.0) or 0.0)
+        dur_after_vad = getattr(info, "duration_after_vad", None)
+
+        buckets: dict[str, list[tuple[float, str]]] = {seg.segment_id: [] for seg, _s, _e in pack}
+        for ws in out:
+            text = (getattr(ws, "text", "") or "").strip()
+            if not text:
+                continue
+            ws_start = float(getattr(ws, "start", 0.0) or 0.0)
+            ws_end = float(getattr(ws, "end", ws_start) or ws_start)
+            best_seg, best_ov = None, 0.0
+            for seg, w_start, w_end in windows:
+                ov = min(ws_end, w_end) - max(ws_start, w_start)
+                if ov > best_ov:
+                    best_ov, best_seg = ov, seg
+            if best_seg is None:
+                # Landed entirely in a silence gap: attach to the nearest segment.
+                mid = 0.5 * (ws_start + ws_end)
+                best_seg = min(windows, key=lambda w: abs(0.5 * (w[1] + w[2]) - mid))[0]
+            buckets[best_seg.segment_id].append((ws_start, text))
+
+        for seg, _s, _e in pack:
+            ordered = sorted(buckets.get(seg.segment_id, []), key=lambda x: x[0])
+            transcript = " ".join(t for _, t in ordered).strip()
+            by_id[seg.segment_id] = ASRResult(
+                seg.segment_id,
+                self.name,
+                transcript,
+                lang_prob,
+                lang,
+                lang_prob,
+                raw={"duration_after_vad": dur_after_vad},
+            )
+
+    def _transcribe_one(self, model, segment: SegmentRecord) -> ASRResult:
+        try:
+            out, info = model.transcribe(
+                str(segment.segment_audio_path),
+                language=None,
+                beam_size=5,
+                batch_size=self._internal_batch_size,
+                # The clip is already a tight VAD segment, so a second Silero pass
+                # is pure overhead and can clip leading/trailing phonemes (#1).
+                vad_filter=False,
+                condition_on_previous_text=False,
+                without_timestamps=True,
+            )
+            text = " ".join(x.text.strip() for x in out).strip()
+            language_probability = float(getattr(info, "language_probability", 0.0) or 0.0)
+            return ASRResult(
+                segment.segment_id,
+                self.name,
+                text,
+                language_probability,
+                getattr(info, "language", None),
+                language_probability,
+                raw={"duration_after_vad": getattr(info, "duration_after_vad", None)},
+            )
+        except Exception as exc:
+            return ASRResult(segment.segment_id, self.name, "", 0.0, error=repr(exc))
 
 
 class QwenAdapter(ASRAdapter):

@@ -884,6 +884,40 @@ asr_models:
     batch_audio_sec_budget: 160
 ```
 
+### Whisper segment packing & model choice
+
+Whisper does **not** use duration-budgeted batching like the other adapters.
+Instead it **packs consecutive same-call segments into ~28 s super-clips**
+(separated by 0.6 s of silence), runs one batched `transcribe` per pack, and maps
+the timestamped output back to each segment by time overlap. Two reasons:
+
+- **Better WER.** Whisper is trained on 30 s windows; feeding it isolated
+  sub-second VAD clips is out-of-distribution and produces worse, sometimes
+  hallucinated, text. Rebuilding near-call context restores quality.
+- **Faster.** One encode/decode per ~28 s pack instead of per tiny clip, and the
+  second per-clip Silero VAD pass is dropped (the clip is already a VAD segment).
+  `beam_size=5` is kept — the speedup comes from removing redundant work, not from
+  trading accuracy.
+
+Toggle for parity A/B: `AMC_WHISPER_BATCHED=0` restores the legacy
+one-transcribe-per-segment path (still without the redundant VAD pass).
+
+**Faster model (opt-in).** `large-v3-turbo` decodes ~5–6× faster than `large-v3`
+with WER within ~1% (the best-WER fast variant). Stage it and point Whisper at it,
+then A/B the WER before adopting:
+
+```bash
+bash ops/fetch_whisper_model.sh   # -> $MODEL_ROOT/whisper-large-v3-turbo
+```
+
+```yaml
+asr_models:
+  whisper:
+    path: /mnt/amc-data/pipeline/models/whisper-large-v3-turbo
+```
+
+`large-v3` stays the default; switch only if the turbo WER delta is acceptable.
+
 ### Quality gate before changing precision
 
 `dtype` and batch-size changes must not change transcripts. SDPA and dynamic
