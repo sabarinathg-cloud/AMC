@@ -276,6 +276,8 @@ class CohereAdapter(ASRAdapter):
         if self._model is None:
             _configure_quiet_transformers()
             import torch  # type: ignore
+
+            _ensure_torch_fp8_dtype_shim(torch)
             from transformers import AutoProcessor, CohereAsrForConditionalGeneration  # type: ignore
 
             _configure_torch_for_inference(torch)
@@ -655,6 +657,27 @@ def _configure_quiet_transformers() -> None:
         hf_logging.set_verbosity_error()
     except Exception:
         pass
+
+
+def _ensure_torch_fp8_dtype_shim(torch) -> None:
+    """Alias FP8/FP4 dtypes that transformers 5.x references at import but torch 2.5.1 lacks.
+
+    transformers >= 5.x imports ``torch.float8_e8m0fnu`` (and other Microscaling MX dtypes)
+    as module-level constants in ``integrations/finegrained_fp8.py``; that dtype was only
+    added in torch 2.7. The cohere venv pins torch 2.5.1 (cu121) to match the shared
+    cuDNN/NVIDIA stack, so importing ``CohereAsrForConditionalGeneration`` would raise
+    ``AttributeError: module 'torch' has no attribute 'float8_e8m0fnu'``.
+
+    The Cohere ASR model loads in bf16/float32 and never uses MXFP8, so aliasing the missing
+    dtype to an existing one lets the import succeed without affecting any real numerics. This
+    is a no-op on torch >= 2.7 (the attributes already exist).
+    """
+    for name in ("float8_e8m0fnu", "float8_e4m3fn", "float8_e5m2", "float4_e2m1fn_x2"):
+        if not hasattr(torch, name):
+            try:
+                setattr(torch, name, torch.float32)
+            except Exception:
+                pass
 
 
 def _configure_torch_for_inference(torch) -> None:

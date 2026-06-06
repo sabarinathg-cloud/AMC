@@ -156,6 +156,10 @@ PY
   log "verifying COHERE venv ($COHERE_VENV)"
   "$COHERE_VENV/bin/python" - <<'PY' || rc=1
 import torch, transformers
+# Mirror the runtime load path: alias FP8 MX dtypes that transformers 5.x references at
+# import but torch 2.5.1 lacks (added in torch 2.7). Harmless for the bf16/fp32 Cohere model.
+from amc_pipeline.transcription import _ensure_torch_fp8_dtype_shim
+_ensure_torch_fp8_dtype_shim(torch)
 from transformers import CohereAsrForConditionalGeneration  # noqa: F401  (the whole point)
 import amc_pipeline  # noqa: F401
 print("  COHERE ok: torch", torch.__version__, "cuda", torch.cuda.is_available(),
