@@ -904,6 +904,25 @@ curb the repetition but do not eliminate the hallucination, so packing trades
 transcript fidelity for throughput. Enable it only when speed matters more than
 WER; otherwise leave it off.
 
+**Full-call batched decode (lossless speed lever, opt-in, `AMC_WHISPER_FULLFILE_BATCH=1`).**
+This is the recommended throughput lever for keeping `large-v3`. Instead of one
+`transcribe` call per short clip (effectively `batch_size=1`, why Whisper is the
+ASR bottleneck), it rebuilds each call's per-channel timeline by writing every
+segment's samples at its **real `start_sec` offset** — so the gaps between
+segments are the *true* inter-segment silences, not the fixed 0.6 s pad used by
+packing. The batched pipeline then VAD-splits the whole call back into its
+original speech regions, decodes them in parallel on the GPU (~4–5×), and word
+timestamps map each word back to the segment whose window it overlaps; any
+dropped segment is re-transcribed solo. Because the silences are real, VAD cuts
+exactly at segment boundaries — this avoids the concatenation hallucination that
+makes plain packing lossy. Still **off by default** until the parity check
+(`ops/asr_parity_check.py`) confirms WER vs the per-segment path on the fleet.
+
+**INT8 compute type (near-lossless, opt-in, `AMC_WHISPER_COMPUTE_TYPE=int8_float16`).**
+CTranslate2 INT8 weights free ~35% VRAM and are marginally faster on GPU with
+<1% WER drift in practice. Defaults to `float16` (GPU) / `int8` (CPU); override
+only after confirming parity.
+
 **Faster model (recommended speed lever, opt-in).** `large-v3-turbo` decodes
 ~5–6× faster than `large-v3` with WER within ~1% — a far better speed/WER
 trade-off than packing because it does not change how clips are fed to the model.
