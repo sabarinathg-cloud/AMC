@@ -4,10 +4,31 @@ set -euo pipefail
 AWS_REGION="${AWS_REGION:-us-east-1}"
 PROJECT_TAG="${PROJECT_TAG:-amc-ec2-fleet}"
 REPO_DIR="${REPO_DIR:-/mnt/amc-data/AMC}"
-AMC_IN="${AMC_IN:?AMC_IN is required}"
-RUN_ROOT="${RUN_ROOT:?RUN_ROOT is required}"
+# SHARED_ROOT must be the cluster-wide shared mount. On this fleet that is the FSx for Lustre
+# mount at /mnt/amc-data; /mnt/amc-runs is a LOCAL directory on each instance and must NOT be
+# used for run state (only the submitting host would have the input, so every other worker
+# discovers an empty input and no-ops).
+SHARED_ROOT="${AMC_SHARED_ROOT:-/mnt/amc-data}"
+AMC_IN="${AMC_IN:?AMC_IN is required (must be on the shared mount, e.g. $SHARED_ROOT/amc-runs/<run>/input)}"
+RUN_ROOT="${RUN_ROOT:-$SHARED_ROOT/amc-runs/run-$(date -u +%Y%m%d-%H%M%S)}"
 PYTHON_BIN="${PYTHON_BIN:-python3.10}"
 STAGES="${STAGES:-preprocess asr_whisper asr_qwen asr_cohere asr_granite normalize consensus pii align mask_plan redact validate manifest}"
+
+# Guard: AMC_IN and RUN_ROOT MUST live on the shared mount, or non-shard-0 workers silently
+# get an empty input. Override only with eyes open via AMC_ALLOW_NONSHARED=1.
+assert_shared() {  # $1=label  $2=path
+  case "$2" in
+    "$SHARED_ROOT"/*) : ;;
+    *)
+      echo "ERROR: $1=$2 is not under the shared mount $SHARED_ROOT." >&2
+      echo "       /mnt/amc-runs is LOCAL per instance on this fleet -- workers would see an empty input." >&2
+      echo "       Use a path under $SHARED_ROOT (e.g. $SHARED_ROOT/amc-runs/...), or set AMC_ALLOW_NONSHARED=1 to override." >&2
+      [[ "${AMC_ALLOW_NONSHARED:-0}" == "1" ]] || exit 2
+      ;;
+  esac
+}
+assert_shared AMC_IN "$AMC_IN"
+assert_shared RUN_ROOT "$RUN_ROOT"
 
 IDS="$(aws ssm describe-instance-information \
   --region "$AWS_REGION" \

@@ -6,7 +6,7 @@ umask 0002
 REPO_DIR="${REPO_DIR:-/mnt/amc-data/AMC}"
 PYTHON_BIN="${PYTHON_BIN:-python3.10}"
 AMC_IN="${AMC_IN:-/mnt/amc-data}"
-RUN_ROOT="${RUN_ROOT:?RUN_ROOT is required, for example /mnt/amc-runs/2026-smoke-100}"
+RUN_ROOT="${RUN_ROOT:?RUN_ROOT is required, for example /mnt/amc-data/amc-runs/2026-smoke-100}"
 HASH_MODE="${HASH_MODE:-path}"
 NUM_SHARDS="${NUM_SHARDS:-}"
 STAGES="${STAGES:-preprocess asr_whisper asr_qwen asr_cohere asr_granite normalize consensus pii align mask_plan redact validate manifest}"
@@ -149,7 +149,7 @@ if [[ "$AUTO_PULL" == "1" ]]; then
   fi
 fi
 
-read -r RUN_FILE_COUNT RUN_SIGNATURE < <(
+read -r RUN_FILE_COUNT RUN_SIGNATURE RUN_TOTAL_COUNT < <(
   "$MAIN_PY" ops/input_signature.py \
     --input "$AMC_IN" \
     --output "$AMC_OUT" \
@@ -157,8 +157,31 @@ read -r RUN_FILE_COUNT RUN_SIGNATURE < <(
     --num-shards "$NUM_SHARDS" \
     --shard-index "$SHARD_INDEX"
 )
+# Sanitize: if input_signature errored, the fields are empty/garbage. Treat as zero so the
+# guards below catch it instead of crashing on a non-numeric arithmetic comparison.
+[[ "${RUN_FILE_COUNT:-}"  =~ ^[0-9]+$ ]] || RUN_FILE_COUNT=0
+[[ "${RUN_TOTAL_COUNT:-}" =~ ^[0-9]+$ ]] || RUN_TOTAL_COUNT=0
 
-write_status "input_signature" "ready" "files=$RUN_FILE_COUNT signature=$RUN_SIGNATURE"
+# Fail fast on a globally-empty input. If THIS host discovers zero audio files under AMC_IN,
+# the input is almost certainly missing or on a NON-shared path -- e.g. /mnt/amc-runs is LOCAL
+# per instance on this fleet, so only the host that created the subset would see it while every
+# other worker silently no-ops all 13 stages. Make that loud instead of invisible.
+if (( RUN_TOTAL_COUNT == 0 )); then
+  write_status "input_signature" "failed" "discovered 0 audio files under AMC_IN=$AMC_IN on host=$HOSTNAME_VALUE -- is AMC_IN on the shared Lustre mount (/mnt/amc-data)? (/mnt/amc-runs is local per instance)"
+  echo "FATAL: discovered 0 audio files under AMC_IN=$AMC_IN on host=$HOSTNAME_VALUE shard=$SHARD_INDEX/$NUM_SHARDS." >&2
+  echo "       AMC_IN must live on the shared Lustre mount (/mnt/amc-data). /mnt/amc-runs is LOCAL per instance." >&2
+  exit 3
+fi
+
+# A shard can legitimately draw zero files (e.g. 2 files across 4 shards). That is not an
+# error -- record it clearly and exit 0 instead of churning all stages as no-ops.
+if (( RUN_FILE_COUNT == 0 )); then
+  write_status "input_signature" "empty" "shard $SHARD_INDEX/$NUM_SHARDS drew 0 of $RUN_TOTAL_COUNT discovered files; nothing to do"
+  echo "[$(date -Is)] shard $SHARD_INDEX/$NUM_SHARDS has 0 of $RUN_TOTAL_COUNT files; exiting 0 (no work for this shard)"
+  exit 0
+fi
+
+write_status "input_signature" "ready" "files=$RUN_FILE_COUNT of total=$RUN_TOTAL_COUNT signature=$RUN_SIGNATURE"
 
 run_stage() {
   local key="$1"

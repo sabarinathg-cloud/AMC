@@ -459,7 +459,7 @@ reused.
 ```bash
 export AWS_REGION=us-east-1
 export PROJECT_TAG=amc-ec2-fleet
-export RUN_ROOT=/mnt/amc-runs/2026-review-full
+export RUN_ROOT=/mnt/amc-data/amc-runs/2026-review-full
 
 ONE_ID=$(aws ssm describe-instance-information \
   --region "$AWS_REGION" \
@@ -471,7 +471,7 @@ SETUP_ID=$(aws ssm send-command \
   --region "$AWS_REGION" \
   --instance-ids "$ONE_ID" \
   --document-name AWS-RunShellScript \
-  --parameters '{"commands":["cd /mnt/amc-data/AMC","git config --global --add safe.directory /mnt/amc-data/AMC || true","git pull --ff-only","python3.10 ops/create_call_subset.py --source-root /mnt/amc-data --year 2026 --output-root /mnt/amc-runs/2026-review-full/input --limit 100 --mode symlink --force"]}' \
+  --parameters '{"commands":["cd /mnt/amc-data/AMC","git config --global --add safe.directory /mnt/amc-data/AMC || true","git pull --ff-only","python3.10 ops/create_call_subset.py --source-root /mnt/amc-data --year 2026 --output-root /mnt/amc-data/amc-runs/2026-review-full/input --limit 100 --mode symlink --force"]}' \
   --query 'Command.CommandId' \
   --output text)
 
@@ -555,8 +555,8 @@ done
 Launch the 5-way smoke run:
 
 ```bash
-export AMC_IN=/mnt/amc-runs/2026-review-full/input
-export RUN_ROOT=/mnt/amc-runs/2026-review-full
+export AMC_IN=/mnt/amc-data/amc-runs/2026-review-full/input
+export RUN_ROOT=/mnt/amc-data/amc-runs/2026-review-full
 export STAGES="preprocess asr_whisper asr_qwen asr_cohere asr_granite normalize consensus pii align mask_plan redact validate manifest"
 
 CMD_ID=$(bash ops/ssm_submit_no_docker.sh)
@@ -566,15 +566,15 @@ echo "$CMD_ID"
 Monitor AWS command status and shard-level pipeline progress:
 
 ```bash
-export RUN_ROOT=/mnt/amc-runs/2026-review-full
+export RUN_ROOT=/mnt/amc-data/amc-runs/2026-review-full
 bash ops/ssm_status_no_docker.sh "$CMD_ID"
 ```
 
 Resume the same smoke run after any interruption:
 
 ```bash
-export AMC_IN=/mnt/amc-runs/2026-review-full/input
-export RUN_ROOT=/mnt/amc-runs/2026-review-full
+export AMC_IN=/mnt/amc-data/amc-runs/2026-review-full/input
+export RUN_ROOT=/mnt/amc-data/amc-runs/2026-review-full
 CMD_ID=$(bash ops/ssm_submit_no_docker.sh)
 echo "$CMD_ID"
 ```
@@ -582,13 +582,13 @@ echo "$CMD_ID"
 Completed stage markers live in:
 
 ```bash
-/mnt/amc-runs/2026-review-full/outputs/shard-*/.pii_pipeline/stage_markers/
+/mnt/amc-data/amc-runs/2026-review-full/outputs/shard-*/.pii_pipeline/stage_markers/
 ```
 
 Item-level state lives in:
 
 ```bash
-/mnt/amc-runs/2026-review-full/outputs/shard-*/.pii_pipeline/state/pipeline.sqlite3
+/mnt/amc-data/amc-runs/2026-review-full/outputs/shard-*/.pii_pipeline/state/pipeline.sqlite3
 ```
 
 After the 100-call review set passes, expand the same input folder to the full
@@ -599,7 +599,7 @@ item-level resume skips the already processed calls.
 ```bash
 export AWS_REGION=us-east-1
 export PROJECT_TAG=amc-ec2-fleet
-export RUN_ROOT=/mnt/amc-runs/2026-review-full
+export RUN_ROOT=/mnt/amc-data/amc-runs/2026-review-full
 
 ONE_ID=$(aws ssm describe-instance-information \
   --region "$AWS_REGION" \
@@ -611,7 +611,7 @@ SETUP_ID=$(aws ssm send-command \
   --region "$AWS_REGION" \
   --instance-ids "$ONE_ID" \
   --document-name AWS-RunShellScript \
-  --parameters '{"commands":["cd /mnt/amc-data/AMC","git config --global --add safe.directory /mnt/amc-data/AMC || true","git pull --ff-only","python3.10 ops/create_call_subset.py --source-root /mnt/amc-data --year 2026 --output-root /mnt/amc-runs/2026-review-full/input --limit 100000 --mode symlink --force"]}' \
+  --parameters '{"commands":["cd /mnt/amc-data/AMC","git config --global --add safe.directory /mnt/amc-data/AMC || true","git pull --ff-only","python3.10 ops/create_call_subset.py --source-root /mnt/amc-data --year 2026 --output-root /mnt/amc-data/amc-runs/2026-review-full/input --limit 100000 --mode symlink --force"]}' \
   --query 'Command.CommandId' \
   --output text)
 
@@ -621,8 +621,8 @@ echo "$SETUP_ID"
 Launch the full run:
 
 ```bash
-export AMC_IN=/mnt/amc-runs/2026-review-full/input
-export RUN_ROOT=/mnt/amc-runs/2026-review-full
+export AMC_IN=/mnt/amc-data/amc-runs/2026-review-full/input
+export RUN_ROOT=/mnt/amc-data/amc-runs/2026-review-full
 export STAGES="preprocess asr_whisper asr_qwen asr_cohere asr_granite normalize consensus pii align mask_plan redact validate manifest"
 
 CMD_ID=$(bash ops/ssm_submit_no_docker.sh)
@@ -662,15 +662,15 @@ therefore **claim-based**, not pinned to instance identity:
 ```bash
 export AWS_REGION=us-east-1
 export PROJECT_TAG=amc-ec2-fleet
-export AMC_IN=/mnt/amc-runs/2026-review-full/input
-export RUN_ROOT=/mnt/amc-runs/2026-review-full
+export AMC_IN=/mnt/amc-data/amc-runs/2026-review-full/input
+export RUN_ROOT=/mnt/amc-data/amc-runs/2026-review-full
 export NUM_SHARDS=5          # fixed data-partition count for this run
 # AUTO_PULL=1 makes the single setup instance refresh the shared repo checkout first.
 AUTO_PULL=1 bash ops/install_autoresume.sh
 ```
 
 This writes a durable run config to `$RUN_ROOT/run.env` plus the stable pointer
-`/mnt/amc-runs/active.env` (note: **no instance IDs** are stored — claiming is dynamic),
+`/mnt/amc-data/amc-runs/active.env` (note: **no instance IDs** are stored — claiming is dynamic),
 installs `ops/resume_shard.sh` to `/usr/local/bin/amc_resume_shard.sh` and the
 `amc-shard.service` unit on every online instance, and `systemctl enable --now`s it. The
 unit starts at boot after the network and the shared NFS mount are ready, and is restarted
@@ -717,7 +717,7 @@ Collect final masked audio after all shards complete:
 export FINAL_OUT=/mnt/amc-redacted-final/2026
 mkdir -p "$FINAL_OUT"
 
-for shard_dir in /mnt/amc-runs/2026-review-full/outputs/shard-*; do
+for shard_dir in /mnt/amc-data/amc-runs/2026-review-full/outputs/shard-*; do
   rsync -a \
     --exclude '/.pii_pipeline/' \
     --include '*/' \
