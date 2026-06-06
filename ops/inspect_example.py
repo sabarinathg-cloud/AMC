@@ -108,6 +108,30 @@ def _pick_segment(con: sqlite3.Connection, want_pii: bool) -> str | None:
     return row["segment_id"] if row else None
 
 
+def _pick_segments(con: sqlite3.Connection, want_pii: bool, count: int) -> list[str]:
+    """Up to ``count`` segment ids: PII-bearing first (if want_pii), then fill with others."""
+    picked: list[str] = []
+    seen: set[str] = set()
+    if want_pii:
+        for row in con.execute("select artifact_id, payload_json from artifacts where kind='pii'"):
+            payload = json.loads(row["payload_json"] or "{}")
+            if payload.get("spans"):
+                sid = payload.get("segment_id") or row["artifact_id"].split(":", 1)[-1]
+                if sid and sid not in seen:
+                    seen.add(sid)
+                    picked.append(sid)
+                    if len(picked) >= count:
+                        return picked
+    for row in con.execute("select distinct segment_id from model_results"):
+        sid = row["segment_id"]
+        if sid and sid not in seen:
+            seen.add(sid)
+            picked.append(sid)
+            if len(picked) >= count:
+                break
+    return picked
+
+
 def _find_db_for_segment(dbs: list[str], segment_id: str) -> str | None:
     for db in dbs:
         try:
@@ -160,6 +184,7 @@ def main() -> int:
     ap.add_argument("--out", help="shard output dir (<out>/.pii_pipeline/state/pipeline.sqlite3)")
     ap.add_argument("--run-root", help="run root to scan for shard DBs")
     ap.add_argument("--segment-id", help="inspect this exact segment id")
+    ap.add_argument("--count", type=int, default=1, help="inspect this many segments (default 1)")
     ap.add_argument("--any", action="store_true", help="don't require PII; just pick any segment")
     ap.add_argument("--dump-audio", metavar="DIR", help="cut original+redacted clips for the segment window into DIR (needs ffmpeg)")
     args = ap.parse_args()
@@ -174,16 +199,22 @@ def main() -> int:
         if not db:
             print(f"FATAL: segment {args.segment_id} not found in any candidate DB.", file=sys.stderr)
             return 3
-        segment_id = args.segment_id
-    else:
-        db = dbs[0]
-        con = _connect_ro(db)
-        segment_id = _pick_segment(con, want_pii=not args.any)
-        con.close()
-        if not segment_id:
-            print(f"FATAL: no segments in {db}", file=sys.stderr)
-            return 3
+        return _print_segment(db, args.segment_id, args)
 
+    db = dbs[0]
+    con = _connect_ro(db)
+    segment_ids = _pick_segments(con, want_pii=not args.any, count=max(1, args.count))
+    con.close()
+    if not segment_ids:
+        print(f"FATAL: no segments in {db}", file=sys.stderr)
+        return 3
+    rc = 0
+    for sid in segment_ids:
+        rc = _print_segment(db, sid, args) or rc
+    return rc
+
+
+def _print_segment(db: str, segment_id: str, args) -> int:
     con = _connect_ro(db)
     seg = _segment_payload(con, segment_id) or {}
     file_id = seg.get("file_id")
