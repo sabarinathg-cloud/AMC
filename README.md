@@ -884,27 +884,30 @@ asr_models:
     batch_audio_sec_budget: 160
 ```
 
-### Whisper segment packing & model choice
+### Whisper: per-segment default, packing opt-in, and model choice
 
-Whisper does **not** use duration-budgeted batching like the other adapters.
-Instead it **packs consecutive same-call segments into ~28 s super-clips**
-(separated by 0.6 s of silence), runs one batched `transcribe` per pack, and maps
-the timestamped output back to each segment by time overlap. Two reasons:
+By default Whisper transcribes **one clip per segment** with the redundant second
+Silero VAD pass disabled (#1 — each clip is already a tight VAD segment, so a
+second pass is pure overhead and can clip phonemes). This is the **WER-safe**
+path: the clip is exactly the segment, so Whisper transcribes it verbatim.
 
-- **Better WER.** Whisper is trained on 30 s windows; feeding it isolated
-  sub-second VAD clips is out-of-distribution and produces worse, sometimes
-  hallucinated, text. Rebuilding near-call context restores quality.
-- **Faster.** One encode/decode per ~28 s pack instead of per tiny clip, and the
-  second per-clip Silero VAD pass is dropped (the clip is already a VAD segment).
-  `beam_size=5` is kept — the speedup comes from removing redundant work, not from
-  trading accuracy.
+**Segment packing (opt-in, `AMC_WHISPER_BATCHED=1`).** Packing concatenates
+consecutive same-call segments into ~28 s super-clips (0.6 s silence gaps), runs
+one batched `transcribe` per pack with `vad_filter=True` (tuned `min_silence`
+below the gap so it re-splits into one VAD chunk per segment, each decoded
+independently), maps chunks back by time overlap, and re-transcribes any dropped
+segment solo. It is **~3× faster** but **not the default**: on very short
+backchannel clips Whisper hallucinates filler into the inter-segment
+silence/padding (verified: a "Hello"-only clip came back as
+`Hello okay okay okay great okay okay no`). `no_repeat_ngram_size`/`repetition_penalty`
+curb the repetition but do not eliminate the hallucination, so packing trades
+transcript fidelity for throughput. Enable it only when speed matters more than
+WER; otherwise leave it off.
 
-Toggle for parity A/B: `AMC_WHISPER_BATCHED=0` restores the legacy
-one-transcribe-per-segment path (still without the redundant VAD pass).
-
-**Faster model (opt-in).** `large-v3-turbo` decodes ~5–6× faster than `large-v3`
-with WER within ~1% (the best-WER fast variant). Stage it and point Whisper at it,
-then A/B the WER before adopting:
+**Faster model (recommended speed lever, opt-in).** `large-v3-turbo` decodes
+~5–6× faster than `large-v3` with WER within ~1% — a far better speed/WER
+trade-off than packing because it does not change how clips are fed to the model.
+Stage it and point Whisper at it, then A/B the WER before adopting:
 
 ```bash
 bash ops/fetch_whisper_model.sh   # -> $MODEL_ROOT/whisper-large-v3-turbo

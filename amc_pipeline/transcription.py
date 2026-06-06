@@ -91,9 +91,13 @@ class WhisperAdapter(ASRAdapter):
         self.device = device
         self.pack_window_sec = max(1.0, float(pack_window_sec))
         self.pack_gap_sec = max(0.0, float(pack_gap_sec))
-        # Segment packing (#5) is the default; AMC_WHISPER_BATCHED=0 restores the
-        # legacy one-transcribe-per-segment path for parity A/B comparisons.
-        self.batched = os.environ.get("AMC_WHISPER_BATCHED", "1") != "0"
+        # Per-segment is the DEFAULT because it is WER-safe: each clip is already a
+        # tight VAD segment, so Whisper transcribes it exactly. Segment packing (#5)
+        # is ~3x faster but, on very short backchannel clips, Whisper hallucinates
+        # filler into the inter-segment silence/padding ("Hello" -> "Hello okay okay
+        # ... no"), which fails our best-WER bar. Opt into packing with
+        # AMC_WHISPER_BATCHED=1 when throughput matters more than transcript fidelity.
+        self.batched = os.environ.get("AMC_WHISPER_BATCHED", "0") == "1"
         self._model = None
         self._internal_batch_size = 0
 
