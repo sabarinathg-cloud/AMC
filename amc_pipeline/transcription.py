@@ -213,6 +213,11 @@ class WhisperAdapter(ASRAdapter):
             },
             condition_on_previous_text=False,
             without_timestamps=False,
+            # Kill Whisper's decode-loop hallucinations ("okay. okay. okay...") that
+            # otherwise show up on short/ambiguous clips. Trigram block leaves real
+            # double-words intact; the mild penalty discourages longer runs.
+            no_repeat_ngram_size=3,
+            repetition_penalty=1.05,
         )
         lang = getattr(info, "language", None)
         lang_prob = float(getattr(info, "language_probability", 0.0) or 0.0)
@@ -265,6 +270,8 @@ class WhisperAdapter(ASRAdapter):
                 vad_filter=False,
                 condition_on_previous_text=False,
                 without_timestamps=True,
+                no_repeat_ngram_size=3,
+                repetition_penalty=1.05,
             )
             text = " ".join(x.text.strip() for x in out).strip()
             language_probability = float(getattr(info, "language_probability", 0.0) or 0.0)
