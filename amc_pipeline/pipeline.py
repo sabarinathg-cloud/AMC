@@ -19,7 +19,7 @@ from .manifests import write_segment_manifests
 from .masking import redact_wav_with_plan
 from .models import ASRResult, AudioFileRecord, MaskInterval, PIISpan, SegmentRecord, dataclass_to_dict
 from .normalization import normalize_transcript
-from .pii_detection import build_enabled_detectors, preflight_detectors
+from .pii_detection import build_enabled_detectors, is_maskable_entity, preflight_detectors
 from .preprocessing import preprocess_file
 from .progress import iter_progress
 from .resources import detect_resources
@@ -433,6 +433,11 @@ class Pipeline:
             for source_name, transcript, flat_idx in refs:
                 for det_idx, detector in enumerate(detectors):
                     for span in detector_spans[det_idx][flat_idx]:
+                        # Policy: skip non-identifying clinical entities (condition/medication/
+                        # lab result). Identifying PII -- incl. re-identifiable medical codes --
+                        # still masked. Override with AMC_MASK_MEDICAL_DETAILS=1.
+                        if not is_maskable_entity(span.entity_type):
+                            continue
                         mapped = _map_span_to_final(span, transcript, final_transcript)
                         if mapped is None:
                             continue

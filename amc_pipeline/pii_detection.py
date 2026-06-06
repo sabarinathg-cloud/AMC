@@ -85,9 +85,32 @@ class RegexPIIDetector(PIIDetector):
         return resolve_overlaps(spans)
 
 
+# Masking policy: only redact entities that can IDENTIFY a person. Clinical facts that
+# describe a condition/treatment but cannot, on their own, point back to an individual are
+# NOT masked -- bleeping them destroys analytic value without adding privacy. Identifying
+# medical entities (a doctor's name, an insurance id, a medical CODE that can be looked up to
+# re-identify the patient) are still masked. Set AMC_MASK_MEDICAL_DETAILS=1 to mask the
+# clinical detail too (restores the old behavior).
+NON_IDENTIFYING_ENTITY_TYPES = frozenset({
+    "MEDICAL_CONDITION",
+    "MEDICATION",
+    "LAB_RESULT",
+})
+
+
+def is_maskable_entity(entity_type: str | None) -> bool:
+    """False for clinical/non-identifying entity types we deliberately leave in the clear."""
+    if os.environ.get("AMC_MASK_MEDICAL_DETAILS", "0") == "1":
+        return True
+    return str(entity_type or "").upper() not in NON_IDENTIFYING_ENTITY_TYPES
+
+
 class GLiNERDetector(PIIDetector):
     name = "gliner"
 
+    # Non-identifying clinical labels (medical condition / lab result / medication) are
+    # intentionally omitted: per masking policy we don't redact facts that can't identify a
+    # person. We still detect "medical code" (re-identifiable) plus doctor/institution/ids.
     LABELS = [
         "person name",
         "phone number",
@@ -95,9 +118,6 @@ class GLiNERDetector(PIIDetector):
         "location",
         "date",
         "aadhaar number",
-        "medical condition",
-        "lab result",
-        "medication",
         "insurance id",
         "doctor name",
         "institution name",
