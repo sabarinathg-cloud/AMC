@@ -12,6 +12,15 @@ NUM_SHARDS="${NUM_SHARDS:-}"
 STAGES="${STAGES:-preprocess asr_whisper asr_qwen asr_cohere asr_granite normalize consensus pii align mask_plan redact validate manifest}"
 AUTO_PULL="${AUTO_PULL:-1}"
 
+# Optional fleet-wide ASR batch override, e.g. AMC_ASR_BATCH_SIZES="whisper=64,qwen=64,cohere=8,granite=8".
+# Passed as --asr-batch-sizes to every asr stage; only the model selected by --models is run, so
+# the same string is safe for all four. Use the values recommended by ops/asr_batch_sweep.py.
+# (${arr[@]+...} keeps this empty-safe under `set -u`.)
+ASR_BATCH_ARGS=()
+if [[ -n "${AMC_ASR_BATCH_SIZES:-}" ]]; then
+  ASR_BATCH_ARGS=(--asr-batch-sizes "$AMC_ASR_BATCH_SIZES")
+fi
+
 INSTANCE_ID="${INSTANCE_ID:-$(curl -fsS --max-time 2 http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || hostname)}"
 HOSTNAME_VALUE="$(hostname)"
 
@@ -253,21 +262,22 @@ for stage in $STAGES; do
       run_stage preprocess preprocess --vad-backend silero
       ;;
     asr_whisper)
-      run_stage asr_whisper asr --models whisper
+      run_stage asr_whisper asr --models whisper ${ASR_BATCH_ARGS[@]+"${ASR_BATCH_ARGS[@]}"}
       ;;
     asr_qwen)
       # Dynamic duration-budgeted batching (config defaults: count cap 8, ~240s budget).
-      # Override per run with --asr-batch-sizes qwen=N or via config asr_models.qwen.{batch_audio_sec_budget,max_batch_size}.
-      run_stage asr_qwen asr --models qwen
+      # Override per run with AMC_ASR_BATCH_SIZES (see top) / --asr-batch-sizes qwen=N, or via
+      # config asr_models.qwen.{batch_audio_sec_budget,max_batch_size}. Size it with ops/asr_batch_sweep.py.
+      run_stage asr_qwen asr --models qwen ${ASR_BATCH_ARGS[@]+"${ASR_BATCH_ARGS[@]}"}
       ;;
     asr_cohere)
       # Dynamic batching (config defaults: count cap 4, ~160s budget). float32 by default;
       # set asr_models.cohere.dtype: bfloat16 only after ops/asr_parity_check.py passes.
-      run_stage asr_cohere asr --models cohere
+      run_stage asr_cohere asr --models cohere ${ASR_BATCH_ARGS[@]+"${ASR_BATCH_ARGS[@]}"}
       ;;
     asr_granite)
       # Dynamic batching (config defaults: count cap 4, ~160s budget); bf16 + SDPA on CUDA.
-      run_stage asr_granite asr --models granite
+      run_stage asr_granite asr --models granite ${ASR_BATCH_ARGS[@]+"${ASR_BATCH_ARGS[@]}"}
       ;;
     normalize)
       run_stage normalize normalize
