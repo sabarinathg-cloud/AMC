@@ -67,7 +67,7 @@ def _load_config(args: argparse.Namespace) -> PipelineConfig:
     )
 
 
-def _load_segments(config: PipelineConfig, limit: int):
+def _load_segments(config: PipelineConfig, limit: int, sample: str = "short"):
     state = _build_state_store(config)
     segments = []
     for row in state.fetch_segments():
@@ -75,9 +75,24 @@ def _load_segments(config: PipelineConfig, limit: int):
         payload["status"] = row.get("status", payload.get("status", "preprocessed"))
         segments.append(_segment_from_payload(payload))
     segments.sort(key=lambda s: (s.duration_sec, s.segment_id))
-    if limit and limit > 0:
-        segments = segments[:limit]
-    return segments
+    if not limit or limit <= 0 or limit >= len(segments):
+        return segments
+    if sample == "short":
+        # The N shortest segments -- the WORST case for any model (all fixed
+        # overhead, most ambiguous backchannels). Good for stress, bad for a
+        # representative WER read.
+        return segments[:limit]
+    if sample == "spread":
+        # Evenly across the duration distribution -- representative for an
+        # adopt/don't-adopt decision.
+        step = len(segments) / float(limit)
+        return [segments[int(i * step)] for i in range(limit)]
+    if sample == "random":
+        import random
+
+        rng = random.Random(1234)  # fixed seed => reproducible
+        return sorted(rng.sample(segments, limit), key=lambda s: (s.duration_sec, s.segment_id))
+    raise ValueError(f"unknown sample mode: {sample}")
 
 
 def _run(adapter, segments) -> dict[str, str]:
@@ -149,6 +164,13 @@ def main() -> int:
     parser.add_argument("--output")
     parser.add_argument("--model", required=True, choices=sorted({*ADAPTERS, "whisper"}))
     parser.add_argument("--limit", type=int, default=50)
+    parser.add_argument(
+        "--sample",
+        choices=["short", "spread", "random"],
+        default="short",
+        help="which segments to sample: 'short'=N shortest (worst case), "
+        "'spread'=evenly across durations (representative), 'random'=seeded random.",
+    )
     parser.add_argument("--budget", type=float, default=None, help="audio-seconds budget for the dynamic run")
     parser.add_argument("--max-batch", type=int, default=None, help="count cap for the dynamic run")
     parser.add_argument("--check-bf16", action="store_true", help="Cohere only: also compare float32 vs bfloat16")
@@ -164,7 +186,7 @@ def main() -> int:
     if base is None or not base.path:
         print(f"model '{args.model}' is not configured with a path", file=sys.stderr)
         return 2
-    segments = _load_segments(config, args.limit)
+    segments = _load_segments(config, args.limit, args.sample)
     if not segments:
         print("no segments found in state; run the preprocess stage first", file=sys.stderr)
         return 2

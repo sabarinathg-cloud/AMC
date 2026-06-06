@@ -16,6 +16,10 @@
 # Compare large-v3 vs turbo (fetch turbo first via ops/fetch_whisper_model.sh):
 #   WHISPER_PATH=/mnt/amc-data/pipeline/models/whisper-large-v3-turbo \
 #     bash ops/run_whisper_parity.sh
+#
+# SAMPLE picks which segments: short (default, N shortest = worst case),
+# spread (evenly across durations = representative), random (seeded).
+#   SAMPLE=spread LIMIT=80 WHISPER_PATH=... bash ops/run_whisper_parity.sh
 if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi
 set -Eeuo pipefail
 
@@ -115,7 +119,7 @@ set +e
 LD_LIBRARY_PATH="$ld" PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}" \
   "$MAIN_PY" ops/asr_parity_check.py \
     --input "$AMC_IN" --output "$OUT" \
-    --model whisper --limit "$LIMIT" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} 2>&1 | tee -a "$LOG"
+    --model whisper --limit "$LIMIT" --sample "${SAMPLE:-short}" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} 2>&1 | tee -a "$LOG"
 rc=${PIPESTATUS[0]}
 set -e
 
