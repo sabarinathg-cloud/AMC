@@ -13,6 +13,9 @@ AMC_IN="${AMC_IN:?AMC_IN is required (must be on the shared mount, e.g. $SHARED_
 RUN_ROOT="${RUN_ROOT:-$SHARED_ROOT/amc-runs/run-$(date -u +%Y%m%d-%H%M%S)}"
 PYTHON_BIN="${PYTHON_BIN:-python3.10}"
 STAGES="${STAGES:-preprocess asr_whisper asr_qwen asr_cohere asr_granite normalize consensus pii align mask_plan redact validate manifest}"
+# Optional fleet-wide ASR batch override (from ops/asr_batch_sweep.py). Forwarded to every shard
+# as --asr-batch-sizes. Empty by default -> each model uses its config default.
+AMC_ASR_BATCH_SIZES="${AMC_ASR_BATCH_SIZES:-}"
 
 # Guard: AMC_IN and RUN_ROOT MUST live on the shared mount, or non-shard-0 workers silently
 # get an empty input. Override only with eyes open via AMC_ALLOW_NONSHARED=1.
@@ -43,9 +46,9 @@ fi
 
 NUM_SHARDS="${NUM_SHARDS:-$(wc -w <<< "$IDS" | tr -d ' ')}"
 
-PARAMS="$(python3 - "$IDS" "$NUM_SHARDS" "$REPO_DIR" "$AMC_IN" "$RUN_ROOT" "$PYTHON_BIN" "$STAGES" <<'PY'
+PARAMS="$(python3 - "$IDS" "$NUM_SHARDS" "$REPO_DIR" "$AMC_IN" "$RUN_ROOT" "$PYTHON_BIN" "$STAGES" "$AMC_ASR_BATCH_SIZES" <<'PY'
 import json, sys
-ids, num_shards, repo_dir, amc_in, run_root, python_bin, stages = sys.argv[1:]
+ids, num_shards, repo_dir, amc_in, run_root, python_bin, stages, asr_batch = sys.argv[1:]
 commands = [
     "set -e",
     f"export INSTANCE_IDS='{ids}'",
@@ -55,8 +58,10 @@ commands = [
     f"export RUN_ROOT='{run_root}'",
     f"export PYTHON_BIN='{python_bin}'",
     f"export STAGES='{stages}'",
-    "bash \"$REPO_DIR/ops/run_shard_no_docker.sh\"",
 ]
+if asr_batch:
+    commands.append(f"export AMC_ASR_BATCH_SIZES='{asr_batch}'")
+commands.append("bash \"$REPO_DIR/ops/run_shard_no_docker.sh\"")
 print(json.dumps({"commands": commands}))
 PY
 )"
