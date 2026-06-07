@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import math
+import os
 import threading
 from dataclasses import dataclass
 from typing import Any
@@ -111,6 +112,27 @@ def preflight_vad_backend(backend: str, silero_repo_or_dir: str = "snakers4/sile
         raise RuntimeError("Silero VAD requires torch")
 
 
+def _resolve_vad_device() -> str:
+    """Pick the Silero VAD device.
+
+    The VAD model is tiny but runs once per channel for every call; the ASR
+    GPU is otherwise idle during preprocess, so defaulting to CUDA when present
+    is a free, lossless win (identical model -> identical segmentation). Override
+    with AMC_VAD_DEVICE (e.g. "cpu" or "cuda:0").
+    """
+    override = os.environ.get("AMC_VAD_DEVICE", "").strip()
+    if override:
+        return override
+    try:
+        import torch  # type: ignore
+
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return "cpu"
+
+
 def silero_vad(
     samples: list[float],
     sample_rate: int,
@@ -121,8 +143,10 @@ def silero_vad(
     preflight_vad_backend("silero", repo_or_dir)
     import torch  # type: ignore
 
-    model, get_speech_timestamps = _get_thread_local_silero(repo_or_dir)
+    model, get_speech_timestamps, device = _get_thread_local_silero(repo_or_dir)
     wav = torch.tensor(samples, dtype=torch.float32)
+    if device != "cpu":
+        wav = wav.to(device)
     with torch.inference_mode():
         speech_ts = get_speech_timestamps(wav, model, sampling_rate=sample_rate)
     raw = [(float(item["start"] / sample_rate), float(item["end"] / sample_rate)) for item in speech_ts]
@@ -136,16 +160,26 @@ def _get_thread_local_silero(repo_or_dir: str):
     if not hasattr(_VAD_LOCAL, cache_key):
         import torch  # type: ignore
 
-        try:
-            torch.set_num_threads(1)
-            torch.set_num_interop_threads(1)
-        except Exception:
-            pass
+        device = _resolve_vad_device()
+        # CPU thread caps only matter for the CPU fallback; on GPU the kernels
+        # run on the device so we leave intra-op threading alone.
+        if device == "cpu":
+            try:
+                torch.set_num_threads(1)
+                torch.set_num_interop_threads(1)
+            except Exception:
+                pass
         with _VAD_LOAD_LOCK:
             model, utils = torch.hub.load(repo_or_dir=repo_or_dir, model="silero_vad", trust_repo=True)
         model.eval()
-        model.to("cpu")
-        setattr(_VAD_LOCAL, cache_key, (model, utils[0]))
+        try:
+            model.to(device)
+        except Exception:
+            # If the GPU placement fails for any reason, fall back to CPU rather
+            # than aborting the whole preprocess stage.
+            device = "cpu"
+            model.to("cpu")
+        setattr(_VAD_LOCAL, cache_key, (model, utils[0], device))
     return getattr(_VAD_LOCAL, cache_key)
 
 

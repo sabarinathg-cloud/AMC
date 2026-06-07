@@ -174,7 +174,12 @@ class PipelineConfig:
         if requested and int(requested) > 0:
             value = int(requested)
         else:
-            value = max(1, min(4, os.cpu_count() or 1))
+            # Preprocess is dominated by GPU Silero VAD + ffmpeg decode (a
+            # subprocess that releases the core), so we oversubscribe the vCPUs
+            # to keep the GPU fed and overlap decode with inference. Cap at 8 to
+            # avoid thrashing Lustre I/O. Override via preprocess_workers.
+            cpu = os.cpu_count() or 1
+            value = max(1, min(8, cpu * 2))
         if max_workers is not None:
             value = max(1, min(value, int(max_workers)))
         return value

@@ -884,6 +884,20 @@ asr_models:
     batch_audio_sec_budget: 160
 ```
 
+### Preprocess: GPU Silero VAD (default) and worker oversubscription
+
+Preprocess is dominated by the Silero VAD pass (run once per channel per call)
+plus ffmpeg decode. The ASR GPU is otherwise **idle** during this stage, so the
+VAD model now runs on **CUDA by default when available** — identical model, so
+segmentation (and downstream WER) is bit-for-bit unchanged; it just moves the
+work to idle hardware. Override with `AMC_VAD_DEVICE` (`cpu`, `cuda`, `cuda:0`).
+If GPU placement fails it silently falls back to CPU.
+
+Worker count (`preprocess_workers`, default auto) now defaults to `2× vCPU`
+(capped at 8) instead of `min(4, vCPU)`. ffmpeg decode is a subprocess that
+releases the core, so oversubscribing keeps the GPU fed and overlaps decode with
+inference. Redact stays hard-capped at 2 (memory safety); ASR is unaffected.
+
 ### Whisper: per-segment default, packing opt-in, and model choice
 
 By default Whisper transcribes **one clip per segment** with the redundant second
