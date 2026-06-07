@@ -898,6 +898,14 @@ Worker count (`preprocess_workers`, default auto) now defaults to `2× vCPU`
 releases the core, so oversubscribing keeps the GPU fed and overlaps decode with
 inference. ASR is unaffected (its own GPU batching governs throughput).
 
+The multi-worker path also persists **incrementally** via a bounded
+`as_completed` window: each file's ffprobe metadata probe, decode, and VAD all
+run **inside the worker** (the old loop ran `inspect_audio`/ffprobe per file on
+the main thread, capping the stage at ~1 file/s), and segments are written to the
+state DB as each file finishes rather than only after all files are submitted.
+This gives live `segments` progress, flat memory, and true resumability (a killed
+run keeps every completed file instead of losing the whole submit phase).
+
 ### Redact: RAM-aware concurrency
 
 Redaction decodes a whole call into RAM (float32 per channel) and re-encodes it,

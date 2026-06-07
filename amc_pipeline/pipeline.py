@@ -183,22 +183,60 @@ class Pipeline:
                     errors.append({"file_id": record.file_id, "source_path": str(record.source_path), "error": repr(exc)})
                     self.state.record_failure(f"{record.file_id}:preprocess", "file", record.file_id, repr(exc), retryable=True)
         else:
-            from concurrent.futures import ThreadPoolExecutor
+            from concurrent.futures import ThreadPoolExecutor, as_completed
 
-            futures = {}
+            # Do the full per-file cost -- ffprobe metadata + decode + GPU VAD --
+            # inside the worker so the main thread never serializes on ffprobe (the
+            # old submit loop did inspect_audio per file on the main thread, which
+            # capped the whole stage at ~1 file/s). The main thread only does the
+            # SQLite writes (single-writer) as results arrive. We keep a bounded
+            # in-flight window so results are persisted incrementally -- segments
+            # land in the DB as files finish (live progress + true resumability),
+            # not only after all ~8k tasks are submitted -- and memory stays flat.
+            def job(record: AudioFileRecord):
+                segments = preprocess_file(record, self.config)
+                return record, segments, file_payload(record)
+
+            max_inflight = max(workers * 2, workers + 2)
+            pending_iter = iter(pending)
+            inflight: dict[Any, AudioFileRecord] = {}
+            paused = False
+
+            def submit_next(pool) -> None:
+                nonlocal paused
+                if paused:
+                    return
+                record = next(pending_iter, None)
+                if record is None:
+                    return
+                inflight[pool.submit(job, record)] = record
+
             with ThreadPoolExecutor(max_workers=workers) as pool:
-                for record in pending:
-                    if self.state.should_pause(self.config.run_id):
-                        break
-                    self.state.upsert_file({"file_id": record.file_id, "source_path": str(record.source_path), "status": "preprocessing", "payload": file_payload(record)})
-                    futures[pool.submit(preprocess_file, record, self.config)] = record
-                for future in iter_progress(futures, desc="Preprocess audio", total=len(futures), unit="file", enabled=self.config.progress_enabled):
-                    record = futures[future]
+                for _ in range(max_inflight):
+                    submit_next(pool)
+                progress = iter_progress(
+                    range(len(pending)), desc="Preprocess audio", total=len(pending), unit="file", enabled=self.config.progress_enabled
+                )
+                progress_it = iter(progress)
+                while inflight:
+                    future = next(as_completed(list(inflight)))
+                    record = inflight.pop(future)
                     try:
-                        all_segments += persist(record, future.result())
+                        rec_done, segments, payload = future.result()
+                        for segment in segments:
+                            self.state.upsert_segment(segment.segment_id, rec_done.file_id, "preprocessed", dataclass_to_dict(segment))
+                        self.state.upsert_file({"file_id": rec_done.file_id, "source_path": str(rec_done.source_path), "status": "preprocessed", "payload": payload})
+                        all_segments += len(segments)
                     except Exception as exc:
                         errors.append({"file_id": record.file_id, "source_path": str(record.source_path), "error": repr(exc)})
                         self.state.record_failure(f"{record.file_id}:preprocess", "file", record.file_id, repr(exc), retryable=True)
+                    try:
+                        next(progress_it)
+                    except StopIteration:
+                        pass
+                    if not paused and self.state.should_pause(self.config.run_id):
+                        paused = True
+                    submit_next(pool)
         segment_count = self.state.count_segments()
         manifest_paths = (
             write_segment_manifests(
