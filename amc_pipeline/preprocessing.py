@@ -14,7 +14,11 @@ def preprocess_file(record: AudioFileRecord, config: PipelineConfig) -> list[Seg
     working_path = record.source_path
     decoded_path: Path | None = None
     if record.source_path.suffix.lower() != ".wav":
-        decoded_path = config.cache_dir / "preprocess" / record.file_id / "decoded.wav"
+        # The decoded WAV is purely transient (written -> read -> deleted here,
+        # never used downstream), so keep it on local scratch (AMC_TEMP_DIR) rather
+        # than the shared Lustre cache_dir. Decoding to Lustre wrote the whole file
+        # and read it back over the network per call -- the bulk of preprocess I/O.
+        decoded_path = config.temp_dir / "preprocess" / record.file_id / "decoded.wav"
         working_path = decode_to_wav(record.source_path, decoded_path, config.audio.target_sample_rate)
     try:
         return _segment_buffer(record, config, read_wav(working_path))
