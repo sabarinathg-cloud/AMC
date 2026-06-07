@@ -113,23 +113,19 @@ def preflight_vad_backend(backend: str, silero_repo_or_dir: str = "snakers4/sile
 
 
 def _resolve_vad_device() -> str:
-    """Pick the Silero VAD device.
+    """Pick the Silero VAD device. Defaults to CPU.
 
-    The VAD model is tiny but runs once per channel for every call; the ASR
-    GPU is otherwise idle during preprocess, so defaulting to CUDA when present
-    is a free, lossless win (identical model -> identical segmentation). Override
-    with AMC_VAD_DEVICE (e.g. "cpu" or "cuda:0").
+    Silero VAD scans audio in ~32 ms windows, i.e. thousands of tiny sequential
+    forward passes per call. On GPU each window is a separate micro-kernel whose
+    launch+sync overhead dominates, and with N preprocess workers sharing a
+    single device those VAD calls serialize. Profiling (ops/profile_preprocess.py)
+    showed CPU is faster even single-stream (RTFx ~17 vs ~12), and on CPU the
+    per-worker VAD parallelizes across vCPUs instead of bottlenecking on one GPU.
+    So CPU is the default; set AMC_VAD_DEVICE=cuda (or cuda:0) to force the GPU.
     """
     override = os.environ.get("AMC_VAD_DEVICE", "").strip()
     if override:
         return override
-    try:
-        import torch  # type: ignore
-
-        if torch.cuda.is_available():
-            return "cuda"
-    except Exception:
-        pass
     return "cpu"
 
 

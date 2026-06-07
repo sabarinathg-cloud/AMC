@@ -16,6 +16,9 @@ STAGES="${STAGES:-preprocess asr_whisper asr_qwen asr_cohere asr_granite normali
 # Optional fleet-wide ASR batch override (from ops/asr_batch_sweep.py). Forwarded to every shard
 # as --asr-batch-sizes. Empty by default -> each model uses its config default.
 AMC_ASR_BATCH_SIZES="${AMC_ASR_BATCH_SIZES:-}"
+# Optional VAD device override forwarded to every shard. Empty -> code default (CPU; see
+# amc_pipeline/segmentation._resolve_vad_device). Set to cuda/cuda:0 to force GPU VAD.
+AMC_VAD_DEVICE="${AMC_VAD_DEVICE:-}"
 
 # Guard: AMC_IN and RUN_ROOT MUST live on the shared mount, or non-shard-0 workers silently
 # get an empty input. Override only with eyes open via AMC_ALLOW_NONSHARED=1.
@@ -46,9 +49,9 @@ fi
 
 NUM_SHARDS="${NUM_SHARDS:-$(wc -w <<< "$IDS" | tr -d ' ')}"
 
-PARAMS="$(python3 - "$IDS" "$NUM_SHARDS" "$REPO_DIR" "$AMC_IN" "$RUN_ROOT" "$PYTHON_BIN" "$STAGES" "$AMC_ASR_BATCH_SIZES" <<'PY'
+PARAMS="$(python3 - "$IDS" "$NUM_SHARDS" "$REPO_DIR" "$AMC_IN" "$RUN_ROOT" "$PYTHON_BIN" "$STAGES" "$AMC_ASR_BATCH_SIZES" "$AMC_VAD_DEVICE" <<'PY'
 import json, sys
-ids, num_shards, repo_dir, amc_in, run_root, python_bin, stages, asr_batch = sys.argv[1:]
+ids, num_shards, repo_dir, amc_in, run_root, python_bin, stages, asr_batch, vad_device = sys.argv[1:]
 commands = [
     "set -e",
     f"export INSTANCE_IDS='{ids}'",
@@ -61,6 +64,8 @@ commands = [
 ]
 if asr_batch:
     commands.append(f"export AMC_ASR_BATCH_SIZES='{asr_batch}'")
+if vad_device:
+    commands.append(f"export AMC_VAD_DEVICE='{vad_device}'")
 # Detach the shard worker from the SSM command's lifetime. An SSM RunShellScript
 # invocation is bounded (max executionTimeout 48h) and SIGKILLs its whole process
 # group on timeout/completion -- which previously killed multi-day runs ~minutes in

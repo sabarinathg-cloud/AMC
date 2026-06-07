@@ -884,14 +884,19 @@ asr_models:
     batch_audio_sec_budget: 160
 ```
 
-### Preprocess: GPU Silero VAD (default) and worker oversubscription
+### Preprocess: CPU Silero VAD (default) and worker oversubscription
 
-Preprocess is dominated by the Silero VAD pass (run once per channel per call)
-plus ffmpeg decode. The ASR GPU is otherwise **idle** during this stage, so the
-VAD model now runs on **CUDA by default when available** — identical model, so
-segmentation (and downstream WER) is bit-for-bit unchanged; it just moves the
-work to idle hardware. Override with `AMC_VAD_DEVICE` (`cpu`, `cuda`, `cuda:0`).
-If GPU placement fails it silently falls back to CPU.
+Preprocess is dominated by the Silero VAD pass — profiling
+(`ops/profile_preprocess.py`) shows VAD is **~94% of per-file wall time**; ffmpeg
+decode/read/chunk/write are noise. VAD runs on **CPU by default**. Silero scans
+audio in ~32 ms windows (thousands of tiny sequential forward passes per call);
+on GPU each window is a separate micro-kernel whose launch+sync overhead
+dominates, and with N workers sharing one device those calls serialize. Measured
+single-stream: **CPU RTFx ~17 vs CUDA ~12**, and on CPU the per-worker VAD
+parallelizes across vCPUs instead of bottlenecking on the single GPU. Override
+with `AMC_VAD_DEVICE` (`cuda`, `cuda:0`) to force the GPU; if GPU placement fails
+it silently falls back to CPU. Segmentation is identical regardless of device, so
+downstream WER is unchanged.
 
 Worker count (`preprocess_workers`, default auto) now defaults to `2× vCPU`
 (capped at 8) instead of `min(4, vCPU)`. ffmpeg decode is a subprocess that
