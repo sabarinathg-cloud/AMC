@@ -166,6 +166,44 @@ class SQLiteStateStore:
                 (segment_id, file_id, status, json.dumps(payload, sort_keys=True, default=str), now),
             )
 
+    def upsert_segments_many(self, segments: list[tuple[str, str, str, dict[str, Any]]]) -> None:
+        """Upsert many segments in a SINGLE transaction.
+
+        persist() previously issued one autocommit transaction per segment
+        (~12-20 per file). On a Lustre-backed WAL DB that transaction/sync count
+        dominated preprocess wall-time. Wrapping a whole file's segments in one
+        BEGIN/COMMIT cuts it ~15x. ``segments`` is ``(segment_id, file_id, status, payload)``.
+        """
+        if not segments:
+            return
+        now = time.time()
+        rows = [
+            (str(sid), str(fid), str(st), json.dumps(pl, sort_keys=True, default=str), now)
+            for (sid, fid, st, pl) in segments
+        ]
+        with self._conn_ctx() as conn:
+            try:
+                conn.execute("begin")
+                conn.executemany(
+                    """
+                    insert into segments(segment_id, file_id, status, payload_json, updated_at)
+                    values (?, ?, ?, ?, ?)
+                    on conflict(segment_id) do update set
+                        file_id=excluded.file_id,
+                        status=excluded.status,
+                        payload_json=excluded.payload_json,
+                        updated_at=excluded.updated_at
+                    """,
+                    rows,
+                )
+                conn.execute("commit")
+            except Exception:
+                try:
+                    conn.execute("rollback")
+                except Exception:
+                    pass
+                raise
+
     def upsert_model_result(self, segment_id: str, model_name: str, status: str, payload: dict[str, Any]) -> None:
         now = time.time()
         with self._conn_ctx() as conn:
@@ -454,6 +492,29 @@ class PostgresStateStore:
 
     def upsert_segment(self, segment_id: str, file_id: str, status: str, payload: dict[str, Any]) -> None:
         self._upsert_payload("segments", "segment_id", segment_id, {"file_id": file_id, "status": status}, payload)
+
+    def upsert_segments_many(self, segments: list[tuple[str, str, str, dict[str, Any]]]) -> None:
+        if not segments:
+            return
+        now = time.time()
+        rows = [
+            (str(sid), str(fid), str(st), json.dumps(pl, sort_keys=True, default=str), now)
+            for (sid, fid, st, pl) in segments
+        ]
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(
+                    """
+                    insert into segments(segment_id, file_id, status, payload_json, updated_at)
+                    values (%s, %s, %s, %s::jsonb, %s)
+                    on conflict(segment_id) do update set
+                        file_id=excluded.file_id,
+                        status=excluded.status,
+                        payload_json=excluded.payload_json,
+                        updated_at=excluded.updated_at
+                    """,
+                    rows,
+                )
 
     def upsert_model_result(self, segment_id: str, model_name: str, status: str, payload: dict[str, Any]) -> None:
         now = time.time()

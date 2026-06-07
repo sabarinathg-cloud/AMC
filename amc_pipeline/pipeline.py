@@ -167,8 +167,9 @@ class Pipeline:
             return payload
 
         def persist(record: AudioFileRecord, segments) -> int:
-            for segment in segments:
-                self.state.upsert_segment(segment.segment_id, record.file_id, "preprocessed", dataclass_to_dict(segment))
+            self.state.upsert_segments_many(
+                [(segment.segment_id, record.file_id, "preprocessed", dataclass_to_dict(segment)) for segment in segments]
+            )
             self.state.upsert_file({"file_id": record.file_id, "source_path": str(record.source_path), "status": "preprocessed", "payload": file_payload(record)})
             return len(segments)
 
@@ -223,8 +224,9 @@ class Pipeline:
                     record = inflight.pop(future)
                     try:
                         rec_done, segments, payload = future.result()
-                        for segment in segments:
-                            self.state.upsert_segment(segment.segment_id, rec_done.file_id, "preprocessed", dataclass_to_dict(segment))
+                        self.state.upsert_segments_many(
+                            [(segment.segment_id, rec_done.file_id, "preprocessed", dataclass_to_dict(segment)) for segment in segments]
+                        )
                         self.state.upsert_file({"file_id": rec_done.file_id, "source_path": str(rec_done.source_path), "status": "preprocessed", "payload": payload})
                         all_segments += len(segments)
                     except Exception as exc:
