@@ -653,10 +653,10 @@ class Pipeline:
             intervals = [MaskInterval(**{k: v for k, v in raw.items() if k in {"channel", "start_sec", "end_sec", "reason", "entity_type", "confidence", "source"}}) for raw in artifact["payload"].get("intervals", [])]
             pending.append((file_id, record, intervals))
 
-        # Redaction decodes whole calls into RAM; cap concurrency so long
-        # stereo calls cannot exhaust the 16 GB box (OOM-kill). Honors an
-        # explicit redact_workers but never lets it exceed the safe ceiling.
-        workers = self.config.resolved_workers(self.config.redact_workers, max_workers=2)
+        # Redaction decodes whole calls into RAM; concurrency is gated by memory,
+        # not CPU. resolved_redact_workers() scales by MemAvailable / per-call peak
+        # so big-RAM boxes use their headroom while 16 GB boxes stay OOM-safe.
+        workers = self.config.resolved_redact_workers()
 
         def persist(file_id: str, record: AudioFileRecord, final_path: Path, status: str, fallback_error: str | None, result: Any) -> None:
             out_path = self.config.output_root / record.relative_path

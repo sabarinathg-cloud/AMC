@@ -896,7 +896,18 @@ If GPU placement fails it silently falls back to CPU.
 Worker count (`preprocess_workers`, default auto) now defaults to `2× vCPU`
 (capped at 8) instead of `min(4, vCPU)`. ffmpeg decode is a subprocess that
 releases the core, so oversubscribing keeps the GPU fed and overlaps decode with
-inference. Redact stays hard-capped at 2 (memory safety); ASR is unaffected.
+inference. ASR is unaffected (its own GPU batching governs throughput).
+
+### Redact: RAM-aware concurrency
+
+Redaction decodes a whole call into RAM (float32 per channel) and re-encodes it,
+so its concurrency is bounded by **memory, not CPU**. Instead of a flat cap of 2,
+it now scales by `MemAvailable / per-call-peak` so big-RAM boxes use their
+headroom while 16 GB boxes stay OOM-safe (a 16 GB / 4-vCPU box auto-picks ~5).
+Tunables: `AMC_REDACT_MEM_PER_CALL_GB` (default 2.0, conservative worst-case long
+stereo call), `AMC_REDACT_MEM_RESERVE_GB` (default 2.0), `AMC_REDACT_MAX_WORKERS`
+(default 8), and `AMC_REDACT_FORCE=1` to let an explicit `redact_workers` bypass
+the RAM clamp. The auto ceiling is also capped at `2× vCPU`.
 
 ### Whisper: per-segment default, packing opt-in, and model choice
 

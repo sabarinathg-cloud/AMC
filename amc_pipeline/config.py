@@ -184,6 +184,61 @@ class PipelineConfig:
             value = max(1, min(value, int(max_workers)))
         return value
 
+    @staticmethod
+    def available_memory_gb() -> float | None:
+        """Best-effort 'usable right now' RAM in GB, or None if undetectable."""
+        try:  # Linux: MemAvailable accounts for reclaimable cache, the right figure.
+            with open("/proc/meminfo", encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith("MemAvailable:"):
+                        return float(line.split()[1]) / (1024.0 * 1024.0)
+        except Exception:
+            pass
+        try:
+            page = os.sysconf("SC_PAGE_SIZE")
+            avail = os.sysconf("SC_AVPHYS_PAGES")
+            return (page * avail) / (1024.0 ** 3)
+        except Exception:
+            return None
+
+    def resolved_redact_workers(self) -> int:
+        """Memory-bounded redact concurrency.
+
+        Redaction decodes a whole call into RAM (float32 per channel) and
+        re-encodes it, so concurrency is gated by memory, not CPU. We scale by
+        ``MemAvailable / per-call-peak`` so a big-RAM box uses its headroom while
+        a 16 GB box stays OOM-safe -- instead of a flat cap of 2. Tunables:
+          AMC_REDACT_MEM_PER_CALL_GB  conservative per-call peak (default 2.0)
+          AMC_REDACT_MEM_RESERVE_GB   RAM left for the OS/others (default 2.0)
+          AMC_REDACT_MAX_WORKERS      absolute ceiling (default 8; I/O-bound past this)
+          AMC_REDACT_FORCE=1          let an explicit redact_workers bypass the RAM clamp
+        """
+        def _envf(name: str, default: float) -> float:
+            try:
+                return float(os.environ.get(name, "") or default)
+            except Exception:
+                return default
+
+        per_call_gb = max(0.25, _envf("AMC_REDACT_MEM_PER_CALL_GB", 2.0))
+        reserve_gb = max(0.0, _envf("AMC_REDACT_MEM_RESERVE_GB", 2.0))
+        hard_cap = max(1, int(_envf("AMC_REDACT_MAX_WORKERS", 8)))
+        cpu = os.cpu_count() or 1
+
+        avail = self.available_memory_gb()
+        if avail is None:
+            ceiling = 2  # unknown memory -> previous safe default
+        else:
+            usable = max(0.0, avail - reserve_gb)
+            ceiling = max(1, int(usable / per_call_gb))
+        ceiling = min(ceiling, hard_cap, cpu * 2)
+
+        requested = int(self.redact_workers) if self.redact_workers else 0
+        if requested > 0:
+            if os.environ.get("AMC_REDACT_FORCE", "0") == "1":
+                return requested
+            return max(1, min(requested, ceiling))
+        return max(1, ceiling)
+
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["input_root"] = str(self.input_root) if self.input_root else None
