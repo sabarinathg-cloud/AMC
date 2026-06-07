@@ -61,7 +61,21 @@ commands = [
 ]
 if asr_batch:
     commands.append(f"export AMC_ASR_BATCH_SIZES='{asr_batch}'")
-commands.append("bash \"$REPO_DIR/ops/run_shard_no_docker.sh\"")
+# Detach the shard worker from the SSM command's lifetime. An SSM RunShellScript
+# invocation is bounded (max executionTimeout 48h) and SIGKILLs its whole process
+# group on timeout/completion -- which previously killed multi-day runs ~minutes in
+# (ResponseCode 137). setsid+nohup move the worker into its own session so it keeps
+# running after this command returns; we just kick it off and exit immediately. The
+# worker's own logs live under $RUN_ROOT/logs/shard-*; this launch log captures any
+# startup error before the worker takes over logging.
+commands.append("mkdir -p \"$RUN_ROOT/logs\"")
+commands.append(
+    "setsid nohup bash \"$REPO_DIR/ops/run_shard_no_docker.sh\" "
+    "> \"$RUN_ROOT/logs/launch-$(hostname -s).log\" 2>&1 < /dev/null & "
+    "echo \"detached run_shard pid=$! host=$(hostname -s)\""
+)
+# Give the worker a moment to fork/exec so a launch crash surfaces in this invocation.
+commands.append("sleep 3; echo launch-dispatched")
 print(json.dumps({"commands": commands}))
 PY
 )"
