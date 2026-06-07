@@ -29,6 +29,54 @@ from .transcription import build_enabled_adapters
 from .validation import validate_audio_pair
 
 
+def _chunk_segments_by_call(segments: list[SegmentRecord], target: int):
+    """Yield lists of segments grouped so whole calls stay together.
+
+    Segments are bucketed by call (falling back to file, then segment id),
+    preserving first-seen order, then whole calls are accumulated into a chunk
+    until it reaches ``target`` segments. Keeping calls intact means Whisper's
+    full-call batched path still receives complete calls, while the ASR stage
+    can persist/resume at chunk granularity. A single call larger than
+    ``target`` is emitted as its own chunk rather than being split.
+    """
+    buckets: dict[str, list[SegmentRecord]] = {}
+    order: list[str] = []
+    for s in segments:
+        key = getattr(s, "call_id", None) or getattr(s, "file_id", None) or s.segment_id
+        if key not in buckets:
+            buckets[key] = []
+            order.append(key)
+        buckets[key].append(s)
+    chunk: list[SegmentRecord] = []
+    for key in order:
+        chunk.extend(buckets[key])
+        if len(chunk) >= target:
+            yield chunk
+            chunk = []
+    if chunk:
+        yield chunk
+
+
+def _failed_results(model_name: str, segments: list[SegmentRecord]) -> list[ASRResult]:
+    """Build placeholder error results so a failed chunk persists as ``failed``.
+
+    These rows are written with status ``failed`` and are therefore retried on
+    the next run (the resume filter only keeps ``transcribed`` rows)."""
+    return [
+        ASRResult(
+            segment_id=s.segment_id,
+            model_name=model_name,
+            transcript="",
+            confidence=0.0,
+            language=s.language,
+            language_confidence=s.language_confidence,
+            error="model_stage_failure",
+            raw={"model_stage_failure": True},
+        )
+        for s in segments
+    ]
+
+
 class Pipeline:
     def __init__(self, config: PipelineConfig):
         self.config = config
@@ -281,6 +329,35 @@ class Pipeline:
         adapters = sorted(adapters, key=lambda a: 0 if a.name == "whisper" else 1)
         for adapter in adapters:
             adapter.progress_enabled = self.config.progress_enabled
+        # Persist transcripts in call-grouped chunks instead of one bulk write at
+        # the end of the whole pass. This makes the ASR stage:
+        #   * resumable mid-pass -- a crash/interruption N hours in keeps every
+        #     chunk already written (the start-of-stage `existing_results` filter
+        #     skips them on restart), instead of redoing the entire model; and
+        #   * observable live -- `model_results` climbs as chunks land, like the
+        #     preprocess `segments` count.
+        # Chunks respect call boundaries so Whisper's full-call batched path still
+        # sees whole calls. Tune the chunk size with AMC_ASR_PERSIST_CHUNK.
+        chunk_target = max(1, int(os.environ.get("AMC_ASR_PERSIST_CHUNK", "256") or "256"))
+
+        def _persist_chunk(model_name: str, results: list[ASRResult]) -> None:
+            seg_rows: list[tuple[str, str, str, dict[str, Any]]] = []
+            model_rows: list[tuple[str, str, str, dict[str, Any]]] = []
+            for result in results:
+                if model_name == "whisper":
+                    language_by_segment[result.segment_id] = result.language
+                    language_confidence_by_segment[result.segment_id] = result.language_confidence
+                    segment = segment_by_id.get(result.segment_id)
+                    if segment is not None:
+                        payload = dataclass_to_dict(replace(segment, language=result.language, language_confidence=result.language_confidence))
+                        seg_rows.append((segment.segment_id, segment.file_id, segment.status, payload))
+                model_rows.append(
+                    (result.segment_id, result.model_name, "failed" if result.error else "transcribed", dataclass_to_dict(result))
+                )
+            if seg_rows:
+                self.state.upsert_segments_many(seg_rows)
+            self.state.upsert_model_results_many(model_rows)
+
         for adapter in iter_progress(adapters, desc="ASR models", total=len(adapters), unit="model", enabled=self.config.progress_enabled):
             try:
                 model_segments = segments
@@ -301,34 +378,30 @@ class Pipeline:
                     continue
                 try:
                     adapter.preflight()
-                    results = adapter.transcribe_batch(model_segments)
+                    preflight_ok = True
                 except Exception as exc:
                     tb = traceback.format_exc()
                     failed_models.append({"model": adapter.name, "error": repr(exc), "segments": len(model_segments)})
                     self.state.record_failure(f"asr:{adapter.name}", "model", adapter.name, repr(exc), retryable=True, traceback=tb)
-                    results = [
-                        ASRResult(
-                            segment_id=s.segment_id,
-                            model_name=adapter.name,
-                            transcript="",
-                            confidence=0.0,
-                            language=s.language,
-                            language_confidence=s.language_confidence,
-                            error=repr(exc),
-                            raw={"model_stage_failure": True},
-                        )
-                        for s in model_segments
-                    ]
-                counts[adapter.name] = len(results)
-                for result in results:
-                    if adapter.name == "whisper":
-                        language_by_segment[result.segment_id] = result.language
-                        language_confidence_by_segment[result.segment_id] = result.language_confidence
-                        segment = segment_by_id.get(result.segment_id)
-                        if segment is not None:
-                            payload = dataclass_to_dict(replace(segment, language=result.language, language_confidence=result.language_confidence))
-                            self.state.upsert_segment(segment.segment_id, segment.file_id, segment.status, payload)
-                    self.state.upsert_model_result(result.segment_id, result.model_name, "failed" if result.error else "transcribed", dataclass_to_dict(result))
+                    preflight_ok = False
+
+                produced = 0
+                for chunk in _chunk_segments_by_call(model_segments, chunk_target):
+                    if preflight_ok:
+                        try:
+                            results = adapter.transcribe_batch(chunk)
+                        except Exception as exc:
+                            tb = traceback.format_exc()
+                            failed_models.append({"model": adapter.name, "error": repr(exc), "segments": len(chunk)})
+                            self.state.record_failure(f"asr:{adapter.name}:chunk", "model", adapter.name, repr(exc), retryable=True, traceback=tb)
+                            results = _failed_results(adapter.name, chunk)
+                    else:
+                        results = _failed_results(adapter.name, chunk)
+                    # Persist this chunk before starting the next one: on restart the
+                    # start-of-stage existing_results filter skips these segments.
+                    _persist_chunk(adapter.name, results)
+                    produced += len(results)
+                counts[adapter.name] = produced
             finally:
                 close = getattr(adapter, "close", None)
                 if callable(close):

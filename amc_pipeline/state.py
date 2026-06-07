@@ -219,6 +219,43 @@ class SQLiteStateStore:
                 (segment_id, model_name, status, json.dumps(payload, sort_keys=True, default=str), now),
             )
 
+    def upsert_model_results_many(self, results: list[tuple[str, str, str, dict[str, Any]]]) -> None:
+        """Upsert many model results in a SINGLE transaction.
+
+        Mirrors upsert_segments_many: lets the ASR stage persist a chunk of
+        transcripts at once (live progress + mid-stage resumability) without one
+        autocommit transaction per segment on the Lustre-backed WAL DB.
+        ``results`` is ``(segment_id, model_name, status, payload)``.
+        """
+        if not results:
+            return
+        now = time.time()
+        rows = [
+            (str(sid), str(model), str(st), json.dumps(pl, sort_keys=True, default=str), now)
+            for (sid, model, st, pl) in results
+        ]
+        with self._conn_ctx() as conn:
+            try:
+                conn.execute("begin")
+                conn.executemany(
+                    """
+                    insert into model_results(segment_id, model_name, status, payload_json, updated_at)
+                    values (?, ?, ?, ?, ?)
+                    on conflict(segment_id, model_name) do update set
+                        status=excluded.status,
+                        payload_json=excluded.payload_json,
+                        updated_at=excluded.updated_at
+                    """,
+                    rows,
+                )
+                conn.execute("commit")
+            except Exception:
+                try:
+                    conn.execute("rollback")
+                except Exception:
+                    pass
+                raise
+
     def record_artifact(self, artifact_id: str, kind: str, path: Path, status: str, payload: dict[str, Any] | None = None) -> None:
         now = time.time()
         with self._conn_ctx() as conn:
@@ -530,6 +567,28 @@ class PostgresStateStore:
                         updated_at=excluded.updated_at
                     """,
                     (segment_id, model_name, status, json.dumps(payload, sort_keys=True, default=str), now),
+                )
+
+    def upsert_model_results_many(self, results: list[tuple[str, str, str, dict[str, Any]]]) -> None:
+        if not results:
+            return
+        now = time.time()
+        rows = [
+            (str(sid), str(model), str(st), json.dumps(pl, sort_keys=True, default=str), now)
+            for (sid, model, st, pl) in results
+        ]
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(
+                    """
+                    insert into model_results(segment_id, model_name, status, payload_json, updated_at)
+                    values (%s, %s, %s, %s::jsonb, %s)
+                    on conflict(segment_id, model_name) do update set
+                        status=excluded.status,
+                        payload_json=excluded.payload_json,
+                        updated_at=excluded.updated_at
+                    """,
+                    rows,
                 )
 
     def record_artifact(self, artifact_id: str, kind: str, path: Path, status: str, payload: dict[str, Any] | None = None) -> None:
