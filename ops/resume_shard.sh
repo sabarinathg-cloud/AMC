@@ -38,12 +38,17 @@ log() { echo "[$(date -Is)] resume_shard: $*"; }
 now_epoch() { date +%s; }
 
 # ---- wait for shared storage + run config -------------------------------------------
+# If the config is not visible yet (NFS still attaching, or the run not installed yet) we
+# exit NON-ZERO so the systemd unit's Restart=on-failure relaunches us and we try again.
+# Exiting 0 here would be read by systemd as a clean completion and the box would stay
+# DEAD forever -- the exact failure mode that stranded spot-replacement boxes that were
+# briefly pointed at the wrong path. Self-heal > silent give-up.
 tries=0
 while [[ ! -f "$RUN_ENV" ]]; do
   tries=$((tries + 1))
   if (( tries > CONFIG_WAIT_TRIES )); then
-    log "no run config at $RUN_ENV after $((CONFIG_WAIT_TRIES * 5))s; nothing to resume"
-    exit 0
+    log "no run config at $RUN_ENV after $((CONFIG_WAIT_TRIES * 5))s; will retry (systemd restart)"
+    exit 1
   fi
   sleep 5
 done
