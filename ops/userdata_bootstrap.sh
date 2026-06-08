@@ -11,12 +11,15 @@
 #
 # Assumptions:
 #   - The shared NFS is (or will be) mounted and contains REPO_DIR below.
-#   - ops/install_autoresume.sh has already written /mnt/amc-runs/active.env once
-#     (the durable run config). Until that exists, the service simply idles and rechecks.
+#   - ops/install_autoresume.sh has already written the durable run config once to the
+#     SHARED stable pointer /mnt/amc-data/amc-runs/active.env. Until that exists, the
+#     service simply idles and rechecks.
 set -uo pipefail
 
 REPO_DIR="${REPO_DIR:-/mnt/amc-data/AMC}"
-AMC_RUN_ENV="${AMC_RUN_ENV:-/mnt/amc-runs/active.env}"
+# Stable pointer on SHARED storage (NOT box-local) so a fresh instance that does not know
+# RUN_ROOT can still find the run config. Must match the default in resume_shard.sh.
+AMC_RUN_ENV="${AMC_RUN_ENV:-/mnt/amc-data/amc-runs/active.env}"
 
 log() { echo "[$(date -Is)] amc-bootstrap: $*"; }
 
@@ -34,7 +37,7 @@ install -m 0755 "$REPO_DIR/ops/resume_shard.sh" /usr/local/bin/amc_resume_shard.
 install -m 0644 "$REPO_DIR/ops/amc-shard.service" /etc/systemd/system/amc-shard.service
 
 # Pass a non-default run-config location through to the service, if set.
-if [[ "$AMC_RUN_ENV" != "/mnt/amc-runs/active.env" ]]; then
+if [[ "$AMC_RUN_ENV" != "/mnt/amc-data/amc-runs/active.env" ]]; then
   mkdir -p /etc/systemd/system/amc-shard.service.d
   cat > /etc/systemd/system/amc-shard.service.d/override.conf <<EOF
 [Service]

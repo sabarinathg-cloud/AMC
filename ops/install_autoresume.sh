@@ -4,8 +4,8 @@
 # What it does:
 #   1. Builds a durable run config (run.env) from the env vars below.
 #   2. On ONE instance: updates the shared repo checkout and writes the run config to
-#      $RUN_ROOT/run.env and the stable pointer $AMC_RUN_ENV (default
-#      /mnt/amc-runs/active.env). (Single writer avoids the NFS ref/race problems.)
+#      $RUN_ROOT/run.env and the stable pointer $AMC_RUN_ENV (default, on SHARED storage,
+#      /mnt/amc-data/amc-runs/active.env). (Single writer avoids the NFS ref/race problems.)
 #   3. On ALL online instances: installs ops/resume_shard.sh to /usr/local/bin and the
 #      systemd unit, then `systemctl enable --now amc-shard.service`.
 #
@@ -27,7 +27,12 @@ AMC_IN="${AMC_IN:?AMC_IN is required (input root the pipeline discovers)}"
 RUN_ROOT="${RUN_ROOT:?RUN_ROOT is required, e.g. /mnt/amc-data/amc-runs/2026-smoke20}"
 STAGES="${STAGES:-preprocess asr_whisper asr_qwen asr_cohere asr_granite normalize consensus pii align mask_plan redact validate manifest}"
 AUTO_PULL="${AUTO_PULL:-0}"
-AMC_RUN_ENV="${AMC_RUN_ENV:-/mnt/amc-runs/active.env}"
+# The run config MUST live on SHARED storage so every instance -- including a spot
+# replacement with a brand-new ID that does not know RUN_ROOT -- reads the same file.
+# This stable pointer lives under the shared runs dir (/mnt/amc-data/...), NOT a box-local
+# path like /mnt/amc-runs/active.env. The old local default existed only on the single
+# writer instance and left every other box waiting forever for a config it could not see.
+AMC_RUN_ENV="${AMC_RUN_ENV:-/mnt/amc-data/amc-runs/active.env}"
 
 IDS="$(aws ssm describe-instance-information \
   --region "$AWS_REGION" \
@@ -182,13 +187,17 @@ aws ssm get-command-invocation --region "$AWS_REGION" --command-id "$CMD_A" \
   --instance-id "$FIRST_ID" --query 'StandardOutputContent' --output text || true
 
 # ---- Step B: install wrapper + unit and enable service on ALL online instances ----
-PARAMS_B="$(python3 - "$REPO_DIR" <<'PY'
+# A drop-in pins AMC_RUN_ENV to the shared config path so resume_shard.sh does NOT fall
+# back to its box-local default; every instance (incl. spot-replacements) reads one file.
+PARAMS_B="$(python3 - "$REPO_DIR" "$AMC_RUN_ENV" <<'PY'
 import json, sys
-repo_dir = sys.argv[1]
+repo_dir, run_env = sys.argv[1], sys.argv[2]
 cmds = [
     "set -e",
     f"install -m 0755 '{repo_dir}/ops/resume_shard.sh' /usr/local/bin/amc_resume_shard.sh",
     f"install -m 0644 '{repo_dir}/ops/amc-shard.service' /etc/systemd/system/amc-shard.service",
+    "mkdir -p /etc/systemd/system/amc-shard.service.d",
+    f"printf '[Service]\\nEnvironment=AMC_RUN_ENV={run_env}\\n' > /etc/systemd/system/amc-shard.service.d/runenv.conf",
     "systemctl daemon-reload",
     "systemctl enable --now amc-shard.service",
     "systemctl --no-pager --full status amc-shard.service | head -n 15 || true",

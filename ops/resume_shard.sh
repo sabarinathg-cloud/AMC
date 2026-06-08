@@ -20,11 +20,14 @@
 #   every stage skips already-finished work via the per-shard SQLite state. So claiming a
 #   shard and re-running it continues exactly where the previous owner left off.
 #
-# Config: a single env file (default /mnt/amc-runs/active.env) written by
-#   ops/install_autoresume.sh. Point elsewhere with AMC_RUN_ENV.
+# Config: a single env file (default /mnt/amc-data/amc-runs/active.env, on SHARED storage)
+#   written by ops/install_autoresume.sh. It MUST be on the shared FS so every instance --
+#   including spot replacements with new IDs -- can read it. Point elsewhere with
+#   AMC_RUN_ENV. (A box-local default like /mnt/amc-runs/active.env is a trap: only the
+#   single writer instance would have it; all other boxes time out waiting and exit.)
 set -uo pipefail
 
-RUN_ENV="${AMC_RUN_ENV:-/mnt/amc-runs/active.env}"
+RUN_ENV="${AMC_RUN_ENV:-/mnt/amc-data/amc-runs/active.env}"
 MAX_BACKOFF="${AMC_RESUME_MAX_BACKOFF:-300}"
 CONFIG_WAIT_TRIES="${AMC_RESUME_CONFIG_WAIT_TRIES:-120}"   # x5s = up to 10 min for NFS/config
 LEASE_TTL="${AMC_LEASE_TTL:-300}"                          # steal a shard if its lease is older than this
