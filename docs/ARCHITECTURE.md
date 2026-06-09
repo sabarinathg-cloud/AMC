@@ -373,7 +373,8 @@ the Whisper pass. Levers to cut total time: lossless full-call batched Whisper
 | Instance dies mid-stage (Spot/OOM/reboot) | push mode: relaunch resumes from last committed chunk + last stage marker. auto-resume mode: another instance steals the stale lease and resumes |
 | Existing box reboots / Spot stop→start | `amc-shard.service` is `enabled`, so it auto-starts on boot, reads the shared config, re-claims a shard, and resumes — **no intervention** |
 | Surviving box is idle (standby) when one is lost | standby steals the stale lease after `LEASE_TTL` (300s) and resumes — **no intervention** (covered today: 5 boxes / 4 shards = 1 standby) |
-| ASG launches a **brand-new** replacement | resumes hands-free **only if the service is installed** on it (launch-template user-data running `ops/userdata_bootstrap.sh`, or an SSM State Manager association). See §13 #4 — not yet wired. |
+| ASG launches a **brand-new** replacement | resumes hands-free: the **SSM State Manager association `amc-autoresume-ensure`** auto-installs `amc-shard.service` on registration (re-checked every 30 min); the box then verifies venvs and claims a stale/free shard. **No intervention.** See §13 #4 — now live. |
+| Replacement briefly mispointed / config not yet visible | `resume_shard.sh` exits non-zero on config-wait timeout, so `Restart=on-failure` relaunches it until the shared config appears — self-heals instead of deactivating permanently (fixed in `ade93dd`). |
 | SSM invocation times out | worker is detached (`setsid+nohup`), keeps running independently |
 | Shared FS hiccup | stage fails → marker not written → re-run is safe (idempotent upserts) |
 
@@ -387,22 +388,28 @@ the Whisper pass. Levers to cut total time: lossless full-call batched Whisper
    models + writing state/audio; is Lustre the right choice vs EFS/S3 + local cache?
 3. **Model artifact distribution** — pre-bake models into the AMI / a Lustre warm cache / S3 to
    avoid a Hugging Face download stampede at 32+ instances.
-4. **Autoscaling self-heal (ACTION REQUIRED).** The fleet already runs under an ASG
-   (`amc-ec2-fleet-asg`, launch template `lt-0bab0ff58d4d087a7`), so the ASG *does* launch a
-   replacement when a Spot box is reclaimed. **But the launch-template user-data does not
-   install the auto-resume service** — confirmed because freshly ASG-launched instances came
-   up with `amc-shard.service` absent (`no-svc`). So a replacement launches but sits **idle**
-   until the service is installed. To make replacements fully hands-free, do one of:
-   - **(preferred)** add a launch-template version whose user-data is `ops/userdata_bootstrap.sh`
-     and point the ASG at it (needs `ec2:CreateLaunchTemplateVersion` / `ModifyLaunchTemplate`
-     — an AWS-team task; the operator SSO role lacks EC2 launch-template permissions); or
-   - **(SSM-only fallback)** create an SSM **State Manager** association on tag
-     `Project=amc-ec2-fleet` that runs `bash /mnt/amc-data/AMC/ops/userdata_bootstrap.sh` on a
-     schedule + at instance registration (needs `ssm:CreateAssociation`). Idempotent; installs
-     the service on any blank/new box within the schedule interval.
-   Note: the run config now lives on **shared** storage (`/mnt/amc-data/amc-runs/active.env`),
-   so a recreated instance with a new ID can read it. (Earlier it defaulted to the box-local
-   `/mnt/amc-runs/active.env`, which only the single writer instance had — fixed.)
+4. **Autoscaling self-heal (RESOLVED — live).** The fleet runs under an ASG
+   (`amc-ec2-fleet-asg`, launch template `lt-0bab0ff58d4d087a7`), which launches a replacement
+   when a Spot box is reclaimed. The launch-template user-data does **not** install the
+   auto-resume service (confirmed: ASG-launched instances came up with `amc-shard.service`
+   absent), so a blank replacement would otherwise sit idle. This is now closed by an
+   **SSM State Manager association** (`ops/autoheal_association.sh`):
+   - Association `amc-autoresume-ensure` (id `0587dbf0-c140-4ffd-895c-5d9d7bc81814`) targets tag
+     `Project=amc-ec2-fleet`, runs `bash /mnt/amc-data/AMC/ops/userdata_bootstrap.sh` at
+     instance registration and on a `rate(30 minutes)` schedule. It is guarded
+     (`systemctl is-active --quiet amc-shard.service && exit 0`), so it's a no-op on healthy
+     boxes and only installs+starts the service on blank/new ones. Created once after
+     `ssm:CreateAssociation` was granted; first execution reported `Success`.
+   - **Teardown:** when the run completes, remove it so it doesn't ping a dead fleet:
+     `aws ssm delete-association --region us-east-1 --association-id 0587dbf0-c140-4ffd-895c-5d9d7bc81814`.
+   - **(Optional, cleaner long-term)** the AWS team can instead bake `ops/userdata_bootstrap.sh`
+     into the launch-template user-data (needs `ec2:CreateLaunchTemplateVersion` /
+     `ModifyLaunchTemplate`), which removes the need for the association entirely.
+   Two related fixes also landed: the run config now lives on **shared** storage
+   (`/mnt/amc-data/amc-runs/active.env`) so a recreated instance with a new ID can read it
+   (it previously defaulted to box-local `/mnt/amc-runs/active.env`); and `resume_shard.sh`
+   now exits non-zero (not 0) on config-wait timeout so the systemd unit relaunches it instead
+   of deactivating permanently (`ade93dd`).
 5. **Networking/egress** — VPC endpoints for SSM/S3; egress allowance for first-run model pulls.
 6. **Target SLA** — desired completion time drives machine count (see §11) and whether to enable
    batched Whisper / fewer consensus models.
