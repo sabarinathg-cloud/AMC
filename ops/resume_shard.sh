@@ -37,6 +37,30 @@ IDLE_RESCAN="${AMC_IDLE_RESCAN:-60}"                       # when all shards are
 log() { echo "[$(date -Is)] resume_shard: $*"; }
 now_epoch() { date +%s; }
 
+# ---- require the shared data mount ---------------------------------------------------
+# This box can do NO work unless the shared FSx Lustre filesystem is mounted at
+# $DATA_MOUNT: without it there is no repo, no run config, and no shard state. A box can
+# boot "Running / healthy" yet have FAILED to mount (e.g. a kernel<->lustre-client kmod
+# mismatch after an unattended kernel upgrade), in which case it would otherwise sit idle
+# forever while the config-wait loop below silently spins. Fail fast and NON-ZERO so the
+# unit's Restart=on-failure churns it and the box shows up as a FAILED service (visible to
+# ops + diagnostics) instead of a silent idle "Running" instance.
+#
+# We allow a short grace window because FSx can attach a little after boot; a genuinely
+# broken box (no kmod) never mounts and keeps failing/restarting, which is the goal.
+DATA_MOUNT="${AMC_DATA_MOUNT:-/mnt/amc-data}"
+MOUNT_WAIT_TRIES="${AMC_MOUNT_WAIT_TRIES:-24}"   # x5s = up to 120s for FSx to attach at boot
+mtries=0
+while ! timeout 15 mountpoint -q "$DATA_MOUNT" 2>/dev/null; do
+  mtries=$((mtries + 1))
+  if (( mtries > MOUNT_WAIT_TRIES )); then
+    log "shared data mount $DATA_MOUNT NOT mounted after $((MOUNT_WAIT_TRIES * 5))s (FSx Lustre missing -- kernel/lustre-client kmod mismatch?); exiting non-zero so systemd restarts and this box stays visibly FAILED instead of idle"
+    exit 1
+  fi
+  log "waiting for shared data mount $DATA_MOUNT to appear ($mtries/$MOUNT_WAIT_TRIES)"
+  sleep 5
+done
+
 # ---- wait for shared storage + run config -------------------------------------------
 # If the config is not visible yet (NFS still attaching, or the run not installed yet) we
 # exit NON-ZERO so the systemd unit's Restart=on-failure relaunches us and we try again.
