@@ -44,7 +44,7 @@ run_stage --config /app/docker/config.docker.yaml run-stage asr --input /data --
 run_stage --config /app/docker/config.docker.yaml run-stage asr --input /data --output /output --models granite
 run_stage --config /app/docker/config.docker.yaml run-stage normalize --input /data --output /output
 run_stage --config /app/docker/config.docker.yaml run-stage consensus --input /data --output /output
-run_stage --config /app/docker/config.docker.yaml run-stage pii --input /data --output /output --detectors regex,gliner,piiranha,spacy,rule_name,saved_json
+run_stage --config /app/docker/config.docker.yaml run-stage pii --input /data --output /output --detectors regex,piiranha,spacy,rule_name,saved_json
 run_stage --config /app/docker/config.docker.yaml run-stage align --input /data --output /output
 run_stage --config /app/docker/config.docker.yaml run-stage mask-plan --input /data --output /output
 run_stage --config /app/docker/config.docker.yaml run-stage redact --input /data --output /output --mask-strategy beep --allow-fallback-format wav

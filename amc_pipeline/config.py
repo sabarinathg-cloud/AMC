@@ -131,7 +131,9 @@ class PipelineConfig:
         if not self.pii_models:
             self.pii_models = {
                 "regex": PIIModelConfig(True, 1.0, None),
-                "gliner": PIIModelConfig(True, 0.35, "knowledgator/gliner-pii-large-v1.0"),
+                # gliner disabled by default: the other detectors (regex/piiranha/spacy/
+                # rule_name/saved_json) cover PII without it, and it is the slowest model.
+                "gliner": PIIModelConfig(False, 0.35, "knowledgator/gliner-pii-large-v1.0"),
                 "piiranha": PIIModelConfig(True, 0.45, "iiiorg/piiranha-v1-detect-personal-information"),
                 "spacy": PIIModelConfig(True, 0.60, "en_core_web_sm"),
                 "rule_name": PIIModelConfig(True, 0.99, None),

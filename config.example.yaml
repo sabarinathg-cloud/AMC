@@ -62,7 +62,7 @@ pii_models:
   regex:
     enabled: true
   gliner:
-    enabled: true
+    enabled: false
     threshold: 0.35
     model_name_or_path: knowledgator/gliner-pii-large-v1.0
   piiranha:

@@ -286,7 +286,7 @@ for stage in $STAGES; do
       run_stage consensus consensus
       ;;
     pii)
-      run_stage pii pii --detectors regex,gliner,piiranha,spacy,rule_name,saved_json
+      run_stage pii pii --detectors regex,piiranha,spacy,rule_name,saved_json
       ;;
     align)
       run_stage align align
