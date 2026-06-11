@@ -173,36 +173,48 @@ if [[ "$AUTO_PULL" == "1" ]]; then
   fi
 fi
 
-# --- HSM pre-warm gate -------------------------------------------------------
+# --- HSM pre-warm gate (distributed, per-shard + fleet barrier) --------------
 # On FSx for Lustre, cold input is released to S3 (lfs hsm_state = "released");
 # the first read of a released file blocks in the kernel (ldlm_completion_ast)
-# until S3 restores it, which serialises discovery+ASR behind FSx restore limits
-# and looks like a hang. So restore the whole input tree to Lustre ONCE before any
-# stage reads it. Single-writer like the git pull: shard 0 warms, the rest wait on
-# a marker (a restore is filesystem-wide, so one box warming makes data resident
-# for all 32). AMC_PREWARM: auto (default, warm iff lfs present) | 1 (force) | 0 (off).
+# until S3 restores it. The discovery builder reads EVERY metadata.json's content,
+# so a released tree wedges the single builder behind ~one-restore-per-file. So we
+# restore the input to Lustre BEFORE any stage (or discovery) reads it.
+#
+# A single box restoring the whole tree is itself a ~1h serial metadata walk, so we
+# distribute it: each shard restores only its 1/NUM_SHARDS slice of the top-level
+# dirs (ls + NR%N==i), all boxes in parallel. The union of slices is the whole tree.
+# Because the discovery builder walks the WHOLE tree (any box may win the build lock),
+# every box then BARRIERS until all NUM_SHARDS slices report done -- only then is the
+# whole tree guaranteed resident and safe to walk. Markers live in STATUS_DIR (shared
+# Lustre), so they are visible fleet-wide. Restores are filesystem-wide, so a file
+# restored by one box is resident for whichever box later processes it.
+# AMC_PREWARM: auto (default, warm iff lfs present) | 1 (force) | 0 (off).
 if [[ "${AMC_PREWARM:-auto}" != "0" ]]; then
-  PREWARM_DONE_MARKER="$STATUS_DIR/.prewarm_done"
-  PREWARM_STATUS_FILE="$RUN_ROOT/status/prewarm.json"
-  if [[ "$SHARD_INDEX" == "0" ]]; then
-    write_status "prewarm" "running" "restoring released input from S3 to Lustre (shard 0)"
-    rm -f "$PREWARM_DONE_MARKER" 2>/dev/null || true
-    if AMC_PREWARM_STATUS="$PREWARM_STATUS_FILE" bash "$REPO_DIR/ops/prewarm_hsm.sh" "$AMC_IN"; then
-      date -u +%Y-%m-%dT%H:%M:%SZ > "$PREWARM_DONE_MARKER"
-    else
-      # Do not block the run forever on a partial restore; record it and proceed.
-      # Stage reads will lazily restore any stragglers (slow but correct).
-      echo "WARNING: prewarm did not fully complete; proceeding (stragglers restore on read)" >&2
-      date -u +%Y-%m-%dT%H:%M:%SZ > "$PREWARM_DONE_MARKER"
-    fi
+  PREWARM_MARKER="$STATUS_DIR/.prewarm_done_$SHARD_INDEX"
+  PREWARM_STATUS_FILE="$STATUS_DIR/prewarm-$SHARD_INDEX.json"
+  write_status "prewarm" "running" "restoring slice $SHARD_INDEX/$NUM_SHARDS of input from S3 to Lustre"
+  rm -f "$PREWARM_MARKER" 2>/dev/null || true
+  if AMC_PREWARM_STATUS="$PREWARM_STATUS_FILE" \
+     AMC_PREWARM_NUM_SHARDS="$NUM_SHARDS" \
+     AMC_PREWARM_SHARD_INDEX="$SHARD_INDEX" \
+     bash "$REPO_DIR/ops/prewarm_hsm.sh" "$AMC_IN"; then
+    date -u +%Y-%m-%dT%H:%M:%SZ > "$PREWARM_MARKER"
   else
-    write_status "prewarm" "waiting" "waiting for shard 0 to pre-warm input from S3"
-    # Generous wait: a large cold tree can take a while to restore.
-    for _ in $(seq 1 "${AMC_PREWARM_WAIT_TRIES:-2400}"); do
-      [[ -f "$PREWARM_DONE_MARKER" ]] && break
-      sleep 10
-    done
+    # Do not block the run forever on a partial restore; record it and proceed.
+    # Stage reads (and the progress-gated discovery heartbeat) handle stragglers.
+    echo "WARNING: prewarm slice $SHARD_INDEX incomplete; proceeding (stragglers restore on read)" >&2
+    date -u +%Y-%m-%dT%H:%M:%SZ > "$PREWARM_MARKER"
   fi
+  # Fleet barrier: the discovery builder reads every metadata.json across the WHOLE
+  # tree, so ALL slices must be resident before ANY box discovers. Wait for all
+  # NUM_SHARDS slice markers (or time out and proceed -- on-read restore + the
+  # progress-gated builder heartbeat keep a missing slice from hanging the fleet).
+  write_status "prewarm" "waiting" "waiting for all $NUM_SHARDS prewarm slices to finish"
+  for _ in $(seq 1 "${AMC_PREWARM_BARRIER_TRIES:-2400}"); do
+    n="$(ls -1 "$STATUS_DIR"/.prewarm_done_* 2>/dev/null | wc -l | tr -d ' ')"
+    [[ "${n:-0}" -ge "$NUM_SHARDS" ]] && break
+    sleep 10
+  done
 fi
 
 read -r RUN_FILE_COUNT RUN_SIGNATURE RUN_TOTAL_COUNT < <(

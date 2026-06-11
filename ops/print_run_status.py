@@ -59,15 +59,28 @@ def preflight_banner(run_root: Path) -> str:
     """One-line summary of the pre-stage gates (HSM prewarm, discovery build) so
     the table shows movement before any shard reaches a processing stage."""
     parts: list[str] = []
-    prewarm = _read_json(run_root / "status" / "prewarm.json")
-    if prewarm:
-        state = prewarm.get("state", "?")
-        rem = prewarm.get("released_remaining")
-        total = prewarm.get("total_files")
-        if state == "done":
-            parts.append(f"prewarm: done ({total} files resident)")
+    # Distributed prewarm writes one status file per shard slice (prewarm-<i>.json);
+    # aggregate them into a single fleet view. Fall back to the legacy single-box
+    # prewarm.json if present.
+    slices = [
+        _read_json(p) for p in sorted((run_root / "status").glob("prewarm-*.json"))
+    ]
+    slices = [s for s in slices if s]
+    if not slices:
+        legacy = _read_json(run_root / "status" / "prewarm.json")
+        if legacy:
+            slices = [legacy]
+    if slices:
+        done = sum(1 for s in slices if s.get("state") == "done")
+        rem = sum(int(s.get("released_remaining") or 0) for s in slices)
+        total = sum(int(s.get("total_files") or 0) for s in slices)
+        if done == len(slices):
+            parts.append(f"prewarm: done ({done}/{len(slices)} slices, {total} files resident)")
         else:
-            parts.append(f"prewarm: {state} (released remaining={rem}/{total})")
+            parts.append(
+                f"prewarm: {done}/{len(slices)} slices done "
+                f"(released remaining={rem}/{total})"
+            )
     for cache_dir in sorted((run_root / "discovery-cache").glob("*/")):
         if (cache_dir / ".done").exists():
             meta = _read_json(cache_dir / "meta.json")
