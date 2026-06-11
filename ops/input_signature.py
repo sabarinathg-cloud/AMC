@@ -2,19 +2,13 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from amc_pipeline.config import PipelineConfig
-from amc_pipeline.discovery import (
-    _belongs_to_shard,
-    _iter_audio_paths,
-    infer_call_id,
-    normalized_hash_mode,
-)
+from amc_pipeline.discovery import discovery_counts
 
 
 def parse_args() -> argparse.Namespace:
@@ -28,30 +22,16 @@ def parse_args() -> argparse.Namespace:
 
 
 def compute_signature(input_root: Path, output_root: Path, hash_mode: str, num_shards: int, shard_index: int) -> tuple[int, str, int]:
-    # Single filesystem walk that yields BOTH the total discovered count (across all shards)
-    # and this shard's slice. The signature is computed from the shard's (relative_path, size)
-    # pairs -- identical to the prior implementation -- so existing stage markers stay valid.
-    # We intentionally avoid building full AudioFileRecord objects / content fingerprints here:
-    # this runs at the start of every stage and only needs counts + a stable signature.
+    # Returns (shard_file_count, signature, total_file_count). The signature is the
+    # sha256 of this shard's sorted (relative_path, size) pairs -- identical to the
+    # prior implementation -- so existing stage markers stay valid. discovery_counts
+    # uses the shared discovery cache when available (one tree walk per run instead
+    # of one per stage per box) and otherwise falls back to a live walk.
     config = PipelineConfig(input_root=input_root, output_root=output_root)
-    normalized_hash_mode(hash_mode)  # validates the mode string early
-    root = config.input_root.resolve()
-    exts = {e.lower() for e in config.supported_extensions}
-
-    total = 0
-    shard_entries: list[tuple[str, int]] = []
-    for path in _iter_audio_paths(root, exts):
-        total += 1
-        rel = path.relative_to(root)
-        call_id = infer_call_id(path, rel)
-        if not _belongs_to_shard(call_id, num_shards, shard_index):
-            continue
-        shard_entries.append((rel.as_posix(), path.stat().st_size))
-
-    shard_entries.sort()
-    payload = "\n".join(f"{rel}:{size}" for rel, size in shard_entries)
-    signature = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
-    return len(shard_entries), signature, total
+    config.discovery.hash_mode = hash_mode
+    config.discovery.num_shards = num_shards
+    config.discovery.shard_index = shard_index
+    return discovery_counts(config)
 
 
 def main() -> int:

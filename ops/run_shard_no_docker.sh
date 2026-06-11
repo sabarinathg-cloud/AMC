@@ -82,6 +82,13 @@ LOCK_DIR="$RUN_ROOT/locks"
 MARKER_DIR="$AMC_OUT/.pii_pipeline/stage_markers"
 mkdir -p "$AMC_OUT" "$LOG_DIR" "$STATUS_DIR" "$LOCK_DIR" "$MARKER_DIR"
 
+# Shared discovery cache (one tree walk per run instead of one per stage per box).
+# Every stage's `amc_pipeline.cli run-stage` child inherits this; discover_audio_files
+# builds the per-shard manifest once under a cross-host lock and everyone reads their
+# slice. Records are reconstructed identically (same file_id/shard/signature), and any
+# failure falls back to a live walk. Set AMC_DISCOVERY_CACHE=0 to disable.
+export AMC_DISCOVERY_CACHE_DIR="${AMC_DISCOVERY_CACHE_DIR:-$RUN_ROOT/discovery-cache}"
+
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 # CTranslate2 (faster-whisper / whisperx backend) dlopen's cuDNN/cuBLAS at runtime, but

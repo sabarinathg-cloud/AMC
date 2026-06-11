@@ -224,10 +224,12 @@ class CorePipelineTests(unittest.TestCase):
                 text=True,
             )
 
-            first_count, first_signature = first.stdout.strip().split()
-            second_count, second_signature = second.stdout.strip().split()
+            first_count, first_signature, first_total = first.stdout.strip().split()
+            second_count, second_signature, second_total = second.stdout.strip().split()
             self.assertEqual(first_count, "1")
             self.assertEqual(second_count, "2")
+            self.assertEqual(first_total, "1")
+            self.assertEqual(second_total, "2")
             self.assertNotEqual(first_signature, second_signature)
 
     def test_preprocessing_exports_unmasked_mono_segments_per_channel(self):
