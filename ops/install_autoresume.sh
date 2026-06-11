@@ -38,14 +38,17 @@ IDS="$(aws ssm describe-instance-information \
   --region "$AWS_REGION" \
   --filters "Key=tag:Project,Values=$PROJECT_TAG" \
   --query 'sort_by(InstanceInformationList[?PingStatus==`Online`], &InstanceId)[].InstanceId' \
-  --output text | tr '\t' ' ')"
+  --output text | tr '\t\n' '  ')"
 
-if [[ -z "$IDS" || "$IDS" == "None" ]]; then
+if [[ -z "${IDS// }" || "$IDS" == "None" ]]; then
   echo "No online SSM instances found for Project=$PROJECT_TAG" >&2
   exit 2
 fi
 ONLINE_COUNT="$(wc -w <<< "$IDS" | tr -d ' ')"
-FIRST_ID="$(awk '{print $1}' <<< "$IDS")"
+# Take the first whitespace-delimited token regardless of how the CLI separated the
+# list (tabs vs newlines): with a large fleet `--output text` can break across lines,
+# and `awk '{print $1}'` would otherwise emit the first column of EVERY line.
+FIRST_ID="$(printf '%s\n' $IDS | head -n1)"
 
 # Shard count is the fixed data-partition count and the CONCURRENCY CAP: at most
 # NUM_SHARDS machines can run at once. It is baked into the call->shard hash and the
