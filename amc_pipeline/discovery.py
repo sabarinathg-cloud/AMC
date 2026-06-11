@@ -40,6 +40,15 @@ _CACHE_STALE_SEC = float(os.environ.get("AMC_DISCOVERY_CACHE_STALE", "120"))
 # Small enough that `tmp_lines` and progress.json are a live progress signal; large
 # enough that flushing 1 line at a time never dominates the walk.
 _CACHE_PROGRESS_EVERY = int(os.environ.get("AMC_DISCOVERY_CACHE_PROGRESS_EVERY", "500"))
+# Per-shard directory scan. When set, a sharded worker enumerates ONLY the top-level
+# call directories that hash to its shard (<root>/<call_id>/<audio>), instead of
+# walking the whole tree and filtering. This makes each box touch only its ~1/N of
+# the input, so no single process ever reads every sidecar -- the exact operation
+# that wedged the shared-cache builder on an HSM-released (S3-cold) tree. It also
+# makes the shared discovery cache unnecessary (each box is independent), so when
+# this is on the cache is bypassed. Layout assumption: the immediate child dir name
+# is the call_id (true for the audio.* sidecar layout; matches infer_call_id).
+_SHARD_DIRSCAN_ENV = "AMC_SHARD_DIRSCAN"
 
 
 def discover_audio_files(config: PipelineConfig) -> list[AudioFileRecord]:
@@ -52,13 +61,24 @@ def discover_audio_files(config: PipelineConfig) -> list[AudioFileRecord]:
     num_shards = int(config.discovery.num_shards or 1)
     shard_index = config.discovery.shard_index
 
+    # Per-shard dir scan: each box enumerates only its own ~1/N call dirs (no whole-tree
+    # walk, no shared cache, no single builder reading every sidecar). The records are
+    # identical to the full-walk+filter path for the <root>/<call_id>/<audio> layout.
+    if _shard_dirscan_enabled() and shard_index is not None and num_shards > 1:
+        records: list[AudioFileRecord] = []
+        for path in _iter_shard_audio_paths(root, exts, num_shards, shard_index):
+            rel = path.relative_to(root)
+            call_id = infer_call_id(path, rel)
+            records.append(_record_for_path(path, rel, call_id, hash_mode))
+        return records
+
     cache_root = _discovery_cache_dir(config)
     if cache_root is not None:
         cached = _records_via_cache(root, exts, hash_mode, num_shards, shard_index, cache_root)
         if cached is not None:
             return cached
 
-    records: list[AudioFileRecord] = []
+    records = []
     for path in _iter_audio_paths(root, exts):
         rel = path.relative_to(root)
         call_id = infer_call_id(path, rel)
@@ -123,6 +143,46 @@ def _iter_audio_paths(root: Path, exts: set[str]) -> Iterator[Path]:
         for filename in sorted(filenames):
             path = Path(dirpath) / filename
             if path.is_file() and path.suffix.lower() in exts:
+                yield path
+
+
+def _shard_dirscan_enabled() -> bool:
+    return os.environ.get(_SHARD_DIRSCAN_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _iter_shard_audio_paths(
+    root: Path, exts: set[str], num_shards: int, shard_index: int
+) -> Iterator[Path]:
+    """Yield audio paths only under the top-level call dirs that hash to this shard.
+
+    Layout assumed: <root>/<call_id>/<audio.*> -- the immediate child dir name IS the
+    call_id (the same value infer_call_id derives for an audio.* file, and the same
+    key _shard_of uses). So selecting child dirs by _shard_of(dir_name) == shard_index
+    yields EXACTLY the files this shard would own under the full-walk+filter path, but
+    touches only one readdir of <root> plus this shard's ~1/N child dirs instead of the
+    whole tree. No process reads sidecars outside its slice, which is what wedged the
+    shared-cache builder on an HSM-released (S3-cold) tree.
+    """
+    try:
+        entries = sorted(os.scandir(root), key=lambda e: e.name)
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            if not entry.is_dir(follow_symlinks=True):
+                continue
+        except OSError:
+            continue
+        if _shard_of(entry.name, num_shards) != shard_index:
+            continue
+        try:
+            names = sorted(e.name for e in os.scandir(entry.path))
+        except OSError:
+            continue
+        base = Path(entry.path)
+        for name in names:
+            path = base / name
+            if path.suffix.lower() in exts and path.is_file():
                 yield path
 
 
@@ -297,6 +357,16 @@ def discovery_counts(config: PipelineConfig) -> tuple[int, str, int]:
     hash_mode = normalized_hash_mode(config.discovery.hash_mode)
     num_shards = int(config.discovery.num_shards or 1)
     shard_index = config.discovery.shard_index
+
+    # Per-shard dir scan: count/signature this shard's slice only. `total` is reported
+    # as the shard's own count (this box never sees other shards); the run-level
+    # "input present?" guard only needs total > 0, which holds for any non-empty shard.
+    if _shard_dirscan_enabled() and shard_index is not None and num_shards > 1:
+        shard_pairs = sorted(
+            (path.relative_to(root).as_posix(), path.stat().st_size)
+            for path in _iter_shard_audio_paths(root, exts, num_shards, shard_index)
+        )
+        return len(shard_pairs), _signature_for(shard_pairs), len(shard_pairs)
 
     cache_root = _discovery_cache_dir(config)
     if cache_root is not None:

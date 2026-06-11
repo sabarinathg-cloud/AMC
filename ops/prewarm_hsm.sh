@@ -13,20 +13,19 @@ set -Eeuo pipefail
 # on a released tree. Restoring up front turns the whole run into pure local-Lustre
 # reads -- no per-read stalls, full 32-box use.
 #
-# Distributed mode (AMC_PREWARM_NUM_SHARDS>1): each box restores only its 1/N slice
-# of the top-level directories (ls + NR%N==i). The union of all slices is the whole
-# tree, so a fleet barrier (in run_shard_no_docker.sh) that waits for all N slices
-# guarantees the whole tree is resident before the single discovery builder walks it.
-# This splits the otherwise ~1h single-box metadata walk N ways and uses every box.
-#
-# Restores are filesystem-wide: any client that restores a file makes it resident
-# for ALL clients, so slice ownership is purely a work-partition, not a correctness
-# constraint -- a file restored by one box is resident for whichever box processes it.
+# Distributed mode (AMC_PREWARM_NUM_SHARDS>1): each box restores only the top-level
+# call dirs whose name (the call_id) hashes to its shard -- sha1(call_id)%N==i, the
+# SAME key amc_pipeline.discovery._shard_of uses. So the set this box restores is
+# EXACTLY the set this shard later discovers + processes (AMC_SHARD_DIRSCAN). Each box
+# is therefore fully self-contained on its ~1/N of the calls: it warms, discovers, and
+# processes only its own slice, with NO fleet barrier and NO whole-tree walk. The union
+# of all N slices is still the whole tree. This both splits the metadata work N ways and
+# removes the single-builder-reads-every-sidecar wedge that hung on a released tree.
 #
 # Usage:
 #   ops/prewarm_hsm.sh <dir>                                  # whole tree (single box)
 #   AMC_PREWARM_NUM_SHARDS=32 AMC_PREWARM_SHARD_INDEX=7 \
-#     ops/prewarm_hsm.sh /mnt/amc-data/2022                   # this box's 1/32 slice
+#     ops/prewarm_hsm.sh /mnt/amc-data/2022                   # this shard's 1/32 of calls
 #
 # Exit codes: 0 = slice fully resident (or nothing to do / not an HSM fs);
 #             1 = timed out with files still released.
@@ -76,12 +75,22 @@ released_subset() {  # $1 = file list
 # --- enumerate files in scope ------------------------------------------------
 write_status "scanning" 0 0
 if [[ "$NUM_SHARDS" -gt 1 ]]; then
-  # Partition the top-level directories across the fleet. ls is a single readdir of
-  # the parent (cheap relative to walking the whole tree); awk keeps every Nth entry
-  # so index 0..N-1 jointly cover all directories exactly once.
-  log "listing top-level dirs under $ROOT and taking slice $SHARD_INDEX/$NUM_SHARDS..."
-  ls -1 "$ROOT" 2>/dev/null | awk -v n="$NUM_SHARDS" -v i="$SHARD_INDEX" 'NR % n == i' \
-    > "$WORK/dirs.txt" || true
+  # Partition the top-level call dirs by the SAME key the pipeline shards on:
+  # _shard_of(call_id) = int(sha1(call_id),16) % NUM_SHARDS, where call_id is the dir
+  # name (<root>/<call_id>/audio.*). This makes the set of dirs THIS box restores
+  # identical to the set this shard later discovers + processes -- so each box warms
+  # exactly its own ~15k calls and can run end-to-end independently (no fleet barrier,
+  # no cross-shard reads). ls is one readdir of the parent; the python filter hashes
+  # each name the same way amc_pipeline.discovery._shard_of does.
+  log "listing top-level dirs under $ROOT; selecting shard $SHARD_INDEX/$NUM_SHARDS by call_id hash..."
+  ls -1 "$ROOT" 2>/dev/null | python3 -c '
+import sys, hashlib
+n = int(sys.argv[1]); i = int(sys.argv[2])
+for line in sys.stdin:
+    name = line.strip()
+    if name and int(hashlib.sha1(name.encode("utf-8")).hexdigest(), 16) % n == i:
+        print(name)
+' "$NUM_SHARDS" "$SHARD_INDEX" > "$WORK/dirs.txt" || true
   ndirs="$(wc -l < "$WORK/dirs.txt" | tr -d ' ')"
   log "slice owns $ndirs top-level dirs; enumerating their files (parallel=$PARALLEL)..."
   # One find per dir, parallelised. Each call dir holds only a few files, so thousands

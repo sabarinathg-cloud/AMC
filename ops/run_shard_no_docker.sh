@@ -82,11 +82,15 @@ LOCK_DIR="$RUN_ROOT/locks"
 MARKER_DIR="$AMC_OUT/.pii_pipeline/stage_markers"
 mkdir -p "$AMC_OUT" "$LOG_DIR" "$STATUS_DIR" "$LOCK_DIR" "$MARKER_DIR"
 
-# Shared discovery cache (one tree walk per run instead of one per stage per box).
-# Every stage's `amc_pipeline.cli run-stage` child inherits this; discover_audio_files
-# builds the per-shard manifest once under a cross-host lock and everyone reads their
-# slice. Records are reconstructed identically (same file_id/shard/signature), and any
-# failure falls back to a live walk. Set AMC_DISCOVERY_CACHE=0 to disable.
+# Per-shard directory scan: each box discovers ONLY its own ~1/NUM_SHARDS call dirs
+# (<input>/<call_id>/audio.*, selected by sha1(call_id)%NUM_SHARDS), so there is no
+# whole-tree walk and no single shared-cache builder reading every sidecar -- the
+# operation that wedged on an HSM-released (S3-cold) tree. Because each box is fully
+# self-contained on its slice, the shared discovery cache is unnecessary and disabled.
+# The dirscan produces byte-identical records to the old full-walk+filter path for this
+# layout, so existing stage markers and signatures stay valid.
+export AMC_SHARD_DIRSCAN="${AMC_SHARD_DIRSCAN:-1}"
+export AMC_DISCOVERY_CACHE="${AMC_DISCOVERY_CACHE:-0}"
 export AMC_DISCOVERY_CACHE_DIR="${AMC_DISCOVERY_CACHE_DIR:-$RUN_ROOT/discovery-cache}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
@@ -173,26 +177,23 @@ if [[ "$AUTO_PULL" == "1" ]]; then
   fi
 fi
 
-# --- HSM pre-warm gate (distributed, per-shard + fleet barrier) --------------
-# On FSx for Lustre, cold input is released to S3 (lfs hsm_state = "released");
-# the first read of a released file blocks in the kernel (ldlm_completion_ast)
-# until S3 restores it. The discovery builder reads EVERY metadata.json's content,
-# so a released tree wedges the single builder behind ~one-restore-per-file. So we
-# restore the input to Lustre BEFORE any stage (or discovery) reads it.
+# --- HSM pre-warm (per-shard, independent; NO fleet barrier) -----------------
+# On FSx for Lustre, cold input is released to S3 (lfs hsm_state = "released"); the
+# first read of a released file blocks in the kernel (ldlm_completion_ast) until S3
+# restores it. To avoid paying that latency serially during processing, each box
+# restores its slice up front, in parallel (lfs hsm_restore).
 #
-# A single box restoring the whole tree is itself a ~1h serial metadata walk, so we
-# distribute it: each shard restores only its 1/NUM_SHARDS slice of the top-level
-# dirs (ls + NR%N==i), all boxes in parallel. The union of slices is the whole tree.
-# Because the discovery builder walks the WHOLE tree (any box may win the build lock),
-# every box then BARRIERS until all NUM_SHARDS slices report done -- only then is the
-# whole tree guaranteed resident and safe to walk. Markers live in STATUS_DIR (shared
-# Lustre), so they are visible fleet-wide. Restores are filesystem-wide, so a file
-# restored by one box is resident for whichever box later processes it.
+# Crucially, prewarm now partitions by the SAME key the pipeline shards on
+# (sha1(call_id)%NUM_SHARDS), so the dirs this box restores are EXACTLY the dirs it
+# then discovers + processes (AMC_SHARD_DIRSCAN). That means each box only ever needs
+# ITS OWN slice resident -- there is no whole-tree walk and no shared-cache builder
+# reading other shards' sidecars -- so we DROP the fleet barrier entirely. A slow box
+# can never stall the others; it just warms and works through its own ~15k calls.
 # AMC_PREWARM: auto (default, warm iff lfs present) | 1 (force) | 0 (off).
 if [[ "${AMC_PREWARM:-auto}" != "0" ]]; then
   PREWARM_MARKER="$STATUS_DIR/.prewarm_done_$SHARD_INDEX"
   PREWARM_STATUS_FILE="$STATUS_DIR/prewarm-$SHARD_INDEX.json"
-  write_status "prewarm" "running" "restoring slice $SHARD_INDEX/$NUM_SHARDS of input from S3 to Lustre"
+  write_status "prewarm" "running" "restoring shard $SHARD_INDEX/$NUM_SHARDS (~1/$NUM_SHARDS of calls) from S3 to Lustre"
   rm -f "$PREWARM_MARKER" 2>/dev/null || true
   if AMC_PREWARM_STATUS="$PREWARM_STATUS_FILE" \
      AMC_PREWARM_NUM_SHARDS="$NUM_SHARDS" \
@@ -200,21 +201,11 @@ if [[ "${AMC_PREWARM:-auto}" != "0" ]]; then
      bash "$REPO_DIR/ops/prewarm_hsm.sh" "$AMC_IN"; then
     date -u +%Y-%m-%dT%H:%M:%SZ > "$PREWARM_MARKER"
   else
-    # Do not block the run forever on a partial restore; record it and proceed.
-    # Stage reads (and the progress-gated discovery heartbeat) handle stragglers.
-    echo "WARNING: prewarm slice $SHARD_INDEX incomplete; proceeding (stragglers restore on read)" >&2
+    # A partial restore must not block this shard's work: discovery/stage reads will
+    # restore any straggler on first access. Record and proceed.
+    echo "WARNING: prewarm shard $SHARD_INDEX incomplete; proceeding (stragglers restore on read)" >&2
     date -u +%Y-%m-%dT%H:%M:%SZ > "$PREWARM_MARKER"
   fi
-  # Fleet barrier: the discovery builder reads every metadata.json across the WHOLE
-  # tree, so ALL slices must be resident before ANY box discovers. Wait for all
-  # NUM_SHARDS slice markers (or time out and proceed -- on-read restore + the
-  # progress-gated builder heartbeat keep a missing slice from hanging the fleet).
-  write_status "prewarm" "waiting" "waiting for all $NUM_SHARDS prewarm slices to finish"
-  for _ in $(seq 1 "${AMC_PREWARM_BARRIER_TRIES:-2400}"); do
-    n="$(ls -1 "$STATUS_DIR"/.prewarm_done_* 2>/dev/null | wc -l | tr -d ' ')"
-    [[ "${n:-0}" -ge "$NUM_SHARDS" ]] && break
-    sleep 10
-  done
 fi
 
 read -r RUN_FILE_COUNT RUN_SIGNATURE RUN_TOTAL_COUNT < <(

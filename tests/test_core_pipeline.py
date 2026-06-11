@@ -18,7 +18,7 @@ from amc_pipeline.audio import decode_to_wav
 from amc_pipeline.cli import build_parser, load_cli_config
 from amc_pipeline.config import PipelineConfig, _parse_minimal_yaml
 from amc_pipeline.consensus import build_consensus
-from amc_pipeline.discovery import discover_audio_files
+from amc_pipeline.discovery import discover_audio_files, discovery_counts
 from amc_pipeline.inspection import inspect_audio
 from amc_pipeline.masking import redact_wav_with_plan
 from amc_pipeline.manifests import write_segment_manifests
@@ -176,6 +176,50 @@ class CorePipelineTests(unittest.TestCase):
             self.assertFalse(sharded[0] & sharded[1])
             self.assertFalse(sharded[0] & sharded[2])
             self.assertFalse(sharded[1] & sharded[2])
+
+    def test_shard_dirscan_matches_full_walk_per_shard(self):
+        # Production points AMC_IN at the year dir, so the layout is <root>/<call_id>/audio.*
+        # and AMC_SHARD_DIRSCAN makes each shard enumerate only its own call dirs. The
+        # records (and per-shard signature) must be byte-identical to the full-walk+filter
+        # path, otherwise existing on-disk stage markers would be invalidated.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "2022"
+            for idx in range(20):
+                write_stereo_wav(root / f"call_{idx:04d}" / "audio.wav")
+
+            num_shards = 3
+
+            def records_for(shard_index, dirscan):
+                cfg = PipelineConfig(input_root=root, output_root=Path(td) / f"o-{dirscan}-{shard_index}")
+                cfg.discovery.hash_mode = "path"
+                cfg.discovery.num_shards = str(num_shards)  # type: ignore[assignment]
+                cfg.discovery.shard_index = str(shard_index)  # type: ignore[assignment]
+                env = {"AMC_DISCOVERY_CACHE": "0"}
+                env["AMC_SHARD_DIRSCAN"] = "1" if dirscan else "0"
+                with patch.dict(os.environ, env, clear=False):
+                    recs = discover_audio_files(cfg)
+                    counts = discovery_counts(cfg)
+                return recs, counts
+
+            union = set()
+            for shard_index in range(num_shards):
+                walk_recs, walk_counts = records_for(shard_index, dirscan=False)
+                scan_recs, scan_counts = records_for(shard_index, dirscan=True)
+
+                def key(records):
+                    return sorted(
+                        (r.file_id, r.relative_path.as_posix(), r.call_id, r.size_bytes, r.content_hash)
+                        for r in records
+                    )
+
+                self.assertEqual(key(scan_recs), key(walk_recs))
+                # shard file count + signature must match the full-walk path exactly
+                self.assertEqual(scan_counts[0], walk_counts[0])
+                self.assertEqual(scan_counts[1], walk_counts[1])
+                union |= {r.call_id for r in scan_recs}
+
+            # every call lands in exactly one shard
+            self.assertEqual(union, {f"call_{idx:04d}" for idx in range(20)})
 
     def test_input_signature_changes_when_subset_expands(self):
         with tempfile.TemporaryDirectory() as td:
