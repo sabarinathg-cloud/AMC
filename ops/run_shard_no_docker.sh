@@ -173,6 +173,38 @@ if [[ "$AUTO_PULL" == "1" ]]; then
   fi
 fi
 
+# --- HSM pre-warm gate -------------------------------------------------------
+# On FSx for Lustre, cold input is released to S3 (lfs hsm_state = "released");
+# the first read of a released file blocks in the kernel (ldlm_completion_ast)
+# until S3 restores it, which serialises discovery+ASR behind FSx restore limits
+# and looks like a hang. So restore the whole input tree to Lustre ONCE before any
+# stage reads it. Single-writer like the git pull: shard 0 warms, the rest wait on
+# a marker (a restore is filesystem-wide, so one box warming makes data resident
+# for all 32). AMC_PREWARM: auto (default, warm iff lfs present) | 1 (force) | 0 (off).
+if [[ "${AMC_PREWARM:-auto}" != "0" ]]; then
+  PREWARM_DONE_MARKER="$STATUS_DIR/.prewarm_done"
+  PREWARM_STATUS_FILE="$RUN_ROOT/status/prewarm.json"
+  if [[ "$SHARD_INDEX" == "0" ]]; then
+    write_status "prewarm" "running" "restoring released input from S3 to Lustre (shard 0)"
+    rm -f "$PREWARM_DONE_MARKER" 2>/dev/null || true
+    if AMC_PREWARM_STATUS="$PREWARM_STATUS_FILE" bash "$REPO_DIR/ops/prewarm_hsm.sh" "$AMC_IN"; then
+      date -u +%Y-%m-%dT%H:%M:%SZ > "$PREWARM_DONE_MARKER"
+    else
+      # Do not block the run forever on a partial restore; record it and proceed.
+      # Stage reads will lazily restore any stragglers (slow but correct).
+      echo "WARNING: prewarm did not fully complete; proceeding (stragglers restore on read)" >&2
+      date -u +%Y-%m-%dT%H:%M:%SZ > "$PREWARM_DONE_MARKER"
+    fi
+  else
+    write_status "prewarm" "waiting" "waiting for shard 0 to pre-warm input from S3"
+    # Generous wait: a large cold tree can take a while to restore.
+    for _ in $(seq 1 "${AMC_PREWARM_WAIT_TRIES:-2400}"); do
+      [[ -f "$PREWARM_DONE_MARKER" ]] && break
+      sleep 10
+    done
+  fi
+fi
+
 read -r RUN_FILE_COUNT RUN_SIGNATURE RUN_TOTAL_COUNT < <(
   "$MAIN_PY" ops/input_signature.py \
     --input "$AMC_IN" \

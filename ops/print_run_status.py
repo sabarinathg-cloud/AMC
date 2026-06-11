@@ -21,6 +21,9 @@ def main() -> int:
     if args.json:
         print(json.dumps(rows, indent=2, sort_keys=True))
         return 0
+    banner = preflight_banner(args.run_root)
+    if banner:
+        print(banner)
     if not rows:
         print(f"No shard status found under {args.run_root}")
         return 0
@@ -50,6 +53,40 @@ def main() -> int:
     for row in rows:
         print("  ".join(str(row.get(header, "")).ljust(widths[header]) for header in headers))
     return 0
+
+
+def preflight_banner(run_root: Path) -> str:
+    """One-line summary of the pre-stage gates (HSM prewarm, discovery build) so
+    the table shows movement before any shard reaches a processing stage."""
+    parts: list[str] = []
+    prewarm = _read_json(run_root / "status" / "prewarm.json")
+    if prewarm:
+        state = prewarm.get("state", "?")
+        rem = prewarm.get("released_remaining")
+        total = prewarm.get("total_files")
+        if state == "done":
+            parts.append(f"prewarm: done ({total} files resident)")
+        else:
+            parts.append(f"prewarm: {state} (released remaining={rem}/{total})")
+    for cache_dir in sorted((run_root / "discovery-cache").glob("*/")):
+        if (cache_dir / ".done").exists():
+            meta = _read_json(cache_dir / "meta.json")
+            parts.append(f"discovery: done ({meta.get('total', '?')} files)")
+        else:
+            prog = _read_json(cache_dir / "progress.json")
+            if prog:
+                parts.append(f"discovery: building ({prog.get('seen', 0)} files seen)")
+            else:
+                parts.append("discovery: starting")
+        break
+    return " | ".join(parts)
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
 
 
 def collect_status(run_root: Path) -> list[dict[str, Any]]:

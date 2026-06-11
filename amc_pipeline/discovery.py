@@ -36,6 +36,10 @@ _CACHE_POLL_SEC = float(os.environ.get("AMC_DISCOVERY_CACHE_POLL", "5"))
 # for an hour; now another box rebuilds within ~2 min.
 _CACHE_HEARTBEAT_SEC = float(os.environ.get("AMC_DISCOVERY_CACHE_HEARTBEAT", "30"))
 _CACHE_STALE_SEC = float(os.environ.get("AMC_DISCOVERY_CACHE_STALE", "120"))
+# How often (in files) the builder flushes shard handles and rewrites progress.json.
+# Small enough that `tmp_lines` and progress.json are a live progress signal; large
+# enough that flushing 1 line at a time never dominates the walk.
+_CACHE_PROGRESS_EVERY = int(os.environ.get("AMC_DISCOVERY_CACHE_PROGRESS_EVERY", "500"))
 
 
 def discover_audio_files(config: PipelineConfig) -> list[AudioFileRecord]:
@@ -363,23 +367,32 @@ def _ensure_cache(
         # Keep the lock's mtime fresh while we walk so a long (but alive) build is
         # never mistaken for stale; the moment this process dies the heartbeat
         # stops, the mtime freezes, and another box reclaims after _CACHE_STALE_SEC.
+        progress = {"seen": 0, "started_at": time.time(), "done": False}
         stop_hb = threading.Event()
-        hb = threading.Thread(target=_heartbeat_lock, args=(lock, stop_hb), daemon=True)
+        hb = threading.Thread(target=_heartbeat_lock, args=(lock, stop_hb, progress), daemon=True)
         hb.start()
         try:
-            _build_cache(base, root, exts, hash_mode, num_shards)
+            _build_cache(base, root, exts, hash_mode, num_shards, progress)
         except Exception:
             # Leave no half-written .done; drop the lock so another worker retries.
             _safe_unlink(done)
             return None
         finally:
+            progress["done"] = True
             stop_hb.set()
             hb.join(timeout=2)
             _safe_unlink(lock)
         # loop: .done now exists
 
 
-def _build_cache(base: Path, root: Path, exts: set[str], hash_mode: str, num_shards: int) -> None:
+def _build_cache(
+    base: Path,
+    root: Path,
+    exts: set[str],
+    hash_mode: str,
+    num_shards: int,
+    progress: dict[str, Any] | None = None,
+) -> None:
     mode = normalized_hash_mode(hash_mode)
     tmp = base / ".tmp"
     if tmp.exists():
@@ -404,6 +417,15 @@ def _build_cache(base: Path, root: Path, exts: set[str], hash_mode: str, num_sha
                 entry["chash"] = hash_file(path)
             handles[_shard_of(call_id, num_shards)].write(json.dumps(entry) + "\n")
             total += 1
+            if progress is not None:
+                # Advancing `seen` is what keeps the build lock fresh (see
+                # _heartbeat_lock); flushing makes tmp_lines + progress.json a live
+                # signal and bounds how much a crashed builder loses.
+                progress["seen"] = total
+                if total % _CACHE_PROGRESS_EVERY == 0:
+                    for h in handles:
+                        h.flush()
+                    _write_progress(base, progress)
     finally:
         for h in handles:
             h.close()
@@ -421,6 +443,9 @@ def _build_cache(base: Path, root: Path, exts: set[str], hash_mode: str, num_sha
     (base / "meta.json").write_text(json.dumps(meta, indent=2, sort_keys=True))
     _safe_rmdir(tmp)
     (base / ".done").write_text("ok")
+    if progress is not None:
+        progress["seen"] = total
+        _write_progress(base, {**progress, "done": True})
 
 
 def _read_cache_entries(base: Path, num_shards: int, shard_index: int | None) -> Iterator[dict[str, Any]]:
@@ -466,19 +491,46 @@ def _is_stale(lock: Path) -> bool:
         return True
 
 
-def _heartbeat_lock(lock: Path, stop: threading.Event) -> None:
-    """Bump the build lock's mtime every _CACHE_HEARTBEAT_SEC until told to stop.
+def _heartbeat_lock(lock: Path, stop: threading.Event, progress: dict[str, Any]) -> None:
+    """Refresh the build lock's mtime ONLY while the walk is making progress.
 
-    Runs in a daemon thread for the lifetime of a build. While the builder is
-    alive the lock never looks stale; if the builder process dies the thread
-    dies with it, the mtime freezes, and waiters reclaim the lock once it ages
-    past _CACHE_STALE_SEC. If the lock vanishes (reclaimed/removed) we stop.
+    Runs in a daemon thread for the build's lifetime. Each beat it compares the
+    builder's `seen` counter to the previous beat:
+      * advanced  -> the walk is alive and moving; bump mtime so the lock stays held.
+      * unchanged -> the walk is wedged (e.g. blocked in the kernel restoring an
+        HSM-released file) OR the process died. Either way we DON'T bump, so the
+        mtime ages past _CACHE_STALE_SEC and another box reclaims and retries.
+    This ties liveness to *progress*, not mere process existence -- the blind spot
+    that let a kernel-wedged builder hold the lock forever while looking healthy.
+    If the lock vanishes (reclaimed/removed) we stop.
     """
+    last_seen = 0
     while not stop.wait(_CACHE_HEARTBEAT_SEC):
+        seen = int(progress.get("seen", 0))
+        if seen == last_seen:
+            continue
+        last_seen = seen
         try:
             os.utime(lock, None)
         except OSError:
             return
+
+
+def _write_progress(base: Path, progress: dict[str, Any]) -> None:
+    """Publish build progress for observability (print_run_status, ops probes)."""
+    try:
+        (base / "progress.json").write_text(
+            json.dumps(
+                {
+                    "seen": int(progress.get("seen", 0)),
+                    "started_at": progress.get("started_at"),
+                    "updated_at": time.time(),
+                    "done": bool(progress.get("done", False)),
+                }
+            )
+        )
+    except OSError:
+        pass
 
 
 def _safe_unlink(path: Path) -> None:

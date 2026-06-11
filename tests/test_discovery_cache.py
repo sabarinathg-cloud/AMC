@@ -225,6 +225,51 @@ class DiscoveryCacheEquivalenceTest(unittest.TestCase):
             self.assertTrue(lock.exists())
             self.assertFalse((key_dir / ".done").exists())
 
+    def test_heartbeat_only_refreshes_lock_while_progress_advances(self):
+        # The anti-wedge guarantee: the build lock's mtime is refreshed ONLY when
+        # the walk's `seen` counter moves. A frozen counter (wedged builder) must
+        # let the lock age so another box can reclaim it.
+        import threading
+
+        with TemporaryDirectory() as tmp:
+            lock = Path(tmp) / ".building"
+            lock.write_text("123")
+            ancient = time.time() - 1000
+            os.utime(lock, (ancient, ancient))
+            progress: dict = {"seen": 0}
+            stop = threading.Event()
+            with patch_attrs(_CACHE_HEARTBEAT_SEC=0.05):
+                t = threading.Thread(
+                    target=disc._heartbeat_lock, args=(lock, stop, progress), daemon=True
+                )
+                t.start()
+                try:
+                    time.sleep(0.3)  # several beats, but no progress
+                    self.assertLess(lock.stat().st_mtime, time.time() - 100)  # still ancient
+                    progress["seen"] = 10  # walk advances
+                    time.sleep(0.3)
+                    self.assertGreater(lock.stat().st_mtime, time.time() - 100)  # refreshed
+                finally:
+                    stop.set()
+                    t.join(timeout=1)
+
+    def test_build_publishes_progress_json(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            root = tmp_path / "input"
+            build_tree(root)
+            out = tmp_path / "out"
+            cache = tmp_path / "cache"
+            with env(AMC_DISCOVERY_CACHE="auto", AMC_DISCOVERY_CACHE_DIR=str(cache)), patch_attrs(
+                _CACHE_PROGRESS_EVERY=1
+            ):
+                discover_audio_files(self._config(root, out, "path", 4, 0))
+            key_dir = self._only_key_dir(cache)
+            self.assertTrue((key_dir / ".done").exists())
+            prog = json.loads((key_dir / "progress.json").read_text())
+            self.assertTrue(prog["done"])
+            self.assertGreaterEqual(prog["seen"], 1)
+
     def test_meta_mismatch_falls_back_to_walk(self):
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
