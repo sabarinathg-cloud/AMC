@@ -2,13 +2,29 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import amc_pipeline.discovery as disc
 from amc_pipeline.config import PipelineConfig
 from amc_pipeline.discovery import discover_audio_files, discovery_counts
+
+
+@contextmanager
+def patch_attrs(**overrides):
+    # Timeout/poll/stale are module constants read at import, so tests that need
+    # to shrink them (to avoid multi-hour waits) patch the globals directly.
+    saved = {k: getattr(disc, k) for k in overrides}
+    try:
+        for k, v in overrides.items():
+            setattr(disc, k, v)
+        yield
+    finally:
+        for k, v in saved.items():
+            setattr(disc, k, v)
 
 
 @contextmanager
@@ -141,6 +157,73 @@ class DiscoveryCacheEquivalenceTest(unittest.TestCase):
                 discover_audio_files(self._config(root, plain_out, "path", 4, 0))
             self.assertFalse((plain_out / "discovery-cache").exists())
             self.assertFalse((plain_out.parent / "discovery-cache").exists())
+
+    def _only_key_dir(self, cache: Path) -> Path:
+        # The real key dir depends on root.resolve() + the configured extension
+        # set, so locate it dynamically rather than recomputing the hash here.
+        dirs = [p for p in cache.iterdir() if p.is_dir()]
+        self.assertEqual(len(dirs), 1, f"expected one cache key dir, got {dirs}")
+        return dirs[0]
+
+    def test_stale_building_lock_is_reclaimed(self):
+        # A builder that died leaves a .building lock with a frozen (old) mtime.
+        # The next worker must detect it as stale, reclaim it, rebuild the
+        # manifest, and return correct records -- not block.
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            root = tmp_path / "input"
+            build_tree(root)
+            out = tmp_path / "out"
+            cache = tmp_path / "cache"
+
+            # Build once so the real key dir exists, then simulate a crashed
+            # builder: drop .done and plant a stale lock with an ancient mtime.
+            with env(AMC_DISCOVERY_CACHE="auto", AMC_DISCOVERY_CACHE_DIR=str(cache)):
+                discover_audio_files(self._config(root, out, "path", 4, 0))
+            key_dir = self._only_key_dir(cache)
+            (key_dir / ".done").unlink()
+            lock = key_dir / ".building"
+            lock.write_text("99999")  # pid of a dead builder
+            old = time.time() - 10_000  # far older than default stale (120s)
+            os.utime(lock, (old, old))
+
+            with env(AMC_DISCOVERY_CACHE="auto", AMC_DISCOVERY_CACHE_DIR=str(cache)):
+                recs_after = discover_audio_files(self._config(root, out, "path", 4, 0))
+            with env(AMC_DISCOVERY_CACHE="0", AMC_DISCOVERY_CACHE_DIR=None):
+                walk_recs = discover_audio_files(self._config(root, out, "path", 4, 0))
+
+            self.assertEqual(records_by_id(walk_recs), records_by_id(recs_after))
+            self.assertTrue((key_dir / ".done").exists())
+
+    def test_fresh_building_lock_is_not_stolen_and_falls_back(self):
+        # A lock that is being heartbeated (fresh mtime) must NOT be stolen.
+        # With a short build timeout the waiter gives up and falls back to the
+        # live walk rather than corrupting another builder's manifest.
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            root = tmp_path / "input"
+            build_tree(root)
+            out = tmp_path / "out"
+            cache = tmp_path / "cache"
+
+            with env(AMC_DISCOVERY_CACHE="auto", AMC_DISCOVERY_CACHE_DIR=str(cache)):
+                discover_audio_files(self._config(root, out, "path", 4, 0))
+            key_dir = self._only_key_dir(cache)
+            (key_dir / ".done").unlink()
+            lock = key_dir / ".building"
+            lock.write_text("12345")  # a "live" builder holds the lock (fresh mtime)
+
+            with env(AMC_DISCOVERY_CACHE="auto", AMC_DISCOVERY_CACHE_DIR=str(cache)), patch_attrs(
+                _CACHE_BUILD_TIMEOUT_SEC=1.0, _CACHE_POLL_SEC=0.2
+            ):
+                recs = discover_audio_files(self._config(root, out, "path", 4, 0))
+            with env(AMC_DISCOVERY_CACHE="0", AMC_DISCOVERY_CACHE_DIR=None):
+                walk_recs = discover_audio_files(self._config(root, out, "path", 4, 0))
+
+            # Fell back to the live walk (correct records) and left the lock alone.
+            self.assertEqual(records_by_id(walk_recs), records_by_id(recs))
+            self.assertTrue(lock.exists())
+            self.assertFalse((key_dir / ".done").exists())
 
     def test_meta_mismatch_falls_back_to_walk(self):
         with TemporaryDirectory() as tmp:

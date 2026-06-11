@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any, Iterator
@@ -27,7 +28,14 @@ _CACHE_ENV = "AMC_DISCOVERY_CACHE"  # "0"/"off" disables; default auto
 _CACHE_DIR_ENV = "AMC_DISCOVERY_CACHE_DIR"  # explicit override
 _CACHE_BUILD_TIMEOUT_SEC = float(os.environ.get("AMC_DISCOVERY_CACHE_TIMEOUT", "7200"))
 _CACHE_POLL_SEC = float(os.environ.get("AMC_DISCOVERY_CACHE_POLL", "5"))
-_CACHE_STALE_SEC = float(os.environ.get("AMC_DISCOVERY_CACHE_STALE", "3600"))
+# A live builder heartbeats its .building lock (bumps mtime) every
+# _CACHE_HEARTBEAT_SEC; a lock whose mtime is older than _CACHE_STALE_SEC is
+# treated as abandoned (builder crashed/killed) and reclaimed. Stale must be a
+# comfortable multiple of heartbeat so a slow-but-alive builder is never stolen.
+# Default 120s (vs the old 3600s): a killed builder used to hang the whole fleet
+# for an hour; now another box rebuilds within ~2 min.
+_CACHE_HEARTBEAT_SEC = float(os.environ.get("AMC_DISCOVERY_CACHE_HEARTBEAT", "30"))
+_CACHE_STALE_SEC = float(os.environ.get("AMC_DISCOVERY_CACHE_STALE", "120"))
 
 
 def discover_audio_files(config: PipelineConfig) -> list[AudioFileRecord]:
@@ -352,14 +360,21 @@ def _ensure_cache(
         except OSError:
             _safe_unlink(lock)
             return None
+        # Keep the lock's mtime fresh while we walk so a long (but alive) build is
+        # never mistaken for stale; the moment this process dies the heartbeat
+        # stops, the mtime freezes, and another box reclaims after _CACHE_STALE_SEC.
+        stop_hb = threading.Event()
+        hb = threading.Thread(target=_heartbeat_lock, args=(lock, stop_hb), daemon=True)
+        hb.start()
         try:
             _build_cache(base, root, exts, hash_mode, num_shards)
         except Exception:
             # Leave no half-written .done; drop the lock so another worker retries.
             _safe_unlink(done)
-            _safe_unlink(lock)
             return None
         finally:
+            stop_hb.set()
+            hb.join(timeout=2)
             _safe_unlink(lock)
         # loop: .done now exists
 
@@ -449,6 +464,21 @@ def _is_stale(lock: Path) -> bool:
         return (time.time() - lock.stat().st_mtime) > _CACHE_STALE_SEC
     except OSError:
         return True
+
+
+def _heartbeat_lock(lock: Path, stop: threading.Event) -> None:
+    """Bump the build lock's mtime every _CACHE_HEARTBEAT_SEC until told to stop.
+
+    Runs in a daemon thread for the lifetime of a build. While the builder is
+    alive the lock never looks stale; if the builder process dies the thread
+    dies with it, the mtime freezes, and waiters reclaim the lock once it ages
+    past _CACHE_STALE_SEC. If the lock vanishes (reclaimed/removed) we stop.
+    """
+    while not stop.wait(_CACHE_HEARTBEAT_SEC):
+        try:
+            os.utime(lock, None)
+        except OSError:
+            return
 
 
 def _safe_unlink(path: Path) -> None:
