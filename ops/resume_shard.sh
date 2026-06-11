@@ -139,7 +139,17 @@ try_claim() {
     write_lease "$i"; echo ok; return 0
   fi
   ep="$(lease_epoch "$i")"
-  if [[ -z "$ep" ]]; then ep=0; fi
+  if [[ -z "$ep" ]]; then
+    # No lease file yet. This happens in the tiny window between another box's
+    # `mkdir lock` (atomic claim) and its write_lease, or if the lease vanished.
+    # Do NOT fall back to ep=0: that makes age ~= now (billions of seconds) > LEASE_TTL,
+    # so EVERY concurrent box "steals" a brand-new claim -> multiple owners run the SAME
+    # shard while high-index shards go unclaimed (observed as 3 boxes on shard 0 after a
+    # simultaneous fleet restart). Use the lock dir's own mtime as the claim time so a
+    # freshly created lock reads as fresh, not stale. A genuinely dead owner is still
+    # reclaimed: its lease file keeps a real (now-old) epoch via the heartbeat.
+    ep="$(stat -c %Y "$lock" 2>/dev/null || stat -f %m "$lock" 2>/dev/null || echo 0)"
+  fi
   age=$(( $(now_epoch) - ep ))
   if (( age > LEASE_TTL )); then
     # Atomically take over a stale lock: only one concurrent rename wins.
