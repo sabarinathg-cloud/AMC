@@ -92,6 +92,14 @@ class WhisperXAligner:
 
     def __init__(self, device: str = "auto"):
         self.device = device
+        # Cache the per-language forced-alignment model+metadata for the lifetime of this
+        # aligner. whisperx.load_align_model() pulls a wav2vec2 model from disk and moves it
+        # onto the GPU; doing that once per segment (~240k/shard) made model loading -- not
+        # alignment -- the dominant cost (observed ~1.3 seg/s, ~40h/shard). The align stage
+        # reuses ONE aligner instance across every segment, so this turns N loads into one
+        # per language. Resolve the device once for the same reason.
+        self._align_cache: dict[str, tuple] = {}
+        self._resolved_device: str | None = None
 
     def preflight(self) -> None:
         if importlib.util.find_spec("whisperx") is None:
@@ -99,14 +107,36 @@ class WhisperXAligner:
         if importlib.util.find_spec("torch") is None:
             raise RuntimeError("Forced alignment backend 'whisperx' requires torch")
 
+    def _device(self) -> str:
+        if self._resolved_device is None:
+            # Inline import: torch/whisperx exist only in the dedicated `align` venv, so a
+            # module-level import would break every other stage that imports this module
+            # (e.g. TokenUniformAligner) from the main venv.
+            import torch  # type: ignore
+
+            if self.device == "auto":
+                self._resolved_device = "cuda" if torch.cuda.is_available() else "cpu"
+            else:
+                self._resolved_device = self.device
+        return self._resolved_device
+
+    def _load_align_model(self, language: str) -> tuple[str, tuple]:
+        device = self._device()
+        key = f"{device}:{str(language or 'en').lower()}"
+        cached = self._align_cache.get(key)
+        if cached is None:
+            import whisperx  # type: ignore  (align-venv-only dependency; see _device)
+
+            cached = whisperx.load_align_model(language_code=language, device=device)
+            self._align_cache[key] = cached
+        return device, cached
+
     def align_segment(self, segment: SegmentRecord, transcript: str, language: str) -> list[AlignmentWord]:
         self.preflight()
-        import torch  # type: ignore
-        import whisperx  # type: ignore
+        import whisperx  # type: ignore  (align-venv-only dependency; see _device)
 
-        device = "cuda" if self.device == "auto" and torch.cuda.is_available() else "cpu" if self.device == "auto" else self.device
+        device, (model, metadata) = self._load_align_model(language)
         audio = whisperx.load_audio(str(segment.segment_audio_path))
-        model, metadata = whisperx.load_align_model(language_code=language, device=device)
         alignment_text, source_to_original = _digit_expanded_alignment_text(transcript, language=language)
         aligned = whisperx.align(
             [{"start": 0.0, "end": segment.duration_sec, "text": alignment_text}],
