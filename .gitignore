@@ -28,3 +28,4 @@ env/
 models/
 data/
 mnt/
+.history/

@@ -193,6 +193,16 @@ class Pipeline:
         skipped = 0
         existing_files: dict[str, dict[str, Any]] = {row["file_id"]: row for row in self.state.iter_files()}
         existing_segment_file_ids: set[str] = {row["file_id"] for row in self.state.iter_segments()}
+        # Reconcile stale failures: a file that is now `preprocessed` but still carries a
+        # failure row (e.g. recorded during an OOM attempt, then succeeded on a later retry)
+        # should not keep inflating the `failures` count. Clear those up front so a resume
+        # also cleans the backlog from before this behavior existed.
+        resolved_failures: list[str] = []
+        for file_id, row in existing_files.items():
+            if row.get("status") == "preprocessed" and file_id in existing_segment_file_ids:
+                resolved_failures.append(f"{file_id}:preprocess")
+                resolved_failures.append(f"{file_id}:inspect")
+        self.state.clear_failures(resolved_failures)
         pending: list[AudioFileRecord] = []
         for record in records:
             if existing_files.get(record.file_id, {}).get("status") == "preprocessed" and record.file_id in existing_segment_file_ids:
@@ -219,6 +229,7 @@ class Pipeline:
                 [(segment.segment_id, record.file_id, "preprocessed", dataclass_to_dict(segment)) for segment in segments]
             )
             self.state.upsert_file({"file_id": record.file_id, "source_path": str(record.source_path), "status": "preprocessed", "payload": file_payload(record)})
+            self.state.clear_failures([f"{record.file_id}:preprocess", f"{record.file_id}:inspect"])
             return len(segments)
 
         if workers <= 1 or len(pending) <= 1:
@@ -276,6 +287,7 @@ class Pipeline:
                             [(segment.segment_id, rec_done.file_id, "preprocessed", dataclass_to_dict(segment)) for segment in segments]
                         )
                         self.state.upsert_file({"file_id": rec_done.file_id, "source_path": str(rec_done.source_path), "status": "preprocessed", "payload": payload})
+                        self.state.clear_failures([f"{rec_done.file_id}:preprocess", f"{rec_done.file_id}:inspect"])
                         all_segments += len(segments)
                     except Exception as exc:
                         errors.append({"file_id": record.file_id, "source_path": str(record.source_path), "error": repr(exc)})
@@ -390,6 +402,7 @@ class Pipeline:
                     if preflight_ok:
                         try:
                             results = adapter.transcribe_batch(chunk)
+                            self.state.clear_failures([f"asr:{adapter.name}", f"asr:{adapter.name}:chunk"])
                         except Exception as exc:
                             tb = traceback.format_exc()
                             failed_models.append({"model": adapter.name, "error": repr(exc), "segments": len(chunk)})
@@ -611,6 +624,7 @@ class Pipeline:
             spans = [_pii_span_from_payload(span) for span in payload.get("spans", [])]
             if not spans:
                 self.state.record_artifact(f"alignment:{segment_id}", "alignment", Path(segment_id), "completed", {"segment_id": segment_id, "words": [], "intervals": []})
+                self.state.clear_failure(f"{segment_id}:alignment")
                 continue
             try:
                 transcript = consensus.get("final_transcript", "")
@@ -643,6 +657,7 @@ class Pipeline:
                     "completed",
                     {"segment_id": segment_id, "words": [dataclass_to_dict(w) for w in words], "intervals": [dataclass_to_dict(i) for i in intervals]},
                 )
+                self.state.clear_failure(f"{segment_id}:alignment")
                 aligned += 1
             except RequiredAlignmentError as exc:
                 failures += 1
@@ -780,6 +795,7 @@ class Pipeline:
                 status,
                 {"file_id": file_id, "path": str(final_path), "preferred_path": str(out_path), "fallback_error": fallback_error, "validation": dataclass_to_dict(result)},
             )
+            self.state.clear_failure(f"{file_id}:redact")
             outputs.append(str(final_path))
 
         if workers <= 1 or len(pending) <= 1:

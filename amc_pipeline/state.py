@@ -6,7 +6,7 @@ import threading
 import time
 from contextlib import closing, contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 
 _FETCH_BATCH_SIZE = 1000
@@ -282,6 +282,19 @@ class SQLiteStateStore:
                 """,
                 (failure_id, scope, scope_id, error, traceback, int(retryable), time.time()),
             )
+
+    def clear_failure(self, failure_id: str) -> None:
+        """Delete a single failure row once its scope has succeeded on retry."""
+        self.clear_failures([failure_id])
+
+    def clear_failures(self, failure_ids: Iterable[str]) -> None:
+        """Delete resolved failure rows so the `failures` count reflects only work
+        that is still broken. No-op for ids that were never recorded as failures."""
+        ids = [fid for fid in failure_ids if fid]
+        if not ids:
+            return
+        with self._conn_ctx() as conn:
+            conn.executemany("delete from failures where failure_id = ?", [(fid,) for fid in ids])
 
     def request_pause(self, run_id: str, worker_id: str | None = None, global_pause: bool = False) -> None:
         with self._conn_ctx() as conn:
@@ -624,6 +637,20 @@ class PostgresStateStore:
                     """,
                     (failure_id, scope, scope_id, error, traceback, int(retryable), time.time()),
                 )
+
+    def clear_failure(self, failure_id: str) -> None:
+        """Delete a single failure row once its scope has succeeded on retry."""
+        self.clear_failures([failure_id])
+
+    def clear_failures(self, failure_ids: Iterable[str]) -> None:
+        """Delete resolved failure rows so the `failures` count reflects only work
+        that is still broken. No-op for ids that were never recorded as failures."""
+        ids = [fid for fid in failure_ids if fid]
+        if not ids:
+            return
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("delete from failures where failure_id = any(%s)", (ids,))
 
     def request_pause(self, run_id: str, worker_id: str | None = None, global_pause: bool = False) -> None:
         with self.connect() as conn:
