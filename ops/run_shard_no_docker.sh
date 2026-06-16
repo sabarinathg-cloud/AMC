@@ -301,7 +301,16 @@ run_stage() {
 for stage in $STAGES; do
   case "$stage" in
     preprocess)
-      run_stage preprocess preprocess --vad-backend silero
+      # Preprocess writes the segment manifests at the end of the stage too. At scale the
+      # per-year duplicates are keyed by the call UUID, so write_per_year opens one writer
+      # (jsonl+csv) per call and exhausts the fd limit -> "[Errno 24] Too many open files"
+      # right at 100%, leaving the stage in an endless running->failed loop. Run lean here
+      # for the same reason the manifest stage does (JSONL/Parquet remain the durable record).
+      if [[ "${AMC_MANIFEST_LEAN:-1}" == "1" ]]; then
+        run_stage preprocess preprocess --vad-backend silero --manifest-no-csv --manifest-no-per-year
+      else
+        run_stage preprocess preprocess --vad-backend silero
+      fi
       ;;
     asr_whisper)
       run_stage asr_whisper asr --models whisper ${ASR_BATCH_ARGS[@]+"${ASR_BATCH_ARGS[@]}"}
