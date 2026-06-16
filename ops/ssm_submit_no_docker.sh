@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# All paths in this script (e.g. /mnt/amc-data/...) are REMOTE Linux paths. On Git Bash /
+# MSYS (Windows) these would be mangled into Windows paths (C:/Program Files/Git/mnt/...)
+# when passed as arguments to a native program like python.exe. Disable that conversion.
+export MSYS_NO_PATHCONV=1
+export MSYS2_ARG_CONV_EXCL='*'
+
 AWS_REGION="${AWS_REGION:-us-east-1}"
 PROJECT_TAG="${PROJECT_TAG:-amc-ec2-fleet}"
 REPO_DIR="${REPO_DIR:-/mnt/amc-data/AMC}"
@@ -12,6 +18,19 @@ SHARED_ROOT="${AMC_SHARED_ROOT:-/mnt/amc-data}"
 AMC_IN="${AMC_IN:?AMC_IN is required (must be on the shared mount, e.g. $SHARED_ROOT/amc-runs/<run>/input)}"
 RUN_ROOT="${RUN_ROOT:-$SHARED_ROOT/amc-runs/run-$(date -u +%Y%m%d-%H%M%S)}"
 PYTHON_BIN="${PYTHON_BIN:-python3.10}"
+# Local Python used ONLY to build the SSM JSON parameters on THIS machine (not the fleet).
+# Prefer python3, fall back to python (e.g. Git Bash on Windows). Override with LOCAL_PYTHON.
+LOCAL_PYTHON="${LOCAL_PYTHON:-}"
+if [[ -z "$LOCAL_PYTHON" ]]; then
+  if command -v python3 >/dev/null 2>&1; then
+    LOCAL_PYTHON="python3"
+  elif command -v python >/dev/null 2>&1; then
+    LOCAL_PYTHON="python"
+  else
+    echo "No local Python found (need python3 or python) to build SSM parameters." >&2
+    exit 2
+  fi
+fi
 STAGES="${STAGES:-preprocess asr_whisper asr_qwen asr_cohere asr_granite normalize consensus pii align mask_plan redact validate manifest}"
 # Optional fleet-wide ASR batch override (from ops/asr_batch_sweep.py). Forwarded to every shard
 # as --asr-batch-sizes. Empty by default -> each model uses its config default.
@@ -49,7 +68,7 @@ fi
 
 NUM_SHARDS="${NUM_SHARDS:-$(wc -w <<< "$IDS" | tr -d ' ')}"
 
-PARAMS="$(python3 - "$IDS" "$NUM_SHARDS" "$REPO_DIR" "$AMC_IN" "$RUN_ROOT" "$PYTHON_BIN" "$STAGES" "$AMC_ASR_BATCH_SIZES" "$AMC_VAD_DEVICE" <<'PY'
+PARAMS="$("$LOCAL_PYTHON" - "$IDS" "$NUM_SHARDS" "$REPO_DIR" "$AMC_IN" "$RUN_ROOT" "$PYTHON_BIN" "$STAGES" "$AMC_ASR_BATCH_SIZES" "$AMC_VAD_DEVICE" <<'PY'
 import json, sys
 ids, num_shards, repo_dir, amc_in, run_root, python_bin, stages, asr_batch, vad_device = sys.argv[1:]
 commands = [
