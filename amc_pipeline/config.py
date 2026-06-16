@@ -113,6 +113,12 @@ class PipelineConfig:
     manifest_write_csv: bool = True
     manifest_write_per_year: bool = True
     manifest_parquet_batch_size: int = 50_000
+    # When set, stages that emit an intermediate manifest at the end of the stage (currently
+    # preprocess) skip that write. Downstream stages read segments from the state DB, not from
+    # the manifest, and the dedicated `manifest` stage regenerates the full manifest at the end
+    # of the run -- so at scale the per-stage manifest is a redundant multi-GB write over Lustre
+    # that can outlast a worker's lease and never finish. The final `manifest` stage ignores this.
+    skip_stage_manifest: bool = False
     report_mode: str = "internal"
     run_id: str = "default"
     progress_enabled: bool = True
@@ -271,7 +277,7 @@ class PipelineConfig:
             current = cfg.pii_models.get(name, PIIModelConfig())
             _merge_dataclass(current, values or {})
             cfg.pii_models[name] = current
-        for key in ["consensus_min_models", "pii_on_all_model_transcripts", "copy_sidecars", "retain_decoded_cache", "preprocess_workers", "redact_workers", "manifest_dataframe_exports", "manifest_xlsx_max_rows", "manifest_write_csv", "manifest_write_per_year", "manifest_parquet_batch_size", "report_mode", "run_id", "progress_enabled"]:
+        for key in ["consensus_min_models", "pii_on_all_model_transcripts", "copy_sidecars", "retain_decoded_cache", "preprocess_workers", "redact_workers", "manifest_dataframe_exports", "manifest_xlsx_max_rows", "manifest_write_csv", "manifest_write_per_year", "manifest_parquet_batch_size", "skip_stage_manifest", "report_mode", "run_id", "progress_enabled"]:
             if key in raw:
                 setattr(cfg, key, raw[key])
         if "languages" in raw:

@@ -310,7 +310,7 @@ class Pipeline:
                 write_per_year=self.config.manifest_write_per_year,
                 parquet_batch_size=self.config.manifest_parquet_batch_size,
             )
-            if segment_count
+            if segment_count and not self.config.skip_stage_manifest
             else []
         )
         summary = {"stage": "preprocess", "files": len(records), "segments": segment_count, "new_segments": all_segments, "skipped_files": skipped, "errors": errors, "manifests": [str(p) for p in manifest_paths]}

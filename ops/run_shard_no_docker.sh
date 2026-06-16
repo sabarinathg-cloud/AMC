@@ -307,7 +307,11 @@ for stage in $STAGES; do
       # right at 100%, leaving the stage in an endless running->failed loop. Run lean here
       # for the same reason the manifest stage does (JSONL/Parquet remain the durable record).
       if [[ "${AMC_MANIFEST_LEAN:-1}" == "1" ]]; then
-        run_stage preprocess preprocess --vad-backend silero --manifest-no-csv --manifest-no-per-year
+        # Skip the intermediate manifest entirely: at scale it is a redundant multi-GB JSONL
+        # write over Lustre that can outlast the worker lease (so it never finishes, churning
+        # forever). Downstream stages read segments from the state DB, and the dedicated
+        # `manifest` stage regenerates the full manifest at the end of the run.
+        run_stage preprocess preprocess --vad-backend silero --skip-stage-manifest
       else
         run_stage preprocess preprocess --vad-backend silero
       fi
