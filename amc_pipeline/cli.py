@@ -42,6 +42,7 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-progress", action="store_true")
     parser.add_argument("--manifest-no-csv", action="store_true", help="Manifest stage: skip the single all_segments.csv (keep JSONL + Parquet). Use at scale.")
     parser.add_argument("--manifest-no-per-year", action="store_true", help="Manifest stage: skip the per-year segments.{jsonl,csv} duplicates. Use at scale.")
+    parser.add_argument("--manifest-no-xlsx", action="store_true", help="Manifest stage: skip the review.xlsx export (keeps JSONL + Parquet). REQUIRED at scale: the xlsx path loads the whole manifest into a pandas DataFrame and builds an openpyxl workbook in RAM, which OOM-kills (rc=137) or hangs the stage at ~100k+ rows.")
     parser.add_argument("--manifest-parquet-batch-size", type=int, default=None, help="Manifest stage: rows per Parquet row group (memory/throughput knob)")
     parser.add_argument("--skip-stage-manifest", action="store_true", help="Skip the intermediate manifest write at the end of a stage (preprocess). Downstream reads the DB and the final manifest stage regenerates it; use at scale to avoid a redundant multi-GB Lustre write.")
 
@@ -81,6 +82,10 @@ def load_cli_config(args: argparse.Namespace) -> PipelineConfig:
         cfg.manifest_write_csv = False
     if getattr(args, "manifest_no_per_year", False):
         cfg.manifest_write_per_year = False
+    if getattr(args, "manifest_no_xlsx", False):
+        # 0 disables the xlsx gate (`0 < total <= max_rows`) while leaving the streamed
+        # Parquet export (gated only on manifest_dataframe_exports) intact.
+        cfg.manifest_xlsx_max_rows = 0
     if getattr(args, "manifest_parquet_batch_size", None) is not None:
         cfg.manifest_parquet_batch_size = args.manifest_parquet_batch_size
     if getattr(args, "skip_stage_manifest", False):

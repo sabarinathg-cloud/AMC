@@ -359,8 +359,12 @@ for stage in $STAGES; do
       # At scale (default) skip the multi-GB single CSV and the per-year duplicates; JSONL stays
       # as the durable record and Parquet as the dataset (ops/merge_shards.sh reads those).
       # Set AMC_MANIFEST_LEAN=0 to restore CSV + per-year for small/manual runs.
+      # --manifest-no-xlsx is critical at scale: the review.xlsx path loads the entire
+      # per-segment manifest into a pandas DataFrame and builds an openpyxl workbook fully
+      # in RAM, which OOM-kills manifest (rc=137) or hangs it for hours at ~120-130k
+      # rows/shard. JSONL (durable) + Parquet (dataset) remain the outputs.
       if [[ "${AMC_MANIFEST_LEAN:-1}" == "1" ]]; then
-        run_stage manifest manifest --manifest-no-csv --manifest-no-per-year
+        run_stage manifest manifest --manifest-no-csv --manifest-no-per-year --manifest-no-xlsx
       else
         run_stage manifest manifest
       fi
