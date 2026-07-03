@@ -168,11 +168,13 @@ def _iter_shard_audio_paths(
     except OSError:
         return
     for entry in entries:
-        try:
-            if not entry.is_dir(follow_symlinks=True):
-                continue
-        except OSError:
-            continue
+        # Hash-filter on the directory NAME first (pure CPU), before touching the
+        # filesystem. On Lustre, readdir returns no d_type, so entry.is_dir() would
+        # stat() every one of the (here ~480k) root entries -- ~7ms each under fleet
+        # MDT contention => ~tens of minutes PER BOX of pure metadata churn before any
+        # real work. By selecting our ~1/N dirs by name hash first we only ever stat
+        # this shard's slice. A non-directory (or unreadable entry) that happens to
+        # hash here is simply skipped when the scandir below raises OSError.
         if _shard_of(entry.name, num_shards) != shard_index:
             continue
         try:
