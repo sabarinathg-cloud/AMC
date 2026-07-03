@@ -40,6 +40,9 @@ def write_segment_manifests(
       * ``all_segments.csv``     -- only if ``write_csv``. A single CSV is multi-GB and slow to
         parse at scale, so it is opt-out (the orchestrator disables it for large runs).
       * ``review.xlsx``          -- if ``enable_dataframe_exports`` and row count <= xlsx_max_rows.
+        Streamed from the jsonl row-by-row via openpyxl write-only mode (constant memory, no
+        pandas), so it never OOMs; skipped entirely on any error since jsonl/parquet are the
+        lossless record. At scale the orchestrator disables it (``--manifest-no-xlsx``).
       * ``<year>/manifests/segments.{jsonl,csv}`` -- only if ``write_per_year``. Per-year
         duplicates of the global data; opt-out at scale (the merge step uses the global files).
 
@@ -78,10 +81,13 @@ def write_segment_manifests(
         writers.abort()
         raise
 
-    # XLSX is only meaningful for small, human-reviewable datasets. Generate it from the durable
-    # jsonl we just wrote (a one-time read of a bounded file) rather than holding a second copy.
+    # XLSX is only a human-review convenience for SMALL datasets; JSONL (durable) and Parquet
+    # (analytics) are the real, lossless outputs. Generate it by STREAMING the jsonl we just
+    # wrote row-by-row into an openpyxl write-only workbook (constant memory), and only when the
+    # row count is within the cap. This can never OOM regardless of dataset size, and if it fails
+    # for any reason it is simply skipped -- the jsonl/parquet already hold every row.
     if enable_dataframe_exports and 0 < writers.total <= xlsx_max_rows:
-        xlsx = _try_write_xlsx(global_dir)
+        xlsx = _write_xlsx_streaming(global_dir, fieldnames)
         if xlsx is not None:
             paths.append(xlsx)
     return paths
@@ -340,20 +346,67 @@ class _ParquetStream:
         _unlink(self.tmp)
 
 
-def _try_write_xlsx(global_dir: Path) -> Path | None:
+# Excel hard limits: 1,048,576 rows/sheet and 32,767 chars/cell. We stay within both.
+_XLSX_MAX_SHEET_ROWS = 1_048_576
+_XLSX_MAX_CELL_CHARS = 32_767
+
+
+def _xlsx_cell(value: Any) -> str | None:
+    """Coerce a value to an Excel-safe cell: string, length-capped, control-chars stripped."""
+    s = _to_cell(value)
+    if s is None:
+        return None
+    if len(s) > _XLSX_MAX_CELL_CHARS:
+        s = s[:_XLSX_MAX_CELL_CHARS]
+    # openpyxl rejects illegal XML control chars; strip them so a stray byte can't abort the write.
+    return "".join(ch for ch in s if ch >= " " or ch in "\t\n\r")
+
+
+def _write_xlsx_streaming(global_dir: Path, fieldnames: list[str]) -> Path | None:
+    """Write review.xlsx by streaming the durable jsonl row-by-row (constant memory).
+
+    Uses openpyxl's write_only workbook, which flushes rows to a temp file as they are
+    appended instead of holding the whole sheet in RAM -- so peak memory is O(1 row), not
+    O(all rows). Any failure (openpyxl missing, bad cell, Excel row cap) is swallowed and the
+    xlsx is skipped: the jsonl + parquet already contain every row, so nothing is ever lost.
+    """
     jsonl = global_dir / "all_segments.jsonl"
     if not jsonl.exists():
         return None
     try:
-        import pandas as pd
+        from openpyxl import Workbook
+    except Exception:
+        # openpyxl not installed -> skip xlsx entirely; jsonl (durable) + parquet remain.
+        return None
 
-        df = pd.read_json(jsonl, lines=True)
-        final = global_dir / "review.xlsx"
-        tmp = _tmp_for(final)
-        df.to_excel(tmp, index=False)
+    final = global_dir / "review.xlsx"
+    tmp = _tmp_for(final)
+    wb = Workbook(write_only=True)
+    ws = wb.create_sheet("segments")
+    try:
+        ws.append(list(fieldnames))  # header
+        written = 1
+        with jsonl.open() as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                if written >= _XLSX_MAX_SHEET_ROWS:
+                    # Would exceed Excel's per-sheet row limit; stop cleanly. The full data is
+                    # in jsonl/parquet -- xlsx is only ever a bounded human-review view.
+                    break
+                row = json.loads(line)
+                ws.append([_xlsx_cell(row.get(name)) for name in fieldnames])
+                written += 1
+        wb.save(str(tmp))
         os.replace(tmp, final)
         return final
-    except Exception:
+    except BaseException:
+        try:
+            wb.close()
+        except Exception:
+            pass
+        _unlink(tmp)
         return None
 
 
