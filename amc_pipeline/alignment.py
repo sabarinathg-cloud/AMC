@@ -40,6 +40,14 @@ class RequiredAlignmentError(RuntimeError):
     pass
 
 
+def _is_degenerate_span(text: str) -> bool:
+    """True for a PII span with no alignable content: empty, whitespace, or
+    punctuation/separator-only (e.g. a lone '-' a neural tokenizer emits inside a number).
+    These are false-positive detections that carry no PII, so they can be safely skipped
+    instead of failing the whole call at alignment time."""
+    return not any(ch.isalnum() for ch in str(text or ""))
+
+
 class TokenUniformAligner:
     """Deterministic test aligner; production configs should use a local forced aligner."""
 
@@ -68,6 +76,23 @@ class TokenUniformAligner:
         for span in spans:
             overlapping = [w for w in words if not (w.end_char <= span.start_char or w.start_char >= span.end_char)]
             if not overlapping:
+                # No aligned word covers this span's characters.
+                if _is_degenerate_span(span.text):
+                    # Junk detection (lone '-'/' '/'.' from a subword tokenizer): not real PII and
+                    # nothing spoken to mask. Skip it -- hides nothing and stops a spurious span
+                    # from dropping the whole call.
+                    continue
+                if words:
+                    # A real span we could not place on a specific word (e.g. transcript/offset
+                    # mismatch). Fail SAFE: mask the entire spoken region so the PII is still
+                    # covered and the call is preserved, instead of dropping the call.
+                    seg_start = min(w.start_sec for w in words)
+                    seg_end = max(w.end_sec for w in words)
+                    start = max(0.0, seg_start - pre_padding_ms / 1000.0)
+                    end = seg_end + post_padding_ms / 1000.0
+                    intervals.append(MaskInterval(channel, start, end, span.source, span.entity_type, span.confidence, span.source))
+                    continue
+                # No aligned words at all for a real span: let the caller decide (uniform fallback).
                 raise RequiredAlignmentError(f"Could not align PII span '{span.text}'")
             start = overlapping[0].start_sec
             end = _conservative_pii_end(span, words, overlapping)

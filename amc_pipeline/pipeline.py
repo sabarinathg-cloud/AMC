@@ -636,8 +636,12 @@ class Pipeline:
                         try:
                             words = aligner.align_segment(segment, transcript, seg_lang)
                             intervals = TokenUniformAligner().spans_to_intervals(spans, transcript, words, channel=segment.channel, pre_padding_ms=self.config.masking.pre_padding_ms, post_padding_ms=self.config.masking.post_padding_ms)
-                        except RequiredAlignmentError:
-                            raise
+                        except RequiredAlignmentError as exc:
+                            # WhisperX produced no usable word alignments for this segment (often
+                            # non-speech/music). Degrade to uniform timing instead of dropping the
+                            # parent call; spans still get masked (fail-safe).
+                            self.state.record_failure(f"{segment_id}:alignment", "segment", segment_id, f"whisperx_fallback_uniform: {exc!r}", retryable=True)
+                            use_uniform = True
                         except Exception as exc:  # forced-alignment model load/runtime failure
                             # Degrade to uniform timing for THIS segment instead of crashing the
                             # stage; spans still get masked and the parent call is not dropped.
