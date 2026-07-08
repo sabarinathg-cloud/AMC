@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import traceback
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -12,7 +13,7 @@ from typing import Any
 from .alignment import RequiredAlignmentError, TokenUniformAligner, TorchaudioCTCAligner, WhisperXAligner
 from .audio import MissingDependencyError, decode_to_wav, encode_from_wav, temp_wav_path
 from .config import PipelineConfig
-from .consensus import build_consensus
+from .consensus import DEFAULT_PRIORITY, build_consensus
 from .discovery import discover_audio_files
 from .inspection import inspect_audio
 from .manifests import write_segment_manifests
@@ -172,6 +173,8 @@ class Pipeline:
             return self.normalize()
         if stage == "consensus":
             return self.consensus()
+        if stage in {"agreement", "model-agreement", "model_agreement"}:
+            return self.model_agreement()
         if stage == "pii":
             return self.pii()
         if stage == "align":
@@ -483,6 +486,42 @@ class Pipeline:
         processed = len(grouped) - skipped
         summary = {"stage": "consensus", "segments": len(grouped), "processed": processed, "skipped_existing": skipped, "strong": strong, "weak": processed - strong}
         self._write_report("consensus_summary.json", summary)
+        return summary
+
+    def model_agreement(self) -> dict[str, Any]:
+        extras = self._manifest_extras()
+        buckets = {"all_4_agree": 0, "three_agree": 0, "two_agree": 0, "all_different": 0}
+        present_hist: Counter = Counter()
+        four_model = 0
+        for ex in extras.values():
+            mp = ex.get("models_present")
+            if isinstance(mp, int):
+                present_hist[mp] += 1
+            label = ex.get("model_agreement")
+            if label in buckets:
+                four_model += 1
+                buckets[label] += 1
+        paths = write_segment_manifests(
+            self.config.output_root,
+            self._iter_segment_records(),
+            extras,
+            enable_dataframe_exports=self.config.manifest_dataframe_exports,
+            xlsx_max_rows=self.config.manifest_xlsx_max_rows,
+            write_csv=self.config.manifest_write_csv,
+            write_per_year=self.config.manifest_write_per_year,
+            parquet_batch_size=self.config.manifest_parquet_batch_size,
+        )
+        summary = {
+            "stage": "model_agreement",
+            "models": list(DEFAULT_PRIORITY),
+            "segments_total": len(extras),
+            "segments_with_4_models": four_model,
+            "agreement_4model": buckets,
+            "usable_models_per_segment": {str(k): present_hist[k] for k in sorted(present_hist)},
+            "match": "exact equality of normalized_transcript; bucket = largest identical cluster",
+            "manifest_paths": [str(p) for p in paths],
+        }
+        self._write_report("model_agreement_summary.json", summary)
         return summary
 
     def pii(self) -> dict[str, Any]:
@@ -911,6 +950,7 @@ class Pipeline:
             extras.setdefault(segment_id, {})
             extras[segment_id][f"{model}_transcript"] = payload.get("transcript", "")
             extras[segment_id][f"{model}_normalized_transcript"] = payload.get("normalized_transcript", "")
+            extras[segment_id][f"{model}_confidence"] = payload.get("confidence", "")
             extras[segment_id][f"{model}_error"] = payload.get("error", "")
             if model == "whisper":
                 extras[segment_id]["language"] = payload.get("language") or extras[segment_id].get("language", "")
@@ -964,7 +1004,35 @@ class Pipeline:
             extras[segment_id]["redacted_audio_path_rel"] = _safe_relative(redacted_path, self.config.output_root)
             extras[segment_id]["redacted_status"] = redacted["status"]
             extras[segment_id]["redacted_fallback_error"] = redacted["payload"].get("fallback_error") or ""
+        for ex in extras.values():
+            _annotate_agreement(ex)
         return extras
+
+
+def _usable_norms(ex):
+    out = []
+    for m in DEFAULT_PRIORITY:
+        if str(ex.get(m + "_error") or "").strip():
+            continue
+        if not str(ex.get(m + "_transcript") or "").strip():
+            continue
+        out.append(str(ex.get(m + "_normalized_transcript") or "").strip())
+    return out
+
+
+def _agreement_label(present, agreeing):
+    if present < len(DEFAULT_PRIORITY):
+        return "incomplete_" + str(present) + "_models"
+    return {4: "all_4_agree", 3: "three_agree", 2: "two_agree"}.get(agreeing, "all_different")
+
+
+def _annotate_agreement(ex: dict[str, Any]) -> None:
+    norms = _usable_norms(ex)
+    present = len(norms)
+    agreeing = max(Counter(norms).values()) if norms else 0
+    ex["model_agreement"] = _agreement_label(present, agreeing)
+    ex["models_present"] = present
+    ex["models_agreeing"] = agreeing
 
 
 def _segment_from_payload(payload: dict[str, Any]) -> SegmentRecord:

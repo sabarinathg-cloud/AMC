@@ -9,7 +9,7 @@ AMC_IN="${AMC_IN:-/mnt/amc-data}"
 RUN_ROOT="${RUN_ROOT:?RUN_ROOT is required, for example /mnt/amc-data/amc-runs/2026-smoke-100}"
 HASH_MODE="${HASH_MODE:-path}"
 NUM_SHARDS="${NUM_SHARDS:-}"
-STAGES="${STAGES:-preprocess asr_whisper asr_qwen asr_cohere asr_granite normalize consensus pii align mask_plan redact validate manifest}"
+STAGES="${STAGES:-preprocess asr_whisper asr_qwen asr_cohere asr_granite normalize consensus pii align mask_plan redact validate manifest agreement}"
 AUTO_PULL="${AUTO_PULL:-1}"
 
 # Optional fleet-wide ASR batch override, e.g. AMC_ASR_BATCH_SIZES="whisper=64,qwen=64,cohere=8,granite=8".
@@ -367,6 +367,16 @@ for stage in $STAGES; do
         run_stage manifest manifest --manifest-no-csv --manifest-no-per-year --manifest-no-xlsx
       else
         run_stage manifest manifest
+      fi
+      ;;
+    agreement)
+      # Final stage: recompute per-segment cross-model agreement and regenerate the comprehensive
+      # manifest parquet (all transcripts + normalized + per-model confidence + metadata + the
+      # model_agreement/models_present/models_agreeing columns), plus model_agreement_summary.json.
+      if [[ "${AMC_MANIFEST_LEAN:-1}" == "1" ]]; then
+        run_stage agreement agreement --manifest-no-csv --manifest-no-per-year --manifest-no-xlsx
+      else
+        run_stage agreement agreement
       fi
       ;;
     *)
