@@ -122,6 +122,29 @@ class PipelineConfig:
     report_mode: str = "internal"
     run_id: str = "default"
     progress_enabled: bool = True
+    # --- Speaker embedding + clustering (speaker_embed / cluster-speakers / speaker_assign) ---
+    # Shared directory where each shard writes its per-(call,channel) centroids (shard-N.npz);
+    # the global cluster-speakers step reads all of them. Set to a path on the shared mount.
+    speaker_embed_root: Path | None = None
+    # Global (call_id, channel) -> speaker_cluster_id mapping produced by cluster-speakers;
+    # speaker_assign joins it back onto every segment. Set to a path on the shared mount.
+    speaker_clusters_path: Path | None = None
+    # Cap segments embedded per (call, channel) side. A robust centroid needs only a handful of
+    # clean segments; capping keeps the embed cost bounded at 21M segments. 0 = embed all.
+    speaker_embed_max_segments: int = 30
+    speaker_embed_batch_size: int = 48
+    speaker_embed_load_workers: int = 8
+    speaker_min_segment_sec: float = 0.80
+    speaker_max_segment_sec: float = 3.0
+    speaker_model_name: str = "M"
+    speaker_train_type: str = "ft_mix"
+    speaker_dataset: str = "vb2+vox2+cnc"
+    # Strict-clustering thresholds (proven defaults from the prototype's STRICT RECLUSTER).
+    speaker_edge_sim_threshold: float = 0.92
+    speaker_component_sim_margin: float = 0.015
+    speaker_cluster_p10_sim_min: float = 0.72
+    speaker_max_call_sides: int = 800
+    speaker_knn_k: int = 50
 
     def __post_init__(self) -> None:
         if not self.asr_models:
@@ -148,6 +171,10 @@ class PipelineConfig:
         if self.input_root is not None:
             self.input_root = Path(self.input_root)
         self.output_root = Path(self.output_root)
+        if self.speaker_embed_root is not None:
+            self.speaker_embed_root = Path(self.speaker_embed_root)
+        if self.speaker_clusters_path is not None:
+            self.speaker_clusters_path = Path(self.speaker_clusters_path)
 
     @property
     def pipeline_dir(self) -> Path:
@@ -277,7 +304,7 @@ class PipelineConfig:
             current = cfg.pii_models.get(name, PIIModelConfig())
             _merge_dataclass(current, values or {})
             cfg.pii_models[name] = current
-        for key in ["consensus_min_models", "pii_on_all_model_transcripts", "copy_sidecars", "retain_decoded_cache", "preprocess_workers", "redact_workers", "manifest_dataframe_exports", "manifest_xlsx_max_rows", "manifest_write_csv", "manifest_write_per_year", "manifest_parquet_batch_size", "skip_stage_manifest", "report_mode", "run_id", "progress_enabled"]:
+        for key in ["consensus_min_models", "pii_on_all_model_transcripts", "copy_sidecars", "retain_decoded_cache", "preprocess_workers", "redact_workers", "manifest_dataframe_exports", "manifest_xlsx_max_rows", "manifest_write_csv", "manifest_write_per_year", "manifest_parquet_batch_size", "skip_stage_manifest", "report_mode", "run_id", "progress_enabled", "speaker_embed_root", "speaker_clusters_path", "speaker_embed_max_segments", "speaker_embed_batch_size", "speaker_embed_load_workers", "speaker_min_segment_sec", "speaker_max_segment_sec", "speaker_model_name", "speaker_train_type", "speaker_dataset", "speaker_edge_sim_threshold", "speaker_component_sim_margin", "speaker_cluster_p10_sim_min", "speaker_max_call_sides", "speaker_knn_k"]:
             if key in raw:
                 setattr(cfg, key, raw[key])
         if "languages" in raw:

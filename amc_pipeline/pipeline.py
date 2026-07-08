@@ -25,6 +25,7 @@ from .preprocessing import preprocess_file
 from .progress import iter_progress
 from .resources import detect_resources
 from .segmentation import preflight_vad_backend
+from .speaker import SpeakerParams, embed_call_channels, load_cluster_map, write_shard_embeddings
 from .state import PostgresStateStore, SQLiteStateStore
 from .transcription import build_enabled_adapters
 from .validation import validate_audio_pair
@@ -175,6 +176,10 @@ class Pipeline:
             return self.consensus()
         if stage in {"agreement", "model-agreement", "model_agreement"}:
             return self.model_agreement()
+        if stage in {"speaker-embed", "speaker_embed"}:
+            return self.speaker_embed()
+        if stage in {"speaker-assign", "speaker_assign"}:
+            return self.speaker_assign()
         if stage == "pii":
             return self.pii()
         if stage == "align":
@@ -522,6 +527,95 @@ class Pipeline:
             "manifest_paths": [str(p) for p in paths],
         }
         self._write_report("model_agreement_summary.json", summary)
+        return summary
+
+    def speaker_embed(self) -> dict[str, Any]:
+        """Per-shard GPU stage: one robust ReDimNet centroid per (call_id, channel).
+
+        Writes ``<speaker_embed_root>/shard-<shard_index>.npz`` on shared storage. The
+        run-once ``cluster-speakers`` step then gathers every shard's centroids to assign
+        globally-consistent speaker ids. Re-running regenerates the shard file from the DB.
+        """
+        embed_root = self.config.speaker_embed_root
+        if embed_root is None:
+            raise RuntimeError("speaker_embed requires --speaker-embed-root (a shared directory).")
+        shard_index = self.config.discovery.shard_index
+        shard_index = 0 if shard_index is None else int(shard_index)
+        params = SpeakerParams.from_config(self.config)
+        data = embed_call_channels(
+            self._iter_segment_records(),
+            params,
+            progress_enabled=self.config.progress_enabled,
+        )
+        out_path = Path(embed_root) / f"shard-{shard_index}.npz"
+        write_shard_embeddings(out_path, data)
+        summary = {
+            "stage": "speaker_embed",
+            "shard_index": shard_index,
+            "call_sides": int(len(data["call_id"])),
+            "embedding_dim": int(data["centroids"].shape[1]) if data["centroids"].size else 0,
+            "max_segments_per_side": params.max_segments_per_side,
+            "model": f"ReDimNet-{params.model_name}/{params.train_type}/{params.dataset}",
+            "output": str(out_path),
+        }
+        self._write_report("speaker_embed_summary.json", summary)
+        return summary
+
+    def speaker_assign(self) -> dict[str, Any]:
+        """Per-shard stage: join the global speaker_cluster_id onto this shard's segments.
+
+        Reads the global mapping written by ``cluster-speakers``, records a per-side
+        ``speaker_cluster`` artifact for every (call_id, channel) in this shard, then
+        regenerates the manifest so ``all_segments.parquet`` gains a ``speaker_cluster_id``
+        column. Sides missing from the global map (e.g. no usable audio) get a deterministic
+        fallback id so every segment is labeled.
+        """
+        clusters_path = self.config.speaker_clusters_path
+        if clusters_path is None:
+            raise RuntimeError("speaker_assign requires --speaker-clusters (the global clusters.parquet).")
+        cluster_map = load_cluster_map(Path(clusters_path))
+        assigned = 0
+        fallback = 0
+        seen: set[tuple[str, str]] = set()
+        for row in self.state.iter_segments():
+            payload = row.get("payload") or {}
+            call_id = str(payload.get("call_id", ""))
+            channel = str(int(payload.get("channel", 0)))
+            key = (call_id, channel)
+            if key in seen:
+                continue
+            seen.add(key)
+            cluster_id = cluster_map.get(key)
+            if cluster_id is None:
+                cluster_id = f"spk_fallback_{call_id}_ch{channel}"
+                fallback += 1
+            else:
+                assigned += 1
+            self.state.record_artifact(
+                f"speaker_cluster:{call_id}:ch{channel}",
+                "speaker_cluster",
+                Path(f"{call_id}/ch{channel}"),
+                "completed",
+                {"call_id": call_id, "channel": channel, "speaker_cluster_id": cluster_id},
+            )
+        paths = write_segment_manifests(
+            self.config.output_root,
+            self._iter_segment_records(),
+            self._manifest_extras(),
+            enable_dataframe_exports=self.config.manifest_dataframe_exports,
+            xlsx_max_rows=self.config.manifest_xlsx_max_rows,
+            write_csv=self.config.manifest_write_csv,
+            write_per_year=self.config.manifest_write_per_year,
+            parquet_batch_size=self.config.manifest_parquet_batch_size,
+        )
+        summary = {
+            "stage": "speaker_assign",
+            "clusters_path": str(clusters_path),
+            "call_sides_assigned": assigned,
+            "call_sides_fallback": fallback,
+            "manifest_paths": [str(p) for p in paths],
+        }
+        self._write_report("speaker_assign_summary.json", summary)
         return summary
 
     def pii(self) -> dict[str, Any]:
@@ -943,6 +1037,12 @@ class Pipeline:
             for artifact in self.state.iter_artifacts("redacted")
             if artifact["payload"].get("file_id")
         }
+        # (call_id, channel) -> speaker_cluster_id, populated by the speaker_assign stage.
+        # Empty when that stage has not run, so the column is simply absent (back-compat).
+        speaker_map: dict[tuple[str, str], str] = {
+            (str(a["payload"].get("call_id", "")), str(a["payload"].get("channel", ""))): a["payload"].get("speaker_cluster_id", "")
+            for a in self.state.iter_artifacts("speaker_cluster")
+        }
         for row in self.state.iter_model_results():
             segment_id = row["segment_id"]
             payload = row["payload"]
@@ -985,7 +1085,11 @@ class Pipeline:
         # map -- the latter was a second full in-memory copy of every segment.
         for row in self.state.iter_segments():
             segment_id = row["segment_id"]
-            file_id = row.get("file_id") or (row.get("payload") or {}).get("file_id")
+            payload = row.get("payload") or {}
+            file_id = row.get("file_id") or payload.get("file_id")
+            if speaker_map:
+                key = (str(payload.get("call_id", "")), str(int(payload.get("channel", 0))))
+                extras.setdefault(segment_id, {})["speaker_cluster_id"] = speaker_map.get(key, "")
             meta = file_metadata.get(file_id)
             if meta:
                 extras.setdefault(segment_id, {})

@@ -38,6 +38,13 @@ spacy>=3.7,<3.8
 # instead, which is uncaught and 404-crashes models like piiranha. Pin to 0.x.
 huggingface_hub>=0.34,<1.0
 
+# Speaker embedding + clustering (speaker_embed / cluster-speakers / speaker_assign).
+# ReDimNet is pulled at runtime from torch.hub (no pip package). faiss-cpu accelerates the
+# global mutual-kNN graph; scikit-learn is the pure-Python fallback when faiss is unavailable.
+# Both ship numpy<2-compatible wheels, so they respect the numpy pin above.
+faiss-cpu>=1.7.4
+scikit-learn>=1.3
+
 # Manifests and review exports
 pandas>=2.2
 pyarrow>=15

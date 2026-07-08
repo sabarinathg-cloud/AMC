@@ -140,6 +140,7 @@ verify() {
   log "verifying MAIN venv ($MAIN_VENV)"
   "$MAIN_VENV/bin/python" - <<'PY' || rc=1
 import torch, torchvision, faster_whisper, transformers, qwen_asr, gliner, spacy, soundfile, huggingface_hub as h
+import faiss, sklearn  # speaker clustering (cluster-speakers)  # noqa: F401
 import amc_pipeline  # noqa: F401
 print("  MAIN ok: torch", torch.__version__, "cuda", torch.cuda.is_available(),
       "tv", torchvision.__version__, "tf", transformers.__version__, "hf", h.__version__)

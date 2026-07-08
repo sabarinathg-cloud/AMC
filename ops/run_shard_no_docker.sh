@@ -379,6 +379,23 @@ for stage in $STAGES; do
         run_stage agreement agreement
       fi
       ;;
+    speaker_embed)
+      # Per-shard GPU stage: embed this shard's segments with ReDimNet and pool one robust
+      # centroid per (call_id, channel), written to the SHARED speaker dir as shard-<N>.npz.
+      # This is Phase A of speaker clustering; the run-once cluster-speakers step (Phase B,
+      # ops/speaker_cluster_once.sh) then assigns globally-consistent ids across all shards.
+      run_stage speaker_embed speaker_embed --speaker-embed-root "$RUN_ROOT/speaker/embed"
+      ;;
+    speaker_assign)
+      # Per-shard stage (Phase C): join the global (call_id, channel) -> speaker_cluster_id
+      # mapping onto every segment and regenerate all_segments.parquet with the new column.
+      # Requires ops/speaker_cluster_once.sh to have produced $RUN_ROOT/speaker/clusters.parquet.
+      if [[ "${AMC_MANIFEST_LEAN:-1}" == "1" ]]; then
+        run_stage speaker_assign speaker_assign --speaker-clusters "$RUN_ROOT/speaker/clusters.parquet" --manifest-no-csv --manifest-no-per-year --manifest-no-xlsx
+      else
+        run_stage speaker_assign speaker_assign --speaker-clusters "$RUN_ROOT/speaker/clusters.parquet"
+      fi
+      ;;
     *)
       echo "Unknown stage key: $stage" >&2
       exit 2

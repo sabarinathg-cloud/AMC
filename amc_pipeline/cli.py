@@ -19,6 +19,12 @@ def build_parser() -> argparse.ArgumentParser:
     stage = sub.add_parser("run-stage")
     _add_common_args(stage)
     stage.add_argument("stage")
+    cluster = sub.add_parser("cluster-speakers")
+    cluster.add_argument("--embed-root", type=Path, required=True, help="Shared directory of per-shard speaker centroids (shard-*.npz)")
+    cluster.add_argument("--out", type=Path, required=True, help="Output path for the global (call_id, channel) -> speaker_cluster_id parquet")
+    cluster.add_argument("--edge-sim-threshold", type=float, default=None)
+    cluster.add_argument("--knn-k", type=int, default=None)
+    cluster.add_argument("--max-call-sides", type=int, default=None)
     pause = sub.add_parser("pause")
     pause.add_argument("--output", type=Path, required=True)
     pause.add_argument("--worker-id", default=None)
@@ -45,6 +51,9 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--manifest-no-xlsx", action="store_true", help="Manifest stage: skip the review.xlsx export (keeps JSONL + Parquet). REQUIRED at scale: the xlsx path loads the whole manifest into a pandas DataFrame and builds an openpyxl workbook in RAM, which OOM-kills (rc=137) or hangs the stage at ~100k+ rows.")
     parser.add_argument("--manifest-parquet-batch-size", type=int, default=None, help="Manifest stage: rows per Parquet row group (memory/throughput knob)")
     parser.add_argument("--skip-stage-manifest", action="store_true", help="Skip the intermediate manifest write at the end of a stage (preprocess). Downstream reads the DB and the final manifest stage regenerates it; use at scale to avoid a redundant multi-GB Lustre write.")
+    parser.add_argument("--speaker-embed-root", type=Path, default=None, help="speaker_embed stage: shared directory to write this shard's per-(call,channel) centroids (shard-N.npz).")
+    parser.add_argument("--speaker-clusters", type=Path, default=None, help="speaker_assign stage: path to the global clusters.parquet from cluster-speakers.")
+    parser.add_argument("--speaker-embed-max-segments", type=int, default=None, help="speaker_embed stage: max segments embedded per (call,channel) side (0 = all).")
 
 
 def load_cli_config(args: argparse.Namespace) -> PipelineConfig:
@@ -90,6 +99,12 @@ def load_cli_config(args: argparse.Namespace) -> PipelineConfig:
         cfg.manifest_parquet_batch_size = args.manifest_parquet_batch_size
     if getattr(args, "skip_stage_manifest", False):
         cfg.skip_stage_manifest = True
+    if getattr(args, "speaker_embed_root", None) is not None:
+        cfg.speaker_embed_root = args.speaker_embed_root
+    if getattr(args, "speaker_clusters", None) is not None:
+        cfg.speaker_clusters_path = args.speaker_clusters
+    if getattr(args, "speaker_embed_max_segments", None) is not None:
+        cfg.speaker_embed_max_segments = args.speaker_embed_max_segments
     return cfg
 
 
@@ -110,6 +125,20 @@ def _apply_asr_batch_sizes(cfg: PipelineConfig, raw: str) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if args.command == "cluster-speakers":
+            # Global, cross-shard step: no per-shard output_root / pipeline needed.
+            from .speaker import SpeakerParams, cluster_global
+
+            params = SpeakerParams()
+            if getattr(args, "edge_sim_threshold", None) is not None:
+                params.edge_sim_threshold = args.edge_sim_threshold
+            if getattr(args, "knn_k", None) is not None:
+                params.knn_k = args.knn_k
+            if getattr(args, "max_call_sides", None) is not None:
+                params.max_call_sides_per_cluster = args.max_call_sides
+            result = cluster_global(args.embed_root, args.out, params)
+            print(json.dumps(result, indent=2, sort_keys=True, default=str))
+            return 0
         cfg = load_cli_config(args)
         pipeline = Pipeline(cfg)
         if args.command == "dry-run":
