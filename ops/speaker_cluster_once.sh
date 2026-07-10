@@ -45,11 +45,14 @@ echo "Clustering on instance: $TARGET"
 echo "Reading centroids from:  $EMBED_ROOT"
 echo "Writing mapping to:      $OUT_PATH"
 
+# SSM AWS-RunShellScript executes the payload under /bin/sh (dash on Ubuntu), which chokes on
+# the bash-style body below. So we base64-encode the script locally and run it under bash
+# remotely -- the two commands we hand SSM are trivially POSIX-safe.
 REMOTE_SCRIPT="$(cat <<REMOTE
 set -e
 MAIN_PY="$VENV_ROOT/main/bin/python"
 [ -x "\$MAIN_PY" ] || MAIN_PY="\$(command -v python3.10 || command -v python3)"
-mkdir -p "$RUN_ROOT/speaker"
+mkdir -p "$RUN_ROOT/speaker" "$RUN_ROOT/logs"
 # Wait for all shard centroids (bounded).
 deadline=\$(( \$(date +%s) + $WAIT_SECS ))
 while :; do
@@ -73,12 +76,17 @@ cd "$REPO_DIR"
 REMOTE
 )"
 
+PARAMS="$(printf '%s' "$REMOTE_SCRIPT" | "${LOCAL_PYTHON:-python3}" -c 'import json,sys,base64
+b64 = base64.b64encode(sys.stdin.buffer.read()).decode()
+cmds = ["set -e", "printf %s " + json.dumps(b64) + " | base64 -d | bash"]
+print(json.dumps({"commands": cmds}))')"
+
 CMD_ID="$(aws ssm send-command \
   --region "$AWS_REGION" \
   --instance-ids "$TARGET" \
   --document-name AWS-RunShellScript \
   --comment "speaker cluster-speakers (global)" \
-  --parameters "commands=[$(printf '%s' "$REMOTE_SCRIPT" | "${LOCAL_PYTHON:-python3}" -c 'import json,sys;print(json.dumps(sys.stdin.read()))')]" \
+  --parameters "$PARAMS" \
   --query 'Command.CommandId' \
   --output text)"
 
