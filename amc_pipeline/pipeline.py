@@ -564,11 +564,13 @@ class Pipeline:
     def speaker_assign(self) -> dict[str, Any]:
         """Per-shard stage: join the global speaker_cluster_id onto this shard's segments.
 
-        Reads the global mapping written by ``cluster-speakers``, records a per-side
-        ``speaker_cluster`` artifact for every (call_id, channel) in this shard, then
-        regenerates the manifest so ``all_segments.parquet`` gains a ``speaker_cluster_id``
-        column. Sides missing from the global map (e.g. no usable audio) get a deterministic
-        fallback id so every segment is labeled.
+        Reads the global mapping written by ``cluster-speakers`` and regenerates the manifest
+        so ``all_segments.parquet`` gains a ``speaker_cluster_id`` column. The join happens in
+        ``_manifest_extras`` (which loads ``clusters.parquet`` directly); sides missing from the
+        global map (e.g. no usable audio) get a deterministic fallback id so every segment is
+        labeled. We intentionally do NOT persist a per-side artifact into SQLite here -- doing so
+        was ~1 insert per (call_id, channel) into FSx-backed SQLite (a write storm of hundreds of
+        thousands of rows per shard) that stalled workers for over an hour.
         """
         clusters_path = self.config.speaker_clusters_path
         if clusters_path is None:
@@ -579,25 +581,14 @@ class Pipeline:
         seen: set[tuple[str, str]] = set()
         for row in self.state.iter_segments():
             payload = row.get("payload") or {}
-            call_id = str(payload.get("call_id", ""))
-            channel = str(int(payload.get("channel", 0)))
-            key = (call_id, channel)
+            key = (str(payload.get("call_id", "")), str(int(payload.get("channel", 0))))
             if key in seen:
                 continue
             seen.add(key)
-            cluster_id = cluster_map.get(key)
-            if cluster_id is None:
-                cluster_id = f"spk_fallback_{call_id}_ch{channel}"
-                fallback += 1
-            else:
+            if cluster_map.get(key) is not None:
                 assigned += 1
-            self.state.record_artifact(
-                f"speaker_cluster:{call_id}:ch{channel}",
-                "speaker_cluster",
-                Path(f"{call_id}/ch{channel}"),
-                "completed",
-                {"call_id": call_id, "channel": channel, "speaker_cluster_id": cluster_id},
-            )
+            else:
+                fallback += 1
         paths = write_segment_manifests(
             self.config.output_root,
             self._iter_segment_records(),
@@ -1037,12 +1028,22 @@ class Pipeline:
             for artifact in self.state.iter_artifacts("redacted")
             if artifact["payload"].get("file_id")
         }
-        # (call_id, channel) -> speaker_cluster_id, populated by the speaker_assign stage.
-        # Empty when that stage has not run, so the column is simply absent (back-compat).
-        speaker_map: dict[tuple[str, str], str] = {
-            (str(a["payload"].get("call_id", "")), str(a["payload"].get("channel", ""))): a["payload"].get("speaker_cluster_id", "")
-            for a in self.state.iter_artifacts("speaker_cluster")
-        }
+        # (call_id, channel) -> speaker_cluster_id. Prefer loading the global mapping produced by
+        # cluster-speakers directly from clusters.parquet -- this avoids the speaker_assign stage
+        # persisting one artifact per side into FSx-backed SQLite (a write storm that stalled
+        # workers). Fall back to per-side artifacts for back-compat if the file isn't configured.
+        # Empty when neither source is available, so the column is simply absent (back-compat).
+        speaker_map: dict[tuple[str, str], str] = {}
+        speaker_clusters_loaded = False
+        speaker_clusters_path = self.config.speaker_clusters_path
+        if speaker_clusters_path and Path(speaker_clusters_path).exists():
+            speaker_map = load_cluster_map(Path(speaker_clusters_path))
+            speaker_clusters_loaded = True
+        else:
+            speaker_map = {
+                (str(a["payload"].get("call_id", "")), str(a["payload"].get("channel", ""))): a["payload"].get("speaker_cluster_id", "")
+                for a in self.state.iter_artifacts("speaker_cluster")
+            }
         for row in self.state.iter_model_results():
             segment_id = row["segment_id"]
             payload = row["payload"]
@@ -1087,9 +1088,14 @@ class Pipeline:
             segment_id = row["segment_id"]
             payload = row.get("payload") or {}
             file_id = row.get("file_id") or payload.get("file_id")
-            if speaker_map:
+            if speaker_map or speaker_clusters_loaded:
                 key = (str(payload.get("call_id", "")), str(int(payload.get("channel", 0))))
-                extras.setdefault(segment_id, {})["speaker_cluster_id"] = speaker_map.get(key, "")
+                cid = speaker_map.get(key, "")
+                if not cid and speaker_clusters_loaded:
+                    # Side had no usable audio to embed -> deterministic per-side fallback id so
+                    # every segment is still labeled and never accidentally grouped with others.
+                    cid = f"spk_fallback_{key[0]}_ch{key[1]}"
+                extras.setdefault(segment_id, {})["speaker_cluster_id"] = cid
             meta = file_metadata.get(file_id)
             if meta:
                 extras.setdefault(segment_id, {})
