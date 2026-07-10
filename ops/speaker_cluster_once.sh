@@ -30,11 +30,14 @@ EXPECT_SHARDS="${NUM_SHARDS:-0}"       # 0 = don't require a specific count
 
 case "$RUN_ROOT" in "$SHARED_ROOT"/*) : ;; *) echo "ERROR: RUN_ROOT must be under $SHARED_ROOT" >&2; exit 2 ;; esac
 
+# NOTE: pick the first Online instance via awk on (InstanceId, PingStatus) rather than a
+# backtick JMESPath filter -- `[?PingStatus==`Online`][0]` proved unreliable across AWS CLI
+# versions (returned multiple ids), and SSM rejects a multi-id --instance-ids scalar.
 TARGET="$(aws ssm describe-instance-information \
   --region "$AWS_REGION" \
   --filters "Key=tag:Project,Values=$PROJECT_TAG" \
-  --query 'sort_by(InstanceInformationList[?PingStatus==`Online`], &InstanceId)[0].InstanceId' \
-  --output text)"
+  --query 'InstanceInformationList[].[InstanceId,PingStatus]' \
+  --output text | awk '$2=="Online"{print $1}' | sort | head -1)"
 if [[ -z "$TARGET" || "$TARGET" == "None" ]]; then
   echo "No online SSM instance found for Project=$PROJECT_TAG" >&2; exit 2
 fi
