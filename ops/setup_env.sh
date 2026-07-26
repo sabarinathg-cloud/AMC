@@ -15,12 +15,19 @@
 #     * Cohere ASR (`asr_cohere`) needs `CohereAsrForConditionalGeneration`, added in
 #       transformers 5.4.0 -- a major-version jump that is incompatible with the 4.57.6
 #       pinned by qwen-asr. So cohere cannot share the main venv either.
+#     * Parakeet TDT (`asr_parakeet`, the Whisper replacement) needs `ParakeetForTDT`,
+#       added in transformers 5.9.0 -- same conflict as cohere.
 #   So we build:
-#     main   -> every stage except align + asr_cohere (transformers 4.57.6, hf 0.36.2,
-#               faster-whisper, gliner, spacy, torch 2.5.1+cu121)
-#     align  -> the align stage only        (whisperx 3.4.2, pyannote 3.4.0,
-#               transformers 4.56.2, hf 0.35.0, torch 2.5.1+cu121)
-#     cohere -> the asr_cohere stage only   (transformers>=5.4.0, torch 2.5.1+cu121)
+#     main     -> every stage except align + asr_cohere + asr_parakeet
+#                 (transformers 4.57.6, hf 0.36.2, faster-whisper, gliner, spacy,
+#                 torch 2.5.1+cu121)
+#     align    -> the align stage only      (whisperx 3.4.2, pyannote 3.4.0,
+#                 transformers 4.56.2, hf 0.35.0, torch 2.5.1+cu121)
+#     cohere   -> the asr_cohere stage only (transformers>=5.4.0, torch 2.5.1+cu121)
+#     parakeet -> the asr_parakeet stage only (transformers>=5.9.0, torch 2.5.1+cu121).
+#                 OPTIONAL/experimental: build and verify failures only warn, so an
+#                 in-evaluation model can never wedge the production stages.
+#                 Skip entirely with AMC_SKIP_PARAKEET=1.
 #
 # WHERE
 #   Both venvs are built ONCE on shared storage ($AMC_VENV_ROOT, default
@@ -49,14 +56,23 @@ SCHEMA_VERSION="v1"   # bump to force a rebuild independent of requirement file 
 MAIN_VENV="$VENV_ROOT/main"
 ALIGN_VENV="$VENV_ROOT/align"
 COHERE_VENV="$VENV_ROOT/cohere"
+PARAKEET_VENV="$VENV_ROOT/parakeet"
 
 log() { echo "[$(date -Is)] setup_env: $*"; }
 die() { log "ERROR: $*"; exit 1; }
+warn() { log "WARN: $*"; }
 
 cd "$REPO_DIR" || die "repo not found at $REPO_DIR"
 [[ -f docker/requirements-gpu.txt ]] || die "docker/requirements-gpu.txt missing"
 [[ -f docker/requirements-align.txt ]] || die "docker/requirements-align.txt missing"
 [[ -f docker/requirements-cohere.txt ]] || die "docker/requirements-cohere.txt missing"
+
+# The parakeet venv (Whisper replacement, still under evaluation) is treated as
+# OPTIONAL: a failure to build or verify it must never block the three venvs the
+# production pipeline depends on. Set AMC_SKIP_PARAKEET=1 to leave it out entirely.
+PARAKEET_ENABLED=1
+[[ "${AMC_SKIP_PARAKEET:-0}" == "1" ]] && PARAKEET_ENABLED=0
+[[ -f docker/requirements-parakeet.txt ]] || PARAKEET_ENABLED=0
 
 # Per-venv signatures: rebuild a venv only when ITS pin set (or this script's schema)
 # changes, so editing the align requirements does not force a main rebuild and vice versa.
@@ -64,11 +80,13 @@ sig_of() { cat "$@" 2>/dev/null | sha256sum | awk -v s="$SCHEMA_VERSION" '{print
 MAIN_SIG="$(sig_of docker/requirements-gpu.txt docker/constraints-gpu.txt pyproject.toml)"
 ALIGN_SIG="$(sig_of docker/requirements-align.txt pyproject.toml)"
 COHERE_SIG="$(sig_of docker/requirements-cohere.txt pyproject.toml)"
+PARAKEET_SIG="$(sig_of docker/requirements-parakeet.txt pyproject.toml)"
 
 venv_sig() {  # $1=venv dir -> expected signature
   case "$1" in
     "$ALIGN_VENV") printf '%s' "$ALIGN_SIG" ;;
     "$COHERE_VENV") printf '%s' "$COHERE_SIG" ;;
+    "$PARAKEET_VENV") printf '%s' "$PARAKEET_SIG" ;;
     *) printf '%s' "$MAIN_SIG" ;;
   esac
 }
@@ -135,6 +153,25 @@ build_cohere() {
   log "COHERE venv ready"
 }
 
+# Optional/experimental: never `die`, so a parakeet build failure cannot wedge a
+# fleet whose production stages only need main/align/cohere.
+build_parakeet() {
+  log "building PARAKEET venv at $PARAKEET_VENV"
+  rm -rf "$PARAKEET_VENV"
+  "$PYTHON_BIN" -m venv "$PARAKEET_VENV" || { warn "venv create failed (parakeet)"; return 1; }
+  local pip="$PARAKEET_VENV/bin/python -m pip"
+  $pip install --upgrade pip wheel setuptools || { warn "pip upgrade (parakeet)"; return 1; }
+  $pip install --index-url "$TORCH_INDEX" torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
+    || { warn "torch install (parakeet)"; return 1; }
+  # Install the editable package WITHOUT the qwen extra so the transformers 4.57.6
+  # pin does not leak in; requirements-parakeet.txt needs >=5.9.0 for ParakeetForTDT.
+  $pip install -r docker/requirements-parakeet.txt -e "." || { warn "requirements/editable install (parakeet)"; return 1; }
+  # Match the cuDNN 9 ABI of the torch 2.5.1+cu121 wheel (same pin as the other venvs).
+  $pip install --force-reinstall --no-deps nvidia-cudnn-cu12==9.1.0.70 || { warn "cudnn pin (parakeet)"; return 1; }
+  echo "$PARAKEET_SIG" > "$PARAKEET_VENV/.ready"
+  log "PARAKEET venv ready"
+}
+
 verify() {
   local rc=0
   log "verifying MAIN venv ($MAIN_VENV)"
@@ -167,6 +204,24 @@ print("  COHERE ok: torch", torch.__version__, "cuda", torch.cuda.is_available()
       "tf", transformers.__version__)
 assert torch.cuda.is_available(), "CUDA not available in COHERE venv"
 PY
+  if (( PARAKEET_ENABLED == 1 )) && [[ -x "$PARAKEET_VENV/bin/python" ]]; then
+    log "verifying PARAKEET venv ($PARAKEET_VENV)"
+    # Soft: a broken experimental venv must not fail the whole verification.
+    "$PARAKEET_VENV/bin/python" - <<'PY' || warn "PARAKEET venv verification failed (asr_parakeet stage unavailable)"
+import torch, transformers
+# Same torch 2.5.1 / transformers 5.x FP8 dtype gap the cohere venv hits above.
+from amc_pipeline.transcription import _ensure_torch_fp8_dtype_shim
+_ensure_torch_fp8_dtype_shim(torch)
+# Resolve the concrete model class, not just AutoModelForTDT: transformers exposes
+# its API lazily, so the Auto alias imports cleanly on a venv where the real
+# Parakeet modeling module cannot load.
+from transformers import ParakeetForTDT  # noqa: F401  (the whole point; needs transformers>=5.9.0)
+import amc_pipeline  # noqa: F401
+print("  PARAKEET ok: torch", torch.__version__, "cuda", torch.cuda.is_available(),
+      "tf", transformers.__version__)
+assert torch.cuda.is_available(), "CUDA not available in PARAKEET venv"
+PY
+  fi
   return "$rc"
 }
 
@@ -200,7 +255,8 @@ release_lock() {
 }
 trap 'release_lock' EXIT INT TERM
 
-both_ready() { venv_ready "$MAIN_VENV" && venv_ready "$ALIGN_VENV" && venv_ready "$COHERE_VENV"; }
+parakeet_ready() { (( PARAKEET_ENABLED == 0 )) || venv_ready "$PARAKEET_VENV"; }
+both_ready() { venv_ready "$MAIN_VENV" && venv_ready "$ALIGN_VENV" && venv_ready "$COHERE_VENV" && parakeet_ready; }
 
 am_builder=0
 deadline=$(( $(date +%s) + LOCK_WAIT ))
@@ -231,14 +287,19 @@ done
 if (( am_builder == 1 )); then
   if [[ "${FORCE_REBUILD:-0}" == "1" ]]; then
     log "FORCE_REBUILD=1: clearing markers and rebuilding all venvs"
-    rm -f "$MAIN_VENV/.ready" "$ALIGN_VENV/.ready" "$COHERE_VENV/.ready" 2>/dev/null || true
+    rm -f "$MAIN_VENV/.ready" "$ALIGN_VENV/.ready" "$COHERE_VENV/.ready" "$PARAKEET_VENV/.ready" 2>/dev/null || true
     build_main
     build_align
     build_cohere
+    (( PARAKEET_ENABLED == 1 )) && { build_parakeet || warn "parakeet venv build failed; continuing"; }
   else
     if venv_ready "$MAIN_VENV"; then log "MAIN venv up-to-date (sig $MAIN_SIG); skipping"; else build_main; fi
     if venv_ready "$ALIGN_VENV"; then log "ALIGN venv up-to-date (sig $ALIGN_SIG); skipping"; else build_align; fi
     if venv_ready "$COHERE_VENV"; then log "COHERE venv up-to-date (sig $COHERE_SIG); skipping"; else build_cohere; fi
+    if (( PARAKEET_ENABLED == 1 )); then
+      if venv_ready "$PARAKEET_VENV"; then log "PARAKEET venv up-to-date (sig $PARAKEET_SIG); skipping"
+      else build_parakeet || warn "parakeet venv build failed; continuing"; fi
+    fi
   fi
   release_lock   # let waiters proceed to verify in parallel
 fi

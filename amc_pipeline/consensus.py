@@ -6,7 +6,19 @@ from .models import ASRResult, ConsensusResult
 from .normalization import normalize_transcript
 
 
-DEFAULT_PRIORITY = ["whisper", "qwen", "cohere", "granite"]
+# Tie-break order for `weak_best_available`. Only consulted among models that
+# actually returned a transcript, so listing every known model here (including
+# both whisper and its parakeet replacement) leaves the relative order of an
+# existing whisper run unchanged.
+DEFAULT_PRIORITY = ["parakeet", "whisper", "qwen", "cohere", "granite"]
+
+# The voting panel: the models whose pairwise agreement defines `model_agreement`.
+# Deliberately SEPARATE from DEFAULT_PRIORITY -- the agreement label compares the
+# number of models present against the panel size, so folding a new name into the
+# tie-break order would otherwise relabel every `all_4_agree` segment in an
+# existing run as `incomplete_4_models`. A run overrides this with its own set of
+# enabled ASR models; this is only the fallback.
+DEFAULT_AGREEMENT_MODELS = ["whisper", "qwen", "cohere", "granite"]
 
 
 def build_consensus(results: list[ASRResult], min_successful_models: int = 3, priority: list[str] | None = None) -> ConsensusResult:

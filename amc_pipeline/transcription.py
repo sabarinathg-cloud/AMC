@@ -29,6 +29,9 @@ _DEFAULT_BATCH_LIMITS: dict[str, tuple[int, float]] = {
     "qwen": (8, 240.0),
     "cohere": (4, 160.0),
     "granite": (4, 160.0),
+    # Parakeet is 0.6B and pads only to the longest clip in the batch, so it
+    # tolerates far larger batches than the seq2seq models at a fraction of VRAM.
+    "parakeet": (128, 1024.0),
 }
 # How many upcoming batches to load on a background thread while the GPU runs.
 _PREFETCH_DEPTH = 2
@@ -41,6 +44,13 @@ _PREFETCH_DEPTH = 2
 # transcribe per pack, then map the timestamped output back to each segment.
 _WHISPER_PACK_WINDOW_SEC = 28.0
 _WHISPER_PACK_GAP_SEC = 0.6
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
 
 
 class ASRAdapter:
@@ -107,6 +117,11 @@ class WhisperAdapter(ASRAdapter):
         # timestamps map back cleanly -- transcripts match the per-segment path.
         # Off by default until the parity check confirms WER on the fleet.
         self.fullfile = os.environ.get("AMC_WHISPER_FULLFILE_BATCH", "0") == "1"
+        # beam_size=5 is the WER-safe default. Greedy (1) is roughly 2-3x faster
+        # per clip; on tight VAD segments the beam rarely changes the 1-best, so
+        # AMC_WHISPER_BEAM_SIZE=1 is the cheapest throughput lever -- gate it on
+        # the parity benchmark (ops/asr_model_bench.py) before adopting it.
+        self.beam_size = max(1, _env_int("AMC_WHISPER_BEAM_SIZE", 5))
         self._model = None
         self._internal_batch_size = 0
 
@@ -225,7 +240,7 @@ class WhisperAdapter(ASRAdapter):
         out, info = model.transcribe(
             audio,
             language=None,
-            beam_size=5,
+            beam_size=self.beam_size,
             batch_size=self._internal_batch_size,
             vad_filter=True,
             vad_parameters={
@@ -285,7 +300,7 @@ class WhisperAdapter(ASRAdapter):
             out, info = model.transcribe(
                 str(segment.segment_audio_path),
                 language=None,
-                beam_size=5,
+                beam_size=self.beam_size,
                 batch_size=self._internal_batch_size,
                 # The clip is already a tight VAD segment, so a second Silero pass
                 # is pure overhead and can clip leading/trailing phonemes (#1).
@@ -380,7 +395,7 @@ class WhisperAdapter(ASRAdapter):
         out, info = model.transcribe(
             audio,
             language=None,
-            beam_size=5,
+            beam_size=self.beam_size,
             batch_size=self._internal_batch_size,
             # Real silences separate the segments, so VAD re-splits the call into
             # its original speech regions; speech_pad keeps phonemes intact.
@@ -436,6 +451,150 @@ class WhisperAdapter(ASRAdapter):
                 lang_prob,
                 raw={"duration_after_vad": dur_after_vad},
             )
+
+
+class ParakeetAdapter(ASRAdapter):
+    """NVIDIA Parakeet TDT (FastConformer + Token-and-Duration Transducer).
+
+    The Whisper replacement. Whisper's encoder always consumes a fixed 30s mel
+    window, so on our ~4s VAD clips the large majority of its compute goes into
+    padding silence. FastConformer consumes the true clip length and pads only to
+    the longest clip in the batch, which is where the order-of-magnitude speedup
+    on this workload comes from -- at equal or better WER.
+
+    Runs on stock `transformers` (ParakeetForTDT landed in 5.9.0), so no NeMo
+    dependency. That transformers floor is above the main venv's qwen-pinned
+    4.57.6, so this adapter lives in its own venv exactly like cohere/align;
+    see ops/setup_env.sh.
+    """
+
+    name = "parakeet"
+
+    def __init__(self, cfg: ASRModelConfig):
+        self.model_path = Path(cfg.path or "")
+        self.batch_size = max(1, int(cfg.batch_size or 64))
+        self.device = cfg.device
+        self.dtype_name = cfg.dtype
+        self.attn_implementation = cfg.attn_implementation
+        self.prefetch = bool(cfg.prefetch)
+        self.cap, self.audio_budget = _resolve_batch_limits(cfg, self.name)
+        self._processor = None
+        self._model = None
+        self._torch = None
+
+    def preflight(self) -> None:
+        _require_path(self.model_path, self.name)
+        _require_import("torch", self.name)
+        _require_import("transformers", self.name)
+        _require_parakeet_support()
+
+    def _load(self):
+        if self._model is None:
+            _configure_quiet_transformers()
+            import torch  # type: ignore
+
+            # Must precede the transformers import: 5.x resolves FP8 MX dtypes at
+            # import time and this venv is on the shared torch 2.5.1 pin, same as
+            # the cohere adapter below.
+            _ensure_torch_fp8_dtype_shim(torch)
+            from transformers import AutoModelForTDT, AutoProcessor  # type: ignore
+
+            _configure_torch_for_inference(torch)
+            _clear_cuda(torch)
+            self._torch = torch
+            self._processor = AutoProcessor.from_pretrained(str(self.model_path), local_files_only=True)
+            # bf16 is NVIDIA's reference inference precision for this checkpoint and
+            # is what the published WER was measured at, so it is the default here
+            # rather than an opt-in. Override with the model's `dtype` config field.
+            default_dtype = torch.bfloat16 if _wants_cuda(self.device, torch) else torch.float32
+            self._model = _load_model_with_attn(
+                AutoModelForTDT,
+                str(self.model_path),
+                attn_implementation=self.attn_implementation,
+                device_map=_resolve_device_map(self.device, torch),
+                torch_dtype=_resolve_dtype(self.dtype_name, torch, default_dtype),
+                local_files_only=True,
+            )
+            self._model.eval()
+        return self._processor, self._model, self._torch
+
+    def transcribe_batch(self, segments: list[SegmentRecord]) -> list[ASRResult]:
+        self._load()
+        by_id: dict[str, ASRResult] = {}
+        # Parakeet v3 detects language itself, so unlike the seq2seq adapters there
+        # is no per-language grouping. Sorting by duration keeps intra-batch padding
+        # minimal, which is a direct speed win when the batch pads to the longest clip.
+        ordered = sorted(segments, key=lambda s: (s.duration_sec, s.segment_id))
+        chunks = list(_dynamic_batches(ordered, self.audio_budget, self.cap))
+
+        def _load_audios(chunk: list[SegmentRecord]) -> list[list[float]]:
+            with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as pool:
+                return list(pool.map(lambda s: _load_cohere_audio(s.segment_audio_path), chunk))
+
+        produced = _prefetch_batches(chunks, _load_audios, enabled=self.prefetch)
+        for chunk, audios, load_error in iter_progress(
+            produced, desc="Parakeet ASR", total=len(chunks), unit="batch", enabled=self.progress_enabled
+        ):
+            if load_error is not None:
+                texts, errors = self._transcribe_segments_individually(chunk)
+            else:
+                texts, errors = self._transcribe_loaded(audios)
+            for segment, text, error in zip(chunk, texts, errors):
+                by_id[segment.segment_id] = ASRResult(
+                    segment.segment_id,
+                    self.name,
+                    text,
+                    0.0,
+                    _language_code(segment.language),
+                    error=error,
+                )
+        return [by_id.get(s.segment_id, ASRResult(s.segment_id, self.name, "", 0.0, error="NOT_RUN")) for s in segments]
+
+    def _transcribe_segments_individually(self, chunk: list[SegmentRecord]) -> tuple[list[str], list[str | None]]:
+        """Slow path used only when the prefetch loader raised for a whole batch."""
+        texts: list[str] = []
+        errors: list[str | None] = []
+        for segment in chunk:
+            try:
+                audio = _load_cohere_audio(segment.segment_audio_path)
+            except Exception as exc:
+                texts.append("")
+                errors.append(repr(exc))
+                continue
+            batch_texts, batch_errors = self._transcribe_loaded([audio])
+            texts.append(batch_texts[0])
+            errors.append(batch_errors[0])
+        return texts, errors
+
+    def _transcribe_loaded(self, audios: list[list[float]]) -> tuple[list[str], list[str | None]]:
+        torch = self._torch
+        assert torch is not None
+        try:
+            return self._generate(audios)
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            if len(audios) > 1:
+                return _split_and_join(self._transcribe_loaded, audios)
+            return [""], ["CUDA_OUT_OF_MEMORY"]
+        except Exception as exc:
+            if len(audios) > 1:
+                return _split_and_join(self._transcribe_loaded, audios)
+            return [""], [repr(exc)]
+
+    def _generate(self, audios: list[list[float]]) -> tuple[list[str], list[str | None]]:
+        processor, model, torch = self._load()
+        np = _optional_import("numpy")
+        arrays: Any = [np.asarray(a, dtype=np.float32) for a in audios] if np is not None else audios
+        sample_rate = int(getattr(processor.feature_extractor, "sampling_rate", 16000) or 16000)
+        inputs = processor(arrays, sampling_rate=sample_rate, return_tensors="pt")
+        inputs = inputs.to(model.device, dtype=model.dtype)
+        with torch.inference_mode():
+            predicted_ids = model.generate(**inputs)
+        decoded = processor.batch_decode(predicted_ids, skip_special_tokens=True)
+        texts = [str(t).strip() for t in decoded]
+        if len(texts) != len(audios):
+            raise RuntimeError(f"parakeet returned {len(texts)} transcripts for {len(audios)} inputs")
+        return texts, [None] * len(texts)
 
 
 class QwenAdapter(ASRAdapter):
@@ -881,6 +1040,8 @@ def _build_single_adapter(name: str, model_cfg: ASRModelConfig) -> ASRAdapter:
         return CohereAdapter(model_cfg)
     if name == "granite":
         return GraniteAdapter(model_cfg)
+    if name == "parakeet":
+        return ParakeetAdapter(model_cfg)
     raise ValueError(f"Unsupported ASR model: {name}")
 
 
@@ -890,7 +1051,7 @@ def build_enabled_adapters(config: PipelineConfig) -> list[ASRAdapter]:
         if not model_cfg.enabled:
             continue
         # Optional, config-gated multi-GPU data parallelism for the seq2seq models.
-        if getattr(model_cfg, "data_parallel", False) and name in ("qwen", "cohere", "granite"):
+        if getattr(model_cfg, "data_parallel", False) and name in ("qwen", "cohere", "granite", "parakeet"):
             gpu_count = _visible_gpu_count()
             if gpu_count > 1:
                 children = [
@@ -940,6 +1101,34 @@ def _require_qwen_runtime_versions() -> None:
             f"python3 -m pip install --force-reinstall 'qwen-asr==0.0.6' "
             f"'transformers=={QWEN_REQUIRED_TRANSFORMERS}' 'accelerate==1.12.0'"
         )
+
+
+def _require_parakeet_support() -> None:
+    """Fail fast when transformers predates ParakeetForTDT (added in 5.9.0).
+
+    The main venv is pinned to 4.57.6 by qwen, so hitting this almost always means
+    the asr_parakeet stage fell back to the main venv instead of its own.
+
+    This resolves the concrete `ParakeetForTDT` class rather than checking
+    `hasattr(transformers, ...)`. transformers exposes its public API lazily, so
+    the attribute is present on the module long before anything confirms the
+    class can actually be constructed -- a hasattr check passes on a venv whose
+    torch is too old and defers the failure to mid-run model load.
+    """
+    import torch  # type: ignore
+    import transformers  # type: ignore
+
+    _ensure_torch_fp8_dtype_shim(torch)
+    try:
+        from transformers import ParakeetForTDT  # noqa: F401
+    except Exception as exc:
+        raise RuntimeError(
+            "parakeet requires transformers>=5.9.0 with a compatible torch; importing "
+            f"ParakeetForTDT failed under transformers=={_package_version('transformers')}, "
+            f"torch=={getattr(torch, '__version__', '?')} ({type(exc).__name__}: {exc}). "
+            "The asr_parakeet stage must run in the dedicated parakeet venv -- see "
+            "ops/setup_env.sh."
+        ) from exc
 
 
 def _package_version(distribution: str) -> str:

@@ -41,11 +41,17 @@ COHERE_PY="$VENV_ROOT/cohere/bin/python"
 # will simply error per-segment (ImportError) and the run degrades to a 3-model consensus,
 # exactly the prior behavior, instead of failing the stage.
 [[ -x "$COHERE_PY" ]] || COHERE_PY="$MAIN_PY"
+# Parakeet TDT needs transformers>=5.9.0 (ParakeetForTDT), same conflict as cohere, so it
+# also gets its own venv. Falling back to MAIN_PY here fails preflight with an explicit
+# "must run in the dedicated parakeet venv" message rather than silently transcribing nothing.
+PARAKEET_PY="$VENV_ROOT/parakeet/bin/python"
+[[ -x "$PARAKEET_PY" ]] || PARAKEET_PY="$MAIN_PY"
 
 stage_python() {  # $1 = run_stage key
   case "$1" in
     align) printf '%s' "$ALIGN_PY" ;;
     asr_cohere) printf '%s' "$COHERE_PY" ;;
+    asr_parakeet) printf '%s' "$PARAKEET_PY" ;;
     *) printf '%s' "$MAIN_PY" ;;
   esac
 }
@@ -318,6 +324,13 @@ for stage in $STAGES; do
       ;;
     asr_whisper)
       run_stage asr_whisper asr --models whisper ${ASR_BATCH_ARGS[@]+"${ASR_BATCH_ARGS[@]}"}
+      ;;
+    asr_parakeet)
+      # Whisper replacement (FastConformer-TDT). Dynamic batching (config defaults:
+      # count cap 128, ~1024s budget) -- it pads only to the longest clip in the batch
+      # instead of Whisper's fixed 30s window, so it tolerates far larger batches.
+      # Requires the parakeet venv; see ops/setup_env.sh.
+      run_stage asr_parakeet asr --models parakeet ${ASR_BATCH_ARGS[@]+"${ASR_BATCH_ARGS[@]}"}
       ;;
     asr_qwen)
       # Dynamic duration-budgeted batching (config defaults: count cap 8, ~240s budget).

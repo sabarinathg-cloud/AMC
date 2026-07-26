@@ -13,7 +13,7 @@ from typing import Any
 from .alignment import RequiredAlignmentError, TokenUniformAligner, TorchaudioCTCAligner, WhisperXAligner
 from .audio import MissingDependencyError, decode_to_wav, encode_from_wav, temp_wav_path
 from .config import PipelineConfig
-from .consensus import DEFAULT_PRIORITY, build_consensus
+from .consensus import DEFAULT_AGREEMENT_MODELS, DEFAULT_PRIORITY, build_consensus
 from .discovery import discover_audio_files
 from .inspection import inspect_audio
 from .manifests import write_segment_manifests
@@ -518,7 +518,7 @@ class Pipeline:
         )
         summary = {
             "stage": "model_agreement",
-            "models": list(DEFAULT_PRIORITY),
+            "models": self._agreement_panel(),
             "segments_total": len(extras),
             "segments_with_4_models": four_model,
             "agreement_4model": buckets,
@@ -1114,14 +1114,26 @@ class Pipeline:
             extras[segment_id]["redacted_audio_path_rel"] = _safe_relative(redacted_path, self.config.output_root)
             extras[segment_id]["redacted_status"] = redacted["status"]
             extras[segment_id]["redacted_fallback_error"] = redacted["payload"].get("fallback_error") or ""
+        panel = self._agreement_panel()
         for ex in extras.values():
-            _annotate_agreement(ex)
+            _annotate_agreement(ex, panel)
         return extras
 
+    def _agreement_panel(self) -> list[str]:
+        """The ASR models this run votes with, in tie-break order.
 
-def _usable_norms(ex):
+        Derived from the run's own enabled models so that swapping one model for
+        another (whisper -> parakeet) keeps the panel at four and the
+        `all_4_agree` / `incomplete_N_models` labels directly comparable across runs.
+        """
+        enabled = {name for name, cfg in (self.config.asr_models or {}).items() if cfg.enabled}
+        panel = [m for m in DEFAULT_PRIORITY if m in enabled]
+        return panel or list(DEFAULT_AGREEMENT_MODELS)
+
+
+def _usable_norms(ex, panel: list[str]):
     out = []
-    for m in DEFAULT_PRIORITY:
+    for m in panel:
         if str(ex.get(m + "_error") or "").strip():
             continue
         if not str(ex.get(m + "_transcript") or "").strip():
@@ -1130,17 +1142,17 @@ def _usable_norms(ex):
     return out
 
 
-def _agreement_label(present, agreeing):
-    if present < len(DEFAULT_PRIORITY):
+def _agreement_label(present, agreeing, panel_size: int):
+    if present < panel_size:
         return "incomplete_" + str(present) + "_models"
     return {4: "all_4_agree", 3: "three_agree", 2: "two_agree"}.get(agreeing, "all_different")
 
 
-def _annotate_agreement(ex: dict[str, Any]) -> None:
-    norms = _usable_norms(ex)
+def _annotate_agreement(ex: dict[str, Any], panel: list[str]) -> None:
+    norms = _usable_norms(ex, panel)
     present = len(norms)
     agreeing = max(Counter(norms).values()) if norms else 0
-    ex["model_agreement"] = _agreement_label(present, agreeing)
+    ex["model_agreement"] = _agreement_label(present, agreeing, len(panel))
     ex["models_present"] = present
     ex["models_agreeing"] = agreeing
 

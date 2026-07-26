@@ -156,6 +156,10 @@ class PipelineConfig:
                 "qwen": ASRModelConfig(True, str(DEFAULT_MODEL_ROOT / "qwen3-asr-1.7b"), 128),
                 "cohere": ASRModelConfig(True, str(DEFAULT_MODEL_ROOT / "cohere-transcribe-03-2026"), 128),
                 "granite": ASRModelConfig(True, str(DEFAULT_MODEL_ROOT / "granite-4.0-1b-speech"), 128),
+                # Whisper replacement: FastConformer-TDT decodes the true clip length
+                # instead of Whisper's fixed 30s window. Disabled until the parity
+                # benchmark (ops/asr_model_bench.py) clears it on our own audio.
+                "parakeet": ASRModelConfig(False, str(DEFAULT_MODEL_ROOT / "parakeet-tdt-0.6b-v3"), 128),
             }
         if not self.pii_models:
             self.pii_models = {

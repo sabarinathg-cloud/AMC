@@ -1,0 +1,36 @@
+# ===========================================================================
+# "parakeet" environment requirements (the `asr_parakeet` stage only).
+#
+# Why isolated: Parakeet TDT is exposed as `ParakeetForTDT`/`AutoModelForTDT`,
+# which landed in transformers 5.9.0. The main venv is hard-pinned to
+# transformers==4.57.6 by qwen-asr, so parakeet cannot share it -- it gets its
+# own venv, exactly like cohere and align. With this venv absent the
+# asr_parakeet stage falls back to the main venv and preflight fails with a
+# clear message (see _require_parakeet_support) rather than silently producing
+# empty transcripts.
+#
+# Why NOT nemo_toolkit: NVIDIA's reference runtime works, but it drags
+# pytorch-lightning/hydra/omegaconf and wants to move torch. Stock transformers
+# runs the same weights, so this venv stays close in shape to the cohere one.
+#
+# torch/torchaudio/torchvision (cu121) and nvidia-cudnn are installed
+# separately by ops/setup_env.sh, not from this file.
+# ===========================================================================
+
+# ParakeetForTDT + AutoModelForTDT + ParakeetProcessor landed in 5.9.0.
+transformers>=5.9.0
+
+# device_map model load.
+accelerate>=1.0.0
+
+# Tokenizer dependencies (unified SentencePiece vocab across the 25 languages).
+sentencepiece>=0.2.0
+protobuf>=4.25
+
+# Audio IO used by the adapter (_load_cohere_audio -> _load_mono_samples).
+librosa>=0.10.2
+soundfile>=0.12.1
+
+# NOTE: do NOT pin numpy<2 here. The NumPy 1.x ABI is only required by the main
+# venv (spaCy/thinc, ctranslate2, onnxruntime/gliner). transformers 5.x + librosa
+# run on numpy>=2; let the resolver choose (it lands on 2.x).
