@@ -9,7 +9,7 @@ AMC_IN="${AMC_IN:-/mnt/amc-data}"
 RUN_ROOT="${RUN_ROOT:?RUN_ROOT is required, for example /mnt/amc-data/amc-runs/2026-smoke-100}"
 HASH_MODE="${HASH_MODE:-path}"
 NUM_SHARDS="${NUM_SHARDS:-}"
-STAGES="${STAGES:-preprocess asr_whisper asr_qwen asr_cohere asr_granite normalize consensus pii align mask_plan redact validate manifest agreement}"
+STAGES="${STAGES:-preprocess asr_parakeet asr_qwen asr_cohere asr_granite normalize consensus pii align mask_plan redact validate manifest agreement}"
 AUTO_PULL="${AUTO_PULL:-1}"
 
 # Optional fleet-wide ASR batch override, e.g. AMC_ASR_BATCH_SIZES="whisper=64,qwen=64,cohere=8,granite=8".

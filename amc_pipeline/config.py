@@ -152,14 +152,25 @@ class PipelineConfig:
                 # Batch caps from the ops/asr_batch_sweep.py sweep (A10G, caps 8-128). All four
                 # max throughput at cap=128 within ~8.3 GB peak; whisper/cohere are byte-identical
                 # across caps, qwen/granite show ~1-2.6% benign batching drift absorbed by consensus.
-                "whisper": ASRModelConfig(True, str(DEFAULT_MODEL_ROOT / "whisper-large-v3"), 128),
+                # Parakeet replaced whisper in the voting panel. Whisper's encoder
+                # always consumes a fixed 30s mel window, so on our ~4s VAD clips most
+                # of its compute went into padding; FastConformer-TDT decodes the true
+                # clip length. Measured on 1,984 real segments from 2022-full
+                # (ops/asr_model_bench.py, reports/asr_bench/), scored against
+                # qwen+cohere+granite with both whisper and the candidate excluded from
+                # the reference:
+                #     panel WER   13.56% -> 10.34%
+                #     agreed WER   7.71% ->  3.91%
+                #     throughput  RTFx 8.1 -> 77.7   (9.6x)
+                # Re-checked on a Spanish-only sample (23.96% vs 25.76% panel WER), since
+                # a uniform sample is 94% English and would hide an es regression.
+                # Whisper stays defined but disabled so it can be re-enabled for
+                # comparison; enabling both makes the agreement panel five models.
+                "whisper": ASRModelConfig(False, str(DEFAULT_MODEL_ROOT / "whisper-large-v3"), 128),
+                "parakeet": ASRModelConfig(True, str(DEFAULT_MODEL_ROOT / "parakeet-tdt-0.6b-v3"), 128),
                 "qwen": ASRModelConfig(True, str(DEFAULT_MODEL_ROOT / "qwen3-asr-1.7b"), 128),
                 "cohere": ASRModelConfig(True, str(DEFAULT_MODEL_ROOT / "cohere-transcribe-03-2026"), 128),
                 "granite": ASRModelConfig(True, str(DEFAULT_MODEL_ROOT / "granite-4.0-1b-speech"), 128),
-                # Whisper replacement: FastConformer-TDT decodes the true clip length
-                # instead of Whisper's fixed 30s window. Disabled until the parity
-                # benchmark (ops/asr_model_bench.py) clears it on our own audio.
-                "parakeet": ASRModelConfig(False, str(DEFAULT_MODEL_ROOT / "parakeet-tdt-0.6b-v3"), 128),
             }
         if not self.pii_models:
             self.pii_models = {

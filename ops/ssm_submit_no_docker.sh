@@ -31,7 +31,7 @@ if [[ -z "$LOCAL_PYTHON" ]]; then
     exit 2
   fi
 fi
-STAGES="${STAGES:-preprocess asr_whisper asr_qwen asr_cohere asr_granite normalize consensus pii align mask_plan redact validate manifest}"
+STAGES="${STAGES:-preprocess asr_parakeet asr_qwen asr_cohere asr_granite normalize consensus pii align mask_plan redact validate manifest}"
 # Optional fleet-wide ASR batch override (from ops/asr_batch_sweep.py). Forwarded to every shard
 # as --asr-batch-sizes. Empty by default -> each model uses its config default.
 AMC_ASR_BATCH_SIZES="${AMC_ASR_BATCH_SIZES:-}"

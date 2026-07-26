@@ -25,7 +25,7 @@ PYTHON_BIN="${PYTHON_BIN:-python3.10}"
 HASH_MODE="${HASH_MODE:-path}"
 AMC_IN="${AMC_IN:?AMC_IN is required (input root the pipeline discovers)}"
 RUN_ROOT="${RUN_ROOT:?RUN_ROOT is required, e.g. /mnt/amc-data/amc-runs/2026-smoke20}"
-STAGES="${STAGES:-preprocess asr_whisper asr_qwen asr_cohere asr_granite normalize consensus pii align mask_plan redact validate manifest agreement}"
+STAGES="${STAGES:-preprocess asr_parakeet asr_qwen asr_cohere asr_granite normalize consensus pii align mask_plan redact validate manifest agreement}"
 AUTO_PULL="${AUTO_PULL:-0}"
 # The run config MUST live on SHARED storage so every instance -- including a spot
 # replacement with a brand-new ID that does not know RUN_ROOT -- reads the same file.
