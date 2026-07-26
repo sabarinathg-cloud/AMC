@@ -377,6 +377,11 @@ def main() -> int:
             for r in results
             if not r.error
         }
+        # Benchmarking a whisper *config* (e.g. beam=1) makes the candidate share the
+        # incumbent's name; without this it would overwrite the manifest row it is
+        # supposed to be compared against and the verdict would compare it to itself.
+        if label in scores:
+            label = f"{label} (this run)"
         scores[label] = score_model(rows, norms, reference_models)
         report["timing"] = {
             "wall_sec": wall,
