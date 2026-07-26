@@ -148,12 +148,22 @@ def score_model(rows: list[dict], norms: dict[str, str], reference_models: list[
 # Sampling
 # ---------------------------------------------------------------------------
 
-def sample_rows(manifests: list[Path], models: list[str], limit: int, seed: int) -> list[dict]:
+def sample_rows(
+    manifests: list[Path],
+    models: list[str],
+    limit: int,
+    seed: int,
+    language: str | None = None,
+) -> list[dict]:
     """Randomly sample segments across shards, reading only whole row groups.
 
     Reading 21M rows x ~15 text columns to draw a few thousand samples would cost
     far more than the benchmark itself, so we pull a random row group per shard
     and sample within it.
+
+    `language` restricts the sample to one language code. A uniform sample is
+    ~94% English, so a regression confined to a minority language is invisible in
+    the aggregate -- Spanish alone is a million segments and needs its own read.
     """
     import pyarrow.parquet as pq
 
@@ -181,6 +191,11 @@ def sample_rows(manifests: list[Path], models: list[str], limit: int, seed: int)
             table = pf.read_row_group(g, columns=available)
             rows = table.to_pylist()
             rng.shuffle(rows)
+            if language:
+                rows = [
+                    r for r in rows
+                    if str(r.get("language") or "").strip().lower().startswith(language)
+                ]
             picked.extend(rows)
             if len(picked) >= per_file:
                 break
@@ -230,8 +245,10 @@ def print_report(report: dict[str, Any]) -> None:
     ref = report["reference_models"]
     print()
     print("=" * 78)
+    lang = report.get("language")
     print(f"ASR PANEL BENCHMARK  --  {report['segments']:,} segments, "
-          f"{report['audio_sec'] / 3600:.2f} h audio")
+          f"{report['audio_sec'] / 3600:.2f} h audio"
+          + (f", language={lang}" if lang else ""))
     print(f"reference panel: {', '.join(ref)}   (candidate and whisper excluded)")
     print("=" * 78)
     header = f"{'model':<22}{'panel_wer':>11}{'agreed_wer':>12}{'exact':>10}{'n_agreed':>10}"
@@ -290,6 +307,9 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=2000, help="Segments to sample (default 2000)")
     ap.add_argument("--seed", type=int, default=1234, help="Sampling seed (keep fixed across variants)")
     ap.add_argument("--shards", default=None, help="Comma-separated shard indices to sample from (default: all)")
+    ap.add_argument("--language", default=None,
+                    help="Restrict the sample to one language code (e.g. es). A uniform "
+                         "sample is ~94%% English, which hides minority-language regressions.")
     ap.add_argument("--baseline-only", action="store_true", help="Score existing manifest columns; run nothing")
     ap.add_argument("--label", default=None, help="Name for the candidate row (default: the model name)")
     ap.add_argument("--json-out", default=None, help="Write the full report as JSON here")
@@ -307,7 +327,7 @@ def main() -> int:
 
     panel = list(DEFAULT_AGREEMENT_MODELS)
     print(f"sampling {args.limit:,} segments from {len(manifests)} manifest(s)...", flush=True)
-    rows = sample_rows(manifests, panel, args.limit, args.seed)
+    rows = sample_rows(manifests, panel, args.limit, args.seed, language=args.language)
     if not rows:
         print("sample came back empty", file=sys.stderr)
         return 2
@@ -340,6 +360,7 @@ def main() -> int:
         "audio_sec": audio_sec,
         "reference_models": reference_models,
         "seed": args.seed,
+        "language": args.language,
     }
 
     if candidate:
