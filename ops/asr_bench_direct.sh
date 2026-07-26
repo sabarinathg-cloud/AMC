@@ -10,6 +10,9 @@ set -euo pipefail
 #
 # Variants (VARIANTS, comma-separated; default runs all four):
 #   baseline        score the whisper transcripts already in the manifests (no GPU work)
+#   whisper_beam5   whisper re-run at PRODUCTION settings (beam_size=5). The speed
+#                   reference: the manifest rows carry no timing, so without this
+#                   there is no measured incumbent RTFx to compare a candidate to.
 #   whisper_greedy  whisper re-run with beam_size=1              (Track A, free speedup)
 #   whisper_int8    whisper re-run with int8_float16 + greedy    (Track A, free speedup)
 #   parakeet        Parakeet TDT 0.6b v3                          (Track B, the replacement)
@@ -30,7 +33,7 @@ MODEL_ROOT="${MODEL_ROOT:-/mnt/amc-data/pipeline/models}"
 RUN_ROOT="${RUN_ROOT:?RUN_ROOT is required (an existing run dir on the shared mount)}"
 LIMIT="${LIMIT:-2000}"
 SEED="${SEED:-1234}"
-VARIANTS="${VARIANTS:-baseline,whisper_greedy,parakeet}"
+VARIANTS="${VARIANTS:-baseline,whisper_beam5,whisper_greedy,parakeet}"
 TIMEOUT="${TIMEOUT:-7200}"
 OUT_DIR="$RUN_ROOT/reports/asr_bench"
 
@@ -89,6 +92,10 @@ for v in \$(echo "$VARIANTS" | tr ',' ' '); do
   case "\$v" in
     baseline)
       run_variant baseline "\$MAIN_PY" --baseline-only
+      ;;
+    whisper_beam5)
+      ( export AMC_WHISPER_BEAM_SIZE=5
+        run_variant whisper_beam5 "\$MAIN_PY" --model whisper --label "whisper beam=5" )
       ;;
     whisper_greedy)
       # Subshell + export: an env prefix on a shell FUNCTION does not reliably scope
