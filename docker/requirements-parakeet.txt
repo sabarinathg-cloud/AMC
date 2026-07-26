@@ -31,6 +31,11 @@ protobuf>=4.25
 librosa>=0.10.2
 soundfile>=0.12.1
 
+# Manifest IO. The asr stage writes shards via the main venv, but this venv runs
+# ops/asr_model_bench.py, which samples segments straight out of the parquet
+# manifests.
+pyarrow>=14.0.0
+
 # NOTE: do NOT pin numpy<2 here. The NumPy 1.x ABI is only required by the main
 # venv (spaCy/thinc, ctranslate2, onnxruntime/gliner). transformers 5.x + librosa
 # run on numpy>=2; let the resolver choose (it lands on 2.x).
