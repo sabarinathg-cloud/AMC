@@ -589,7 +589,12 @@ class ParakeetAdapter(ASRAdapter):
         inputs = processor(arrays, sampling_rate=sample_rate, return_tensors="pt")
         inputs = inputs.to(model.device, dtype=model.dtype)
         with torch.inference_mode():
-            predicted_ids = model.generate(**inputs)
+            generated = model.generate(**inputs)
+        # TDT generate returns ParakeetRNNTGenerateOutput(sequences, durations), not a
+        # bare id tensor. Handing the container to batch_decode iterates its KEYS, so
+        # the tokenizer receives the strings "sequences"/"durations" and raises
+        # "argument 'ids': 'str' object cannot be interpreted as an integer".
+        predicted_ids = getattr(generated, "sequences", generated)
         decoded = processor.batch_decode(predicted_ids, skip_special_tokens=True)
         texts = [str(t).strip() for t in decoded]
         if len(texts) != len(audios):
