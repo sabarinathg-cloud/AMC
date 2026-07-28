@@ -806,7 +806,7 @@ class Pipeline:
             if segment is None or consensus is None:
                 continue
             spans = [_pii_span_from_payload(span) for span in payload.get("spans", [])]
-            if str(consensus.get("consensus_method") or "") in UNREADABLE_METHODS:
+            if str(consensus.get("method") or "") in UNREADABLE_METHODS:
                 # No model produced a usable transcript for this segment (all errored,
                 # or all looped -- see `degeneracy`), so there is no text to search for
                 # PII and an empty span list here means "nothing to mask". Mask the whole

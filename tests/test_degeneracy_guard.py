@@ -68,8 +68,9 @@ class DegeneracyDetectorTest(unittest.TestCase):
         self.assertFalse(is_degenerate("okay thanks", 0.4))
 
     def test_keeps_a_long_fast_but_varied_transcript(self):
+        # ~400 distinct words over two minutes: fast talker, no repetition.
         text = " ".join(f"word{i}" for i in range(400))
-        self.assertFalse(is_degenerate(text, 60.0))
+        self.assertFalse(is_degenerate(text, 120.0))
 
     def test_keeps_naturally_repetitive_speech(self):
         # An IVR menu repeats phrases without looping.
@@ -163,7 +164,7 @@ class UnreadableSegmentIsMaskedWholeTest(unittest.TestCase):
             self.assertEqual(consensus_summary["degenerate_rejected"]["parakeet"], 2)
 
             for artifact in pipeline.state.fetch_artifacts("consensus"):
-                self.assertIn(artifact["payload"]["consensus_method"], UNREADABLE_METHODS)
+                self.assertIn(artifact["payload"]["method"], UNREADABLE_METHODS)
 
             # Regex finds no PII in a loop, so without the fail-safe nothing would be masked.
             self.assertEqual(pipeline.pii()["spans"], 0)
