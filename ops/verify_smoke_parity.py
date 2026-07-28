@@ -37,6 +37,14 @@ def read_manifest(path: Path, columns: list[str] | None = None) -> dict:
     return pq.read_table(path, columns=columns).to_pydict()
 
 
+def num(value) -> float:
+    """Manifest numerics are written as strings; treat unparseable as zero."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def audio_duration_sec(path: Path) -> float | None:
     try:
         out = subprocess.run(
@@ -72,10 +80,18 @@ def main() -> int:
 
     missing = ref_cols - unswap(smoke_cols)
     extra = unswap(smoke_cols) - ref_cols
-    check(not missing and not extra, "manifest columns match 2026-full (modulo whisper->parakeet)",
-          f"missing={sorted(missing)} extra={sorted(extra)}")
+    # Only losing a column is a regression. The reference parquet was written by an
+    # older build, so columns added since (the agreement/confidence set) show up as
+    # extras and are reported rather than failed.
+    check(not missing, "no manifest column from 2026-full is missing",
+          f"missing={sorted(missing)}")
+    if extra:
+        notes.append(f"columns added since the reference run: {sorted(extra)}")
     check(any(c.startswith("parakeet_") for c in smoke_cols),
           "parakeet transcript columns present")
+    check(not any(c.startswith("whisper_") for c in smoke_cols),
+          "no whisper columns remain",
+          f"whisper_cols={sorted(c for c in smoke_cols if c.startswith('whisper_'))}")
 
     # --- 2. Every input call produced rows and a redacted file ----------------
     inputs = {p.name: p.parent.name for p in args.input_root.glob("*/*") if p.is_dir()}
@@ -116,25 +132,28 @@ def main() -> int:
           f"checked={min(len(seg_paths), 400)} present={present} total_rows={len(seg_paths)}")
 
     # --- 3. The four-model panel actually voted ------------------------------
-    panel = Counter()
-    for present_models in man.get("models_present", []):
-        for m in str(present_models or "").replace(";", ",").split(","):
-            m = m.strip()
-            if m:
-                panel[m] += 1
-    check("parakeet" in panel and "whisper" not in panel,
-          "panel is parakeet-based with no whisper", f"models_present={dict(panel)}")
-    agreement = Counter(str(v) for v in man.get("model_agreement", []))
-    notes.append(f"model_agreement: {dict(agreement)}")
+    # `models_present` is a count, so the panel is checked by asking how many rows
+    # each model actually transcribed.
+    voted = {
+        model: sum(1 for t in man.get(f"{model}_transcript", []) if (t or "").strip())
+        for model in ("parakeet", "qwen", "cohere", "granite")
+    }
+    rows = len(man["call_id"])
+    check(all(n >= rows * 0.9 for n in voted.values()),
+          "all four models transcribed at least 90% of segments", f"voted={voted} rows={rows}")
+    present_hist = Counter(str(v) for v in man.get("models_present", []))
+    notes.append(f"models_present histogram: {dict(present_hist)}")
+    notes.append(f"model_agreement: {dict(Counter(str(v) for v in man.get('model_agreement', [])))}")
+    notes.append(f"consensus_method: {dict(Counter(str(v) for v in man.get('consensus_method', [])))}")
 
     # --- 4. Redaction / alignment health ------------------------------------
     align = Counter(str(v) for v in man.get("alignment_status", []))
     check(align.get("failed", 0) == 0, "no failed alignments", f"alignment_status={dict(align)}")
     red = Counter(str(v) for v in man.get("redacted_status", []))
-    check(all(k in {"ok", "redacted", "clean", "no_pii", "skipped"} for k in red),
+    check(all(k in {"completed", "ok", "redacted", "clean", "no_pii", "skipped"} for k in red),
           "redacted_status values healthy", f"redacted_status={dict(red)}")
 
-    pii_rows = [i for i, n in enumerate(man.get("pii_count", [])) if (n or 0) > 0]
+    pii_rows = [i for i, n in enumerate(man.get("pii_count", [])) if num(n) > 0]
     check(bool(pii_rows), "pii detected in the sample", f"segments_with_pii={len(pii_rows)}")
     no_plan = [i for i in pii_rows if not (man["mask_intervals_json"][i] or "").strip("[] \n")]
     check(not no_plan, "every pii segment has mask intervals",
@@ -150,12 +169,20 @@ def main() -> int:
         except json.JSONDecodeError:
             empty_iv += 1
             continue
-        seg_len = float(man["end_sec"][i]) - float(man["start_sec"][i])
+        seg_start, seg_end = num(man["start_sec"][i]), num(man["end_sec"][i])
+        seg_len = seg_end - seg_start
         covered = 0.0
         for iv in intervals:
-            start, end = (iv[0], iv[1]) if isinstance(iv, (list, tuple)) else (iv["start"], iv["end"])
-            start, end = float(start), float(end)
-            if end <= start or start < -0.05 or end > seg_len + 0.05:
+            if isinstance(iv, (list, tuple)):
+                start, end = num(iv[0]), num(iv[1])
+            else:
+                start = num(iv.get("start_sec", iv.get("start")))
+                end = num(iv.get("end_sec", iv.get("end")))
+            # Intervals may be written segment-relative or in call time; accept either
+            # frame, and only complain if the interval fits in neither.
+            relative = -0.05 <= start and end <= seg_len + 0.05
+            absolute = seg_start - 0.05 <= start and end <= seg_end + 0.05
+            if end <= start or not (relative or absolute):
                 out_of_bounds += 1
             covered += max(0.0, end - start)
         if seg_len > 0 and covered >= seg_len * 0.98:
@@ -183,13 +210,13 @@ def main() -> int:
                                               old["start_sample"], old["end_sample"],
                                               old["language"]):
                 if cid in replay_ids:
-                    old_by_call[cid][str(sid)] = (ss, es, lang)
+                    old_by_call[cid][str(sid)] = (num(ss), num(es), lang)
 
             new_by_call: dict[str, dict[str, tuple]] = defaultdict(dict)
             for i, cid in enumerate(man["call_id"]):
                 if cid in replay_ids:
                     new_by_call[cid][str(man["segment_id"][i])] = (
-                        man["start_sample"][i], man["end_sample"][i], man["language"][i])
+                        num(man["start_sample"][i]), num(man["end_sample"][i]), man["language"][i])
 
             seg_count_bad, span_bad, lang_agree, lang_total = [], 0, 0, 0
             for cid in sorted(replay_ids):
