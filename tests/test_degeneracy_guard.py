@@ -106,27 +106,27 @@ class ConsensusGuardTest(unittest.TestCase):
             result("granite", HONEST),
         ]
         out = build_consensus(results, min_successful_models=3, duration_sec=24.0)
-        self.assertEqual(out.consensus_method, "strong_exact")
+        self.assertEqual(out.method, "strong_exact")
         self.assertTrue(out.strong)
 
     def test_healthy_run_is_untouched(self):
         results = [result(m, HONEST) for m in ("parakeet", "qwen", "cohere", "granite")]
         out = build_consensus(results, min_successful_models=3, duration_sec=6.0)
-        self.assertEqual(out.consensus_method, "strong_exact")
+        self.assertEqual(out.method, "strong_exact")
         self.assertEqual(out.selected_model, "parakeet")
 
     def test_all_looping_is_reported_as_unreadable(self):
         results = [result(m, LOOP) for m in ("parakeet", "qwen", "cohere", "granite")]
         out = build_consensus(results, min_successful_models=3, duration_sec=24.0)
-        self.assertEqual(out.consensus_method, "failed_all_degenerate")
-        self.assertIn(out.consensus_method, UNREADABLE_METHODS)
+        self.assertEqual(out.method, "failed_all_degenerate")
+        self.assertIn(out.method, UNREADABLE_METHODS)
         self.assertEqual(out.final_transcript, "")
 
     def test_errored_models_still_report_no_transcripts(self):
         results = [result(m, "", error="boom") for m in ("parakeet", "qwen")]
         out = build_consensus(results, min_successful_models=3, duration_sec=5.0)
-        self.assertEqual(out.consensus_method, "failed_no_transcripts")
-        self.assertIn(out.consensus_method, UNREADABLE_METHODS)
+        self.assertEqual(out.method, "failed_no_transcripts")
+        self.assertIn(out.method, UNREADABLE_METHODS)
 
     def test_partition_reports_what_it_dropped(self):
         results = [result("parakeet", LOOP), result("qwen", HONEST)]
