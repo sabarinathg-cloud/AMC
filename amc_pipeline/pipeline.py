@@ -13,7 +13,7 @@ from typing import Any
 from .alignment import RequiredAlignmentError, TokenUniformAligner, TorchaudioCTCAligner, WhisperXAligner
 from .audio import MissingDependencyError, decode_to_wav, encode_from_wav, temp_wav_path
 from .config import PipelineConfig
-from .consensus import DEFAULT_AGREEMENT_MODELS, DEFAULT_PRIORITY, build_consensus
+from .consensus import DEFAULT_AGREEMENT_MODELS, DEFAULT_PRIORITY, UNREADABLE_METHODS, build_consensus, partition_degenerate
 from .discovery import discover_audio_files
 from .inspection import inspect_audio
 from .manifests import write_segment_manifests
@@ -505,17 +505,38 @@ class Pipeline:
             for artifact in self.state.iter_artifacts("consensus")
             if artifact.get("status") == "completed"
         }
+        # Duration turns a transcript's length into a speech rate, which is how a
+        # looping model is told apart from a talkative one (see `degeneracy`).
+        duration_by_segment = {s.segment_id: s.duration_sec for s in self._load_segments()}
+        rejected_by_model: Counter = Counter()
+        rejected_rows: list[dict[str, Any]] = []
         items = list(grouped.items())
         for segment_id, results in iter_progress(items, desc="Build consensus", total=len(items), unit="segment", enabled=self.config.progress_enabled):
             if segment_id in existing:
                 skipped += 1
                 continue
-            result = build_consensus(results, min_successful_models=self.config.consensus_min_models)
+            duration_sec = duration_by_segment.get(segment_id)
+            _, degenerate = partition_degenerate(results, duration_sec)
+            for result, report in degenerate:
+                rejected_by_model[result.model_name] += 1
+                rejected_rows.append(
+                    {
+                        "segment_id": segment_id,
+                        "model": result.model_name,
+                        "reason": report.reason,
+                        "chars": len(result.transcript or ""),
+                        "chars_per_sec": round(report.chars_per_sec, 1) if report.chars_per_sec else None,
+                        "repeat_ratio": round(report.repeat_ratio, 3),
+                    }
+                )
+            result = build_consensus(results, min_successful_models=self.config.consensus_min_models, duration_sec=duration_sec)
             if result.strong:
                 strong += 1
             self.state.record_artifact(f"consensus:{segment_id}", "consensus", Path(segment_id), "completed", dataclass_to_dict(result))
+        if rejected_rows:
+            self._write_report("degenerate_asr.json", rejected_rows)
         processed = len(grouped) - skipped
-        summary = {"stage": "consensus", "segments": len(grouped), "processed": processed, "skipped_existing": skipped, "strong": strong, "weak": processed - strong}
+        summary = {"stage": "consensus", "segments": len(grouped), "processed": processed, "skipped_existing": skipped, "strong": strong, "weak": processed - strong, "degenerate_rejected": dict(rejected_by_model)}
         self._write_report("consensus_summary.json", summary)
         return summary
 
@@ -751,6 +772,7 @@ class Pipeline:
         failures = 0
         skipped = 0
         degraded = 0
+        unreadable = 0
         # Supported language roots (e.g. {"en", "es"}). Whisper occasionally misdetects
         # short/noisy segments as other languages (pt, nn, ...). Forced alignment for those
         # would fetch a language-specific wav2vec2 model from HuggingFace, which (a) may not
@@ -784,6 +806,22 @@ class Pipeline:
             if segment is None or consensus is None:
                 continue
             spans = [_pii_span_from_payload(span) for span in payload.get("spans", [])]
+            if str(consensus.get("consensus_method") or "") in UNREADABLE_METHODS:
+                # No model produced a usable transcript for this segment (all errored,
+                # or all looped -- see `degeneracy`), so there is no text to search for
+                # PII and an empty span list here means "nothing to mask". Mask the whole
+                # segment instead: losing one segment of audio beats shipping speech that
+                # nothing has read.
+                interval = MaskInterval(segment.channel, 0.0, float(segment.duration_sec), "no_usable_transcript", "UNKNOWN", 1.0, "fail_safe")
+                empty_artifacts.append(
+                    (f"alignment:{segment_id}", "alignment", Path(segment_id), "completed",
+                     {"segment_id": segment_id, "words": [], "intervals": [dataclass_to_dict(interval)]})
+                )
+                empty_failure_ids.append(f"{segment_id}:alignment")
+                unreadable += 1
+                if len(empty_artifacts) >= _ALIGN_EMPTY_FLUSH_ROWS:
+                    flush_empty_alignments()
+                continue
             if not spans:
                 empty_artifacts.append(
                     (f"alignment:{segment_id}", "alignment", Path(segment_id), "completed", {"segment_id": segment_id, "words": [], "intervals": []})
@@ -834,7 +872,7 @@ class Pipeline:
                 self.state.record_failure(f"{segment_id}:alignment", "segment", segment_id, repr(exc), retryable=True)
                 self.state.record_artifact(f"alignment:{segment_id}", "alignment", Path(segment_id), "failed", {"segment_id": segment_id, "error": repr(exc)})
         flush_empty_alignments()
-        summary = {"stage": "align", "aligned": aligned, "failed": failures, "degraded_uniform": degraded, "skipped_existing": skipped}
+        summary = {"stage": "align", "aligned": aligned, "failed": failures, "degraded_uniform": degraded, "skipped_existing": skipped, "masked_whole_no_transcript": unreadable}
         self._write_report("align_summary.json", summary)
         return summary
 

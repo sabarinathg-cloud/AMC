@@ -3,7 +3,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .models import PIISpan
 from .config import PipelineConfig
@@ -180,6 +180,16 @@ class GLiNERDetector(PIIDetector):
 class PiiranhaDetector(PIIDetector):
     name = "piiranha"
 
+    # The tokenizer declares no model_max_length, so the HF pipeline never truncates
+    # and attention memory grows with the square of the longest text in the batch. One
+    # 9,000-char ASR loop was enough to ask for 9 GiB and kill the stage, so long text
+    # is cut into overlapping windows and batches are capped by total characters
+    # rather than by count. Windows overlap so an entity split by a cut is still seen
+    # whole in the neighbouring window; `resolve_overlaps` drops the duplicates.
+    MAX_WINDOW_CHARS = 1200
+    WINDOW_OVERLAP_CHARS = 150
+    BATCH_CHAR_BUDGET = 24000
+
     def __init__(self, model_name_or_path: str, threshold: float = 0.45):
         self.model_name_or_path = model_name_or_path
         self.threshold = threshold
@@ -218,19 +228,58 @@ class PiiranhaDetector(PIIDetector):
                 spans.append(PIISpan(label, str(text)[start:end], start, end, score, self.name, dict(item)))
         return resolve_overlaps(spans)
 
+    def _windows(self, text: str) -> list[tuple[int, str]]:
+        """Split `text` into (offset, window) pairs, cutting on whitespace."""
+        if len(text) <= self.MAX_WINDOW_CHARS:
+            return [(0, text)]
+        windows: list[tuple[int, str]] = []
+        start = 0
+        while start < len(text):
+            end = min(len(text), start + self.MAX_WINDOW_CHARS)
+            if end < len(text):
+                space = text.rfind(" ", start + self.MAX_WINDOW_CHARS // 2, end)
+                if space > start:
+                    end = space
+            windows.append((start, text[start:end]))
+            if end >= len(text):
+                break
+            start = max(start + 1, end - self.WINDOW_OVERLAP_CHARS)
+        return windows
+
+    def _batches(self, windows: list[tuple[int, int, str]]):
+        """Group (text_index, offset, window) by a character budget.
+
+        Sorting by length first keeps padding tight, so a batch costs roughly its
+        budget instead of `count x longest`.
+        """
+        batch: list[tuple[int, int, str]] = []
+        for item in sorted(windows, key=lambda w: len(w[2])):
+            longest = max(len(item[2]), max((len(b[2]) for b in batch), default=0))
+            if batch and ((len(batch) + 1) * longest > self.BATCH_CHAR_BUDGET or len(batch) >= self.batch_size):
+                yield batch
+                batch = []
+            batch.append(item)
+        if batch:
+            yield batch
+
     def detect(self, text: str) -> list[PIISpan]:
-        pipe = self._load()
-        text = str(text)
-        return self._spans_from_items(text, pipe(text))
+        return self.detect_batch([text])[0]
 
     def detect_batch(self, texts: list[str]) -> list[list[PIISpan]]:
         pipe = self._load()
         texts = [str(t or "") for t in texts]
         if not texts:
             return []
-        # A list input makes the HF pipeline batch internally (one result list per text).
-        results = pipe(texts, batch_size=self.batch_size)
-        return [self._spans_from_items(text, items) for text, items in zip(texts, results)]
+        windows = [(i, offset, window) for i, text in enumerate(texts) for offset, window in self._windows(text)]
+        per_text: list[list[PIISpan]] = [[] for _ in texts]
+        for batch in self._batches(windows):
+            # A list input makes the HF pipeline batch internally (one result list per text).
+            for (index, offset, window), items in zip(batch, pipe([w for _, _, w in batch], batch_size=len(batch))):
+                for span in self._spans_from_items(window, items):
+                    per_text[index].append(
+                        replace(span, start_char=span.start_char + offset, end_char=span.end_char + offset)
+                    )
+        return [resolve_overlaps(spans) for spans in per_text]
 
 
 # spaCy's DATE/CARDINAL entities frequently fire on tokens that are NOT PII: relative time

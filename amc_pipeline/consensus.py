@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 
+from .degeneracy import DegeneracyReport, inspect_transcript
 from .models import ASRResult, ConsensusResult
 from .normalization import normalize_transcript
 
@@ -20,13 +21,46 @@ DEFAULT_PRIORITY = ["parakeet", "whisper", "qwen", "cohere", "granite"]
 # enabled ASR models; this is only the fallback.
 DEFAULT_AGREEMENT_MODELS = ["whisper", "qwen", "cohere", "granite"]
 
+# `consensus_method` values meaning no model produced a usable transcript, so
+# there is no text in which to find PII. Segments landing here are masked whole
+# by the align stage rather than shipped unchecked.
+UNREADABLE_METHODS = frozenset({"failed_no_transcripts", "failed_all_degenerate"})
 
-def build_consensus(results: list[ASRResult], min_successful_models: int = 3, priority: list[str] | None = None) -> ConsensusResult:
+
+def partition_degenerate(
+    results: list[ASRResult], duration_sec: float | None = None
+) -> tuple[list[ASRResult], list[tuple[ASRResult, DegeneracyReport]]]:
+    """Split successful results into (usable, looping). See `degeneracy`.
+
+    A looping transcript must not reach the vote: it is longer than every honest
+    transcript, so it wins both the priority and the longest-transcript
+    tie-break, and it hides the PII it looped over.
+    """
+    usable: list[ASRResult] = []
+    rejected: list[tuple[ASRResult, DegeneracyReport]] = []
+    for result in results:
+        if not result.ok:
+            continue
+        report = inspect_transcript(result.transcript, duration_sec)
+        (rejected.append((result, report)) if report.degenerate else usable.append(result))
+    return usable, rejected
+
+
+def build_consensus(
+    results: list[ASRResult],
+    min_successful_models: int = 3,
+    priority: list[str] | None = None,
+    duration_sec: float | None = None,
+) -> ConsensusResult:
     priority = priority or DEFAULT_PRIORITY
-    ok = [r for r in results if r.ok]
+    ok, degenerate = partition_degenerate(results, duration_sec)
     segment_id = results[0].segment_id if results else ""
     if not ok:
-        return ConsensusResult(segment_id, "", "", "failed_no_transcripts", 0.0, None, False)
+        # Every model either errored or looped. There is no transcript to locate
+        # PII in, so the segment is reported as having none -- `mask_plan` masks
+        # it whole rather than shipping audio nobody has read.
+        method = "failed_all_degenerate" if degenerate else "failed_no_transcripts"
+        return ConsensusResult(segment_id, "", "", method, 0.0, None, False)
     normalized = {r.model_name: normalize_transcript(r.transcript, remove_fillers=True) for r in ok}
     counts = Counter(normalized.values())
     best_norm, best_count = counts.most_common(1)[0]
