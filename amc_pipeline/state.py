@@ -273,6 +273,46 @@ class SQLiteStateStore:
                 (artifact_id, kind, str(path), status, json.dumps(payload or {}, sort_keys=True, default=str), now),
             )
 
+    def record_artifacts_many(self, artifacts: list[tuple[str, str, Path, str, dict[str, Any] | None]]) -> None:
+        """Record many artifacts in a SINGLE transaction.
+
+        Counterpart to upsert_model_results_many for stages whose per-item output is a
+        cheap artifact row: most segments carry no PII spans, so the align stage writes
+        an empty alignment for them and nothing else, and one autocommit transaction per
+        empty row was the bulk of that stage's cost.
+        ``artifacts`` is ``(artifact_id, kind, path, status, payload)``.
+        """
+        if not artifacts:
+            return
+        now = time.time()
+        rows = [
+            (str(aid), str(kind), str(path), str(status), json.dumps(payload or {}, sort_keys=True, default=str), now)
+            for (aid, kind, path, status, payload) in artifacts
+        ]
+        with self._conn_ctx() as conn:
+            try:
+                conn.execute("begin")
+                conn.executemany(
+                    """
+                    insert into artifacts(artifact_id, kind, path, status, payload_json, updated_at)
+                    values (?, ?, ?, ?, ?, ?)
+                    on conflict(artifact_id) do update set
+                        kind=excluded.kind,
+                        path=excluded.path,
+                        status=excluded.status,
+                        payload_json=excluded.payload_json,
+                        updated_at=excluded.updated_at
+                    """,
+                    rows,
+                )
+                conn.execute("commit")
+            except Exception:
+                try:
+                    conn.execute("rollback")
+                except Exception:
+                    pass
+                raise
+
     def record_failure(self, failure_id: str, scope: str, scope_id: str, error: str, retryable: bool = True, traceback: str | None = None) -> None:
         with self._conn_ctx() as conn:
             conn.execute(
@@ -620,6 +660,30 @@ class PostgresStateStore:
                         updated_at=excluded.updated_at
                     """,
                     (artifact_id, kind, str(path), status, json.dumps(payload or {}, sort_keys=True, default=str), now),
+                )
+
+    def record_artifacts_many(self, artifacts: list[tuple[str, str, Path, str, dict[str, Any] | None]]) -> None:
+        if not artifacts:
+            return
+        now = time.time()
+        rows = [
+            (str(aid), str(kind), str(path), str(status), json.dumps(payload or {}, sort_keys=True, default=str), now)
+            for (aid, kind, path, status, payload) in artifacts
+        ]
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(
+                    """
+                    insert into artifacts(artifact_id, kind, path, status, payload_json, updated_at)
+                    values (%s, %s, %s, %s, %s::jsonb, %s)
+                    on conflict(artifact_id) do update set
+                        kind=excluded.kind,
+                        path=excluded.path,
+                        status=excluded.status,
+                        payload_json=excluded.payload_json,
+                        updated_at=excluded.updated_at
+                    """,
+                    rows,
                 )
 
     def record_failure(self, failure_id: str, scope: str, scope_id: str, error: str, retryable: bool = True, traceback: str | None = None) -> None:

@@ -10,12 +10,14 @@ import os
 import queue
 import threading
 import warnings
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
 from .config import ASRModelConfig, PipelineConfig
+from .language_id import detect_language
 from .models import ASRResult, SegmentRecord
 from .progress import iter_progress
 
@@ -540,15 +542,63 @@ class ParakeetAdapter(ASRAdapter):
             else:
                 texts, errors = self._transcribe_loaded(audios)
             for segment, text, error in zip(chunk, texts, errors):
+                # This adapter is the panel's language source (LANGUAGE_DETECTING_MODELS):
+                # it runs first and the rest of the panel, the manifests and the align
+                # stage all consume the label it sets. It detects language internally
+                # without reporting it, so recover the label from the transcript it just
+                # produced.
+                detected, detected_confidence = detect_language(text)
                 by_id[segment.segment_id] = ASRResult(
                     segment.segment_id,
                     self.name,
                     text,
                     0.0,
-                    _language_code(segment.language),
+                    detected,
+                    language_confidence=detected_confidence,
                     error=error,
                 )
+        self._fill_undecided_languages(segments, by_id)
         return [by_id.get(s.segment_id, ASRResult(s.segment_id, self.name, "", 0.0, error="NOT_RUN")) for s in segments]
+
+    @staticmethod
+    def _call_key(segment: SegmentRecord) -> str:
+        return getattr(segment, "call_id", None) or getattr(segment, "file_id", None) or segment.segment_id
+
+    def _fill_undecided_languages(self, segments: list[SegmentRecord], by_id: dict[str, ASRResult]) -> None:
+        """Label segments whose own text carried no language evidence from their call.
+
+        A bare digit string ("29-49-43") or a one-word reply has nothing to detect on, and
+        those are the segments where the label matters most: the align stage expands digits
+        into Spanish or English number words before forced alignment, so a spoken phone
+        number -- the PII itself -- is aligned against the wrong words if the label is
+        wrong. Calls do not switch language between speakers, and Pipeline.asr hands this
+        adapter whole calls at a time (see _chunk_segments_by_call), so the rest of the call
+        is the best available evidence. Confidence becomes the share of the call that
+        agreed, which is honest about this being inferred rather than detected.
+
+        Only undecided segments are filled: a segment that did detect its own language keeps
+        it, so genuine mid-call code-switching survives.
+        """
+        votes: dict[str, Counter[str]] = {}
+        for segment in segments:
+            result = by_id.get(segment.segment_id)
+            if result is not None and result.language:
+                votes.setdefault(self._call_key(segment), Counter())[result.language] += 1
+        for segment in segments:
+            result = by_id.get(segment.segment_id)
+            if result is None or result.language:
+                continue
+            counter = votes.get(self._call_key(segment))
+            if counter:
+                language, agreed = counter.most_common(1)[0]
+                confidence = agreed / sum(counter.values())
+            else:
+                # Nothing in the whole call was decidable; fall back to the segment's
+                # existing label, which is the corpus-majority default on a fresh run.
+                language, confidence = _language_code(segment.language), 0.0
+            by_id[segment.segment_id] = dataclasses.replace(
+                result, language=language, language_confidence=confidence
+            )
 
     def _transcribe_segments_individually(self, chunk: list[SegmentRecord]) -> tuple[list[str], list[str | None]]:
         """Slow path used only when the prefetch loader raised for a whole batch."""
@@ -1048,6 +1098,33 @@ def _build_single_adapter(name: str, model_cfg: ASRModelConfig) -> ASRAdapter:
     if name == "parakeet":
         return ParakeetAdapter(model_cfg)
     raise ValueError(f"Unsupported ASR model: {name}")
+
+
+# Panel models that carry their own `language` label. The rest of the panel is
+# filtered to the supported languages using that label, and the align stage picks
+# its forced-alignment model from it, so exactly one model has to own it. Ordered
+# by preference for the case where more than one has already run.
+LANGUAGE_DETECTING_MODELS: tuple[str, ...] = ("whisper", "parakeet")
+
+
+def language_source_model(in_this_run: Iterable[str], already_transcribed: Iterable[str]) -> str | None:
+    """Resolve which model's results own the language label.
+
+    The ASR stage runs once per model (`asr_parakeet`, then `asr_qwen`, ...), each a
+    separate process, so on the qwen/cohere/granite passes the detecting model is not
+    among this invocation's adapters -- its rows are already in the DB. Prefer a
+    detecting model that is running now (it is about to write fresh labels), and
+    otherwise fall back to one that has already written them.
+    """
+    running = set(in_this_run)
+    for name in LANGUAGE_DETECTING_MODELS:
+        if name in running:
+            return name
+    done = set(already_transcribed)
+    for name in LANGUAGE_DETECTING_MODELS:
+        if name in done:
+            return name
+    return None
 
 
 def build_enabled_adapters(config: PipelineConfig) -> list[ASRAdapter]:

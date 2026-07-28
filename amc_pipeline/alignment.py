@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import wave
 from pathlib import Path
 
 from .models import AlignmentWord, MaskInterval, PIISpan, SegmentRecord
+
+# The sample rate whisperx asks ffmpeg for, and the rate preprocessing writes segment
+# WAVs at. Both have to agree for the fast decode path below to be used at all.
+_ALIGN_SAMPLE_RATE = 16000
 
 
 _DIGIT_WORDS_BY_LANGUAGE = {
@@ -156,12 +161,53 @@ class WhisperXAligner:
             self._align_cache[key] = cached
         return device, cached
 
+    @staticmethod
+    def _read_pcm16_mono_16k(path: str):
+        """Return the audio array for a WAV already in whisperx's target format, else None.
+
+        whisperx.load_audio asks ffmpeg for 16 kHz mono PCM-16 and then scales the int16
+        samples by 1/32768. When the file on disk is already in that format -- which is
+        what preprocessing writes -- there is nothing to decode: reinterpreting the data
+        chunk gives bit-identical samples to what ffmpeg would have returned. Returning
+        None means "not in that format", and the caller must fall back to ffmpeg, which is
+        the only thing that can resample or downmix correctly.
+        """
+        import numpy as np  # type: ignore  (present wherever whisperx is; see _device)
+
+        try:
+            with wave.open(path, "rb") as wav:
+                if (
+                    wav.getframerate() != _ALIGN_SAMPLE_RATE
+                    or wav.getnchannels() != 1
+                    or wav.getsampwidth() != 2
+                ):
+                    return None
+                frames = wav.readframes(wav.getnframes())
+        except Exception:
+            # Unreadable or non-PCM header (wave rejects e.g. WAVE_FORMAT_EXTENSIBLE).
+            return None
+        return np.frombuffer(frames, dtype=np.int16).flatten().astype(np.float32) / 32768.0
+
+    def _load_audio(self, path: str):
+        """Decode a segment WAV into the array whisperx.align expects.
+
+        whisperx.load_audio shells out to ffmpeg on every call, and the align stage calls
+        it once per PII-bearing segment, so process spawn plus ffmpeg startup cost more
+        than the alignment itself.
+        """
+        fast = self._read_pcm16_mono_16k(path)
+        if fast is not None:
+            return fast
+        import whisperx  # type: ignore  (align-venv-only dependency; see _device)
+
+        return whisperx.load_audio(path)
+
     def align_segment(self, segment: SegmentRecord, transcript: str, language: str) -> list[AlignmentWord]:
         self.preflight()
         import whisperx  # type: ignore  (align-venv-only dependency; see _device)
 
         device, (model, metadata) = self._load_align_model(language)
-        audio = whisperx.load_audio(str(segment.segment_audio_path))
+        audio = self._load_audio(str(segment.segment_audio_path))
         alignment_text, source_to_original = _digit_expanded_alignment_text(transcript, language=language)
         aligned = whisperx.align(
             [{"start": 0.0, "end": segment.duration_sec, "text": alignment_text}],

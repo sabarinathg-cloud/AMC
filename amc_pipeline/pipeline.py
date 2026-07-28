@@ -27,8 +27,24 @@ from .resources import detect_resources
 from .segmentation import preflight_vad_backend
 from .speaker import SpeakerParams, embed_call_channels, load_cluster_map, write_shard_embeddings
 from .state import PostgresStateStore, SQLiteStateStore
-from .transcription import build_enabled_adapters
+from .transcription import LANGUAGE_DETECTING_MODELS, build_enabled_adapters, language_source_model
 from .validation import validate_audio_pair
+
+
+# How many empty alignments the align stage buffers before writing them. Segments with
+# no PII spans need nothing aligned, just an artifact row saying so, and they are the
+# large majority -- so their two autocommit transactions each (artifact + failure clear)
+# were most of the stage's wall time. Segments that do get aligned are still written one
+# at a time: the GPU work dwarfs the write, and buffering them would only widen the
+# window of expensive work to redo after a crash.
+_ALIGN_EMPTY_FLUSH_ROWS = 1000
+
+# How many normalized transcripts the normalize stage buffers before writing them
+# back. Each flush is one transaction on the Lustre-backed WAL DB, and per-row
+# autocommit was the whole cost of that stage. The stage is idempotent (it skips
+# rows that already carry `normalized_transcript`), so a crash mid-buffer only
+# redoes normalization for at most this many rows.
+_NORMALIZE_FLUSH_ROWS = 1000
 
 
 def _chunk_segments_by_call(segments: list[SegmentRecord], target: int):
@@ -340,13 +356,17 @@ class Pipeline:
             for row in self.state.fetch_model_results()
             if row.get("status") == "transcribed"
         }
+        language_source = language_source_model(
+            (adapter.name for adapter in adapters),
+            (model_name for (_, model_name) in existing_results),
+        )
         for (segment_id, model_name), row in existing_results.items():
-            if model_name != "whisper":
+            if model_name != language_source:
                 continue
             payload = row["payload"]
             language_by_segment[segment_id] = payload.get("language")
             language_confidence_by_segment[segment_id] = payload.get("language_confidence")
-        adapters = sorted(adapters, key=lambda a: 0 if a.name == "whisper" else 1)
+        adapters = sorted(adapters, key=lambda a: 0 if a.name == language_source else 1)
         for adapter in adapters:
             adapter.progress_enabled = self.config.progress_enabled
         # Persist transcripts in call-grouped chunks instead of one bulk write at
@@ -364,7 +384,7 @@ class Pipeline:
             seg_rows: list[tuple[str, str, str, dict[str, Any]]] = []
             model_rows: list[tuple[str, str, str, dict[str, Any]]] = []
             for result in results:
-                if model_name == "whisper":
+                if model_name == language_source:
                     language_by_segment[result.segment_id] = result.language
                     language_confidence_by_segment[result.segment_id] = result.language_confidence
                     segment = segment_by_id.get(result.segment_id)
@@ -381,7 +401,7 @@ class Pipeline:
         for adapter in iter_progress(adapters, desc="ASR models", total=len(adapters), unit="model", enabled=self.config.progress_enabled):
             try:
                 model_segments = segments
-                if adapter.name != "whisper" and language_by_segment:
+                if adapter.name != language_source and language_by_segment:
                     model_segments = [
                         replace(
                             s,
@@ -444,14 +464,20 @@ class Pipeline:
         total = self.state.count_model_results()
         count = 0
         skipped = 0
+        pending: list[tuple[str, str, str, dict[str, Any]]] = []
         for row in iter_progress(self.state.iter_model_results(), desc="Normalize transcripts", total=total, unit="result", enabled=self.config.progress_enabled):
             payload = row["payload"]
             if "normalized_transcript" in payload:
                 skipped += 1
                 continue
             payload["normalized_transcript"] = normalize_transcript(payload.get("transcript", ""), remove_fillers=True)
-            self.state.upsert_model_result(row["segment_id"], row["model_name"], row["status"], payload)
+            pending.append((row["segment_id"], row["model_name"], row["status"], payload))
             count += 1
+            if len(pending) >= _NORMALIZE_FLUSH_ROWS:
+                self.state.upsert_model_results_many(pending)
+                pending = []
+        if pending:
+            self.state.upsert_model_results_many(pending)
         summary = {"stage": "normalize", "model_results": count, "skipped_existing": skipped}
         self._write_report("normalize_summary.json", summary)
         return summary
@@ -734,6 +760,18 @@ class Pipeline:
         # intervals, so masking stays fail-safe (no leak) even when a forced-alignment
         # model is unavailable or the detected language is unsupported.
         uniform_fallback = TokenUniformAligner()
+        # Buffered writes for the no-PII-span case; see _ALIGN_EMPTY_FLUSH_ROWS.
+        empty_artifacts: list[tuple[str, str, Path, str, dict[str, Any] | None]] = []
+        empty_failure_ids: list[str] = []
+
+        def flush_empty_alignments() -> None:
+            if not empty_artifacts:
+                return
+            self.state.record_artifacts_many(empty_artifacts)
+            self.state.clear_failures(empty_failure_ids)
+            empty_artifacts.clear()
+            empty_failure_ids.clear()
+
         pii_artifacts = self.state.fetch_artifacts("pii")
         for artifact in iter_progress(pii_artifacts, desc="Force alignment", total=len(pii_artifacts), unit="segment", enabled=self.config.progress_enabled):
             payload = artifact["payload"]
@@ -747,8 +785,12 @@ class Pipeline:
                 continue
             spans = [_pii_span_from_payload(span) for span in payload.get("spans", [])]
             if not spans:
-                self.state.record_artifact(f"alignment:{segment_id}", "alignment", Path(segment_id), "completed", {"segment_id": segment_id, "words": [], "intervals": []})
-                self.state.clear_failure(f"{segment_id}:alignment")
+                empty_artifacts.append(
+                    (f"alignment:{segment_id}", "alignment", Path(segment_id), "completed", {"segment_id": segment_id, "words": [], "intervals": []})
+                )
+                empty_failure_ids.append(f"{segment_id}:alignment")
+                if len(empty_artifacts) >= _ALIGN_EMPTY_FLUSH_ROWS:
+                    flush_empty_alignments()
                 continue
             try:
                 transcript = consensus.get("final_transcript", "")
@@ -791,6 +833,7 @@ class Pipeline:
                 failures += 1
                 self.state.record_failure(f"{segment_id}:alignment", "segment", segment_id, repr(exc), retryable=True)
                 self.state.record_artifact(f"alignment:{segment_id}", "alignment", Path(segment_id), "failed", {"segment_id": segment_id, "error": repr(exc)})
+        flush_empty_alignments()
         summary = {"stage": "align", "aligned": aligned, "failed": failures, "degraded_uniform": degraded, "skipped_existing": skipped}
         self._write_report("align_summary.json", summary)
         return summary
@@ -1053,7 +1096,7 @@ class Pipeline:
             extras[segment_id][f"{model}_normalized_transcript"] = payload.get("normalized_transcript", "")
             extras[segment_id][f"{model}_confidence"] = payload.get("confidence", "")
             extras[segment_id][f"{model}_error"] = payload.get("error", "")
-            if model == "whisper":
+            if model in LANGUAGE_DETECTING_MODELS:
                 extras[segment_id]["language"] = payload.get("language") or extras[segment_id].get("language", "")
                 extras[segment_id]["language_confidence"] = payload.get("language_confidence") or payload.get("confidence") or extras[segment_id].get("language_confidence", "")
         for artifact in self.state.iter_artifacts("consensus"):
