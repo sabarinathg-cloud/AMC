@@ -288,29 +288,41 @@ def main() -> int:
                     new_by_call[cid][seg_key(man["segment_id"][i])] = (
                         num(man["start_sample"][i]), num(man["end_sample"][i]), man["language"][i])
 
-            seg_count_bad, span_bad, lang_agree, lang_total = [], 0, 0, 0
+            seg_count_bad, span_bad = [], 0
+            confusion: Counter = Counter()
+            # Spanish share per call, old vs new. The label picks the alignment model,
+            # so what has to hold is that a Spanish call still comes out Spanish --
+            # NOT that the labels match whisper's, which flap per segment (in this very
+            # sample whisper called plainly Spanish audio Greek, Finnish and Italian,
+            # and rendered "Si, perdon" as "Deep in it").
+            spanish_loss = []
             for cid in sorted(replay_ids):
                 o, n = old_by_call.get(cid, {}), new_by_call.get(cid, {})
                 if len(o) != len(n):
                     seg_count_bad.append((cid, len(o), len(n)))
-                for sid, (ss, es, lang) in o.items():
-                    if sid not in n:
-                        continue
-                    if (n[sid][0], n[sid][1]) != (ss, es):
+                matched = [(v, n[sid]) for sid, v in o.items() if sid in n]
+                for (ss, es, old_lang), (nss, nes, new_lang) in matched:
+                    if (nss, nes) != (ss, es):
                         span_bad += 1
-                    lang_total += 1
-                    lang_agree += int(str(n[sid][2] or "")[:2] == str(lang or "")[:2])
+                    confusion[(str(old_lang or "")[:2], str(new_lang or "")[:2])] += 1
+                if not matched:
+                    spanish_loss.append((cid, "no segments matched"))
+                    continue
+                old_es = sum(1 for (_, _, l), _ in matched if str(l or "").startswith("es"))
+                new_es = sum(1 for _, (_, _, l) in matched if str(l or "").startswith("es"))
+                if new_es < old_es - max(1, 0.02 * len(matched)):
+                    spanish_loss.append((cid, f"{old_es}->{new_es} of {len(matched)}"))
             check(not seg_count_bad, "replayed 2022 calls segment identically",
                   f"count_mismatches={seg_count_bad}")
             check(span_bad == 0, "replayed segment spans identical", f"mismatched_spans={span_bad}")
-            rate = (lang_agree / lang_total * 100) if lang_total else 0.0
-            check(lang_total > 0 and rate >= 95.0,
-                  "parakeet language labels agree with whisper on replayed calls",
-                  f"{lang_agree}/{lang_total} = {rate:.2f}%")
-            es_new = sum(1 for cid in replay_ids
-                         for v in (t[2] for t in new_by_call.get(cid, {}).values())
-                         if str(v or "").startswith("es"))
-            notes.append(f"replayed spanish segments labelled es by parakeet: {es_new}")
+            check(not spanish_loss, "no replayed spanish call loses spanish coverage",
+                  f"regressions={spanish_loss}")
+            agree = sum(n for (a, b), n in confusion.items() if a == b)
+            total = sum(confusion.values())
+            notes.append(f"replay language agreement with whisper: {agree}/{total}"
+                         f" ({agree / max(total, 1) * 100:.1f}%)")
+            notes.append("replay language changes: " + ", ".join(
+                f"{a}->{b}:{n}" for (a, b), n in confusion.most_common() if a != b))
 
     print()
     for n in notes:
