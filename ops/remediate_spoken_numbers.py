@@ -74,12 +74,51 @@ def delete_artifacts(con: sqlite3.Connection, ids: list[str]) -> int:
     return total
 
 
+def verify(manifest: Path) -> int:
+    """After remediation, every spoken number must carry a mask. Returns leak count."""
+    import pyarrow.parquet as pq
+
+    cols = ["segment_id", "final_transcript", "pii_count", "mask_intervals_json"]
+    man = pq.read_table(manifest, columns=cols).to_pydict()
+    total = with_number = still_open = 0
+    examples: list[str] = []
+    for i in range(len(man["segment_id"])):
+        total += 1
+        text = man["final_transcript"][i] or ""
+        if not find_spoken_number_runs(text):
+            continue
+        with_number += 1
+        try:
+            masked = bool(json.loads(man["mask_intervals_json"][i] or "[]"))
+        except (json.JSONDecodeError, TypeError):
+            masked = False
+        if not masked:
+            still_open += 1
+            if len(examples) < 8:
+                examples.append(" ".join(text.split())[:100])
+    print(f"  {total:,} segments, {with_number:,} contain a spoken number, "
+          f"{with_number - still_open:,} now masked, {still_open:,} still unmasked")
+    for line in examples:
+        print(f"    UNMASKED: {line}")
+    return still_open
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", type=Path, required=True, help="run root, e.g. .../2025-full")
     ap.add_argument("--shard", type=int, required=True)
     ap.add_argument("--apply", action="store_true", help="actually delete (default: inspect)")
+    ap.add_argument("--verify", action="store_true",
+                    help="check a remediated shard instead: exits 1 if any number is still bare")
     args = ap.parse_args()
+
+    if args.verify:
+        manifest = args.run / "outputs" / f"shard-{args.shard}" / "manifests" / "all_segments.parquet"
+        if not manifest.exists():
+            print(f"missing: {manifest}", file=sys.stderr)
+            return 2
+        print(f"shard-{args.shard}: verifying")
+        return 1 if verify(manifest) else 0
 
     shard_dir = args.run / "outputs" / f"shard-{args.shard}"
     db = shard_dir / ".pii_pipeline" / "state" / "pipeline.sqlite3"
