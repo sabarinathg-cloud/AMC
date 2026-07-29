@@ -150,20 +150,56 @@ def _shard_dirscan_enabled() -> bool:
     return os.environ.get(_SHARD_DIRSCAN_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-# How many children a directory may have and still be read as a list of GROUPS
-# (year dirs) rather than a list of calls. The corpus is staged either as
-# <root>/<call_id>/ (hundreds of thousands of children) or as <root>/<year>/<call_id>/
-# (a handful), so the count separates the two without a stat per child.
-_MAX_GROUP_DIRS = 64
+# The corpus is staged either with call dirs directly under the input root, or one level
+# down under year dirs. Telling the two apart costs a bounded look at a few children --
+# never a stat per child, which on the flat layout would mean ~400k of them.
+_LAYOUT_PROBE_DIRS = 8
+_LAYOUT_PROBE_ENTRIES = 64
+
+
+def _probe_dir(path: Path, exts: set[str]) -> tuple[bool, bool]:
+    """Report (holds an audio file, holds a subdir) for one dir, reading a few entries."""
+    holds_subdir = False
+    try:
+        with os.scandir(path) as it:
+            for seen, entry in enumerate(it):
+                if seen >= _LAYOUT_PROBE_ENTRIES:
+                    break
+                if entry.name.startswith("."):
+                    continue
+                if Path(entry.name).suffix.lower() in exts:
+                    return True, holds_subdir
+                if not holds_subdir and entry.is_dir():
+                    holds_subdir = True
+    except OSError:
+        return False, False
+    return False, holds_subdir
+
+
+def _calls_are_direct_children(entries: list[os.DirEntry], exts: set[str]) -> bool:
+    """True if `entries` are the call dirs, False if they are year dirs holding them."""
+    probed = 0
+    saw_subdir = False
+    for entry in entries:
+        if entry.name.startswith("."):
+            continue
+        holds_audio, holds_subdir = _probe_dir(Path(entry.path), exts)
+        if holds_audio:
+            return True
+        saw_subdir = saw_subdir or holds_subdir
+        probed += 1
+        if probed >= _LAYOUT_PROBE_DIRS:
+            break
+    return not saw_subdir
 
 
 def _shard_call_dirs(
-    root: Path, num_shards: int, shard_index: int
+    root: Path, exts: set[str], num_shards: int, shard_index: int, depth: int = 0
 ) -> Iterator[Path]:
     """Yield the call dirs under `root` that hash to this shard.
 
     Handles both stagings of the corpus: call dirs directly under `root`, and call dirs
-    one level down under year dirs (how a run's `input/` is wired -- `input/2025` is a
+    one level down under year dirs (how a run's input/ is wired -- input/2025 is a
     symlink to the year tree, which is also what puts "2025" in the manifest's `year`).
     Only the CALL dir name is ever hashed, so either way this yields exactly the calls
     the full-walk path would assign to this shard.
@@ -172,15 +208,12 @@ def _shard_call_dirs(
         entries = sorted(os.scandir(root), key=lambda e: e.name)
     except OSError:
         return
-    # A handful of children means they are year dirs, so recurse to find the calls. The
-    # check is on the count alone: with the flat layout, asking "is this a call dir?"
-    # per child would stat all ~400k of them, the metadata churn this scan exists to
-    # avoid.
-    if 0 < len(entries) <= _MAX_GROUP_DIRS:
+    if depth < 1 and not _calls_are_direct_children(entries, exts):
         for entry in entries:
-            if entry.name.startswith("."):
-                continue
-            yield from _shard_call_dirs(Path(entry.path), num_shards, shard_index)
+            if not entry.name.startswith("."):
+                yield from _shard_call_dirs(
+                    Path(entry.path), exts, num_shards, shard_index, depth + 1
+                )
         return
     for entry in entries:
         # Hash-filter on the directory NAME first (pure CPU), before touching the
@@ -205,7 +238,7 @@ def _iter_shard_audio_paths(
     outside its slice, which is what wedged the shared-cache builder on an
     HSM-released (S3-cold) tree.
     """
-    for call_dir in _shard_call_dirs(root, num_shards, shard_index):
+    for call_dir in _shard_call_dirs(root, exts, num_shards, shard_index):
         try:
             # A non-directory that happens to hash here just raises and is skipped.
             names = sorted(e.name for e in os.scandir(call_dir))
