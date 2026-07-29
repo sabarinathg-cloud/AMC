@@ -150,22 +150,37 @@ def _shard_dirscan_enabled() -> bool:
     return os.environ.get(_SHARD_DIRSCAN_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _iter_shard_audio_paths(
-    root: Path, exts: set[str], num_shards: int, shard_index: int
-) -> Iterator[Path]:
-    """Yield audio paths only under the top-level call dirs that hash to this shard.
+# How many children a directory may have and still be read as a list of GROUPS
+# (year dirs) rather than a list of calls. The corpus is staged either as
+# <root>/<call_id>/ (hundreds of thousands of children) or as <root>/<year>/<call_id>/
+# (a handful), so the count separates the two without a stat per child.
+_MAX_GROUP_DIRS = 64
 
-    Layout assumed: <root>/<call_id>/<audio.*> -- the immediate child dir name IS the
-    call_id (the same value infer_call_id derives for an audio.* file, and the same
-    key _shard_of uses). So selecting child dirs by _shard_of(dir_name) == shard_index
-    yields EXACTLY the files this shard would own under the full-walk+filter path, but
-    touches only one readdir of <root> plus this shard's ~1/N child dirs instead of the
-    whole tree. No process reads sidecars outside its slice, which is what wedged the
-    shared-cache builder on an HSM-released (S3-cold) tree.
+
+def _shard_call_dirs(
+    root: Path, num_shards: int, shard_index: int
+) -> Iterator[Path]:
+    """Yield the call dirs under `root` that hash to this shard.
+
+    Handles both stagings of the corpus: call dirs directly under `root`, and call dirs
+    one level down under year dirs (how a run's `input/` is wired -- `input/2025` is a
+    symlink to the year tree, which is also what puts "2025" in the manifest's `year`).
+    Only the CALL dir name is ever hashed, so either way this yields exactly the calls
+    the full-walk path would assign to this shard.
     """
     try:
         entries = sorted(os.scandir(root), key=lambda e: e.name)
     except OSError:
+        return
+    # A handful of children means they are year dirs, so recurse to find the calls. The
+    # check is on the count alone: with the flat layout, asking "is this a call dir?"
+    # per child would stat all ~400k of them, the metadata churn this scan exists to
+    # avoid.
+    if 0 < len(entries) <= _MAX_GROUP_DIRS:
+        for entry in entries:
+            if entry.name.startswith("."):
+                continue
+            yield from _shard_call_dirs(Path(entry.path), num_shards, shard_index)
         return
     for entry in entries:
         # Hash-filter on the directory NAME first (pure CPU), before touching the
@@ -173,17 +188,31 @@ def _iter_shard_audio_paths(
         # stat() every one of the (here ~480k) root entries -- ~7ms each under fleet
         # MDT contention => ~tens of minutes PER BOX of pure metadata churn before any
         # real work. By selecting our ~1/N dirs by name hash first we only ever stat
-        # this shard's slice. A non-directory (or unreadable entry) that happens to
-        # hash here is simply skipped when the scandir below raises OSError.
-        if _shard_of(entry.name, num_shards) != shard_index:
-            continue
+        # this shard's slice.
+        if _shard_of(entry.name, num_shards) == shard_index:
+            yield Path(entry.path)
+
+
+def _iter_shard_audio_paths(
+    root: Path, exts: set[str], num_shards: int, shard_index: int
+) -> Iterator[Path]:
+    """Yield audio paths only under the call dirs that hash to this shard.
+
+    The call dir name IS the call_id (the same value infer_call_id derives for an
+    audio.* file, and the same key _shard_of uses), so this yields EXACTLY the files
+    this shard would own under the full-walk+filter path while touching only this
+    shard's ~1/N of the call dirs instead of the whole tree. No process reads sidecars
+    outside its slice, which is what wedged the shared-cache builder on an
+    HSM-released (S3-cold) tree.
+    """
+    for call_dir in _shard_call_dirs(root, num_shards, shard_index):
         try:
-            names = sorted(e.name for e in os.scandir(entry.path))
+            # A non-directory that happens to hash here just raises and is skipped.
+            names = sorted(e.name for e in os.scandir(call_dir))
         except OSError:
             continue
-        base = Path(entry.path)
         for name in names:
-            path = base / name
+            path = call_dir / name
             if path.suffix.lower() in exts and path.is_file():
                 yield path
 
