@@ -82,20 +82,49 @@ if [[ "$NUM_SHARDS" -gt 1 ]]; then
   # exactly its own ~15k calls and can run end-to-end independently (no fleet barrier,
   # no cross-shard reads). ls is one readdir of the parent; the python filter hashes
   # each name the same way amc_pipeline.discovery._shard_of does.
-  log "listing top-level dirs under $ROOT; selecting shard $SHARD_INDEX/$NUM_SHARDS by call_id hash..."
-  ls -1 "$ROOT" 2>/dev/null | python3 -c '
-import sys, hashlib
-n = int(sys.argv[1]); i = int(sys.argv[2])
-for line in sys.stdin:
-    name = line.strip()
-    if name and int(hashlib.sha1(name.encode("utf-8")).hexdigest(), 16) % n == i:
-        print(name)
-' "$NUM_SHARDS" "$SHARD_INDEX" > "$WORK/dirs.txt" || true
+  log "listing call dirs under $ROOT; selecting shard $SHARD_INDEX/$NUM_SHARDS by call_id hash..."
+  # Emit ABSOLUTE call-dir paths so this works for both stagings of the corpus: call dirs
+  # directly under $ROOT, and call dirs one level down under year dirs (a run's input/
+  # holds one symlink per year). Only the call dir NAME is hashed either way, which is
+  # what keeps this slice identical to the one the pipeline later discovers.
+  python3 -c '
+import hashlib, os, sys
+root, n, i = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+
+def mine(name):
+    return int(hashlib.sha1(name.encode("utf-8")).hexdigest(), 16) % n == i
+
+def has_audio(path):
+    exts = {".wav", ".mp3", ".flac", ".m4a", ".opus", ".ogg", ".aac", ".wma"}
+    try:
+        with os.scandir(path) as it:
+            for seen, e in enumerate(it):
+                if seen >= 64:
+                    break
+                if os.path.splitext(e.name)[1].lower() in exts:
+                    return True
+    except OSError:
+        pass
+    return False
+
+names = sorted(e.name for e in os.scandir(root) if not e.name.startswith("."))
+# Few children and no audio inside the first of them => year dirs, so descend.
+parents = [root]
+if 0 < len(names) <= 64 and not has_audio(os.path.join(root, names[0])):
+    parents = [os.path.join(root, name) for name in names]
+for parent in parents:
+    try:
+        for e in os.scandir(parent):
+            if not e.name.startswith(".") and mine(e.name):
+                print(e.path)
+    except OSError:
+        pass
+' "$ROOT" "$NUM_SHARDS" "$SHARD_INDEX" > "$WORK/dirs.txt" || true
   ndirs="$(wc -l < "$WORK/dirs.txt" | tr -d ' ')"
-  log "slice owns $ndirs top-level dirs; enumerating their files (parallel=$PARALLEL)..."
+  log "slice owns $ndirs call dirs; enumerating their files (parallel=$PARALLEL)..."
   # One find per dir, parallelised. Each call dir holds only a few files, so thousands
   # of tiny finds in parallel are far cheaper than one serial walk of the whole tree.
-  xargs -r -a "$WORK/dirs.txt" -P "$PARALLEL" -I {} find "$ROOT/{}" -type f 2>/dev/null \
+  xargs -r -a "$WORK/dirs.txt" -P "$PARALLEL" -I {} find "{}" -type f 2>/dev/null \
     > "$ALL" || true
 else
   log "scanning whole tree $ROOT for files..."
