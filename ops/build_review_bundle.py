@@ -53,7 +53,10 @@ def parse_json(raw, default):
 
 def span_text(span: dict, transcript: str) -> tuple[str, str]:
     """(label, quoted text) for a PII span, tolerating either key naming."""
-    label = str(span.get("label") or span.get("entity") or span.get("type") or "PII")
+    label = str(span.get("label") or span.get("entity") or span.get("type")
+                or span.get("entity_type") or "PII")
+    if str(span.get("source") or span.get("detector") or "") == "spoken_number":
+        label += " (spoken)"
     text = span.get("text") or span.get("value") or ""
     if not text:
         start = span.get("start_char", span.get("start"))
@@ -94,6 +97,8 @@ def main() -> int:
     ap.add_argument("--pad", type=float, default=2.5, help="seconds of context each side")
     ap.add_argument("--full-calls", type=int, default=5,
                     help="also copy this many whole redacted calls")
+    ap.add_argument("--no-prefer-spoken", dest="prefer_spoken", action="store_false",
+                    help="rank by looping models only, ignoring spoken-number masks")
     args = ap.parse_args()
 
     manifest = args.run / "manifests" / "all_segments.parquet"
@@ -110,11 +115,19 @@ def main() -> int:
     for i, call_id in enumerate(man["call_id"]):
         rows_by_call[call_id].append(i)
 
+    def spoken_spans(i: int) -> int:
+        """Spans found by the spoken-number detector, which are the newest masks."""
+        return str(man["pii_spans_json"][i] or "").count("spoken_number")
+
     def call_rank(call_id: str) -> tuple:
         rows = rows_by_call[call_id]
+        spoken = sum(spoken_spans(i) for i in rows)
         loops = sum(1 for i in rows if man["segment_id"][i] in looped)
         pii = sum(num(man["pii_count"][i]) for i in rows)
-        return (-loops, -pii)
+        # Numbers read out digit by digit rank first: they were shipping in the clear
+        # until the spoken-number detector landed, so they are the masks least proven
+        # by ear -- both that the digits are gone and that the speech around them is not.
+        return (-spoken, -loops, -pii) if args.prefer_spoken else (-loops, -pii)
 
     calls = sorted(rows_by_call, key=call_rank)[: args.max_calls]
 
