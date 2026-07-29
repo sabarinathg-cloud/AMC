@@ -89,21 +89,28 @@ for m in glob.glob(f"{root}/outputs/shard-*/.pii_pipeline/stage_markers/*.done")
 # counting bare stage-units puts the ETA out by a wide margin. Only used for stages this
 # run has not finished anywhere yet; anything measured here wins.
 REF_VS_QWEN = {
-    "asr_cohere": 1.04, "asr_granite": 2.98, "normalize": 1.05, "consensus": 0.06,
-    "pii": 0.22, "align": 3.11, "mask_plan": 0.01, "redact": 0.39,
-    "validate": 0.61, "manifest": 0.06,
+    "preprocess": 1.20, "asr_parakeet": 0.95, "asr_cohere": 1.04, "asr_granite": 2.98,
+    "normalize": 1.05, "consensus": 0.06, "pii": 0.22, "align": 3.11,
+    "mask_plan": 0.01, "redact": 0.39, "validate": 0.61, "manifest": 0.06,
 }
 
-# Measured hours per shard for every stage that has finished somewhere in THIS run.
+# Measured hours per shard, from CONSECUTIVE MARKER PAIRS only.
+# Do not reach for the shard dir's ctime as a start time: on Unix that is the inode CHANGE
+# time, not creation, so it moves every time the dir is written and the arithmetic goes
+# negative. That leaves the first stage unmeasurable (nothing precedes it), so it takes a
+# ratio like the not-yet-run stages.
 measured = {}
-for shard_dir, times in marker_times.items():
-    prev = os.path.getctime(shard_dir)
+for times in marker_times.values():
+    prev_stage = None
     for stage in stages:
         if stage not in times:
             break
-        measured.setdefault(stage, []).append((times[stage] - prev) / 3600)
-        prev = times[stage]
-measured = {k: statistics.median(v) for k, v in measured.items() if v}
+        if prev_stage is not None:
+            measured.setdefault(stage, []).append(
+                (times[stage] - times[prev_stage]) / 3600)
+        prev_stage = stage
+measured = {k: statistics.median(v) for k, v in measured.items()
+            if v and statistics.median(v) > 0}
 
 qwen_base = measured.get("asr_qwen")
 weights = {}
@@ -113,7 +120,7 @@ for stage in stages:
     elif qwen_base and stage in REF_VS_QWEN:
         weights[stage] = REF_VS_QWEN[stage] * qwen_base
     else:
-        weights[stage] = 1.0
+        weights[stage] = qwen_base or 1.0
 
 # Progress in HOURS OF WORK rather than stage count, so an unfinished granite pass is not
 # treated as interchangeable with an unfinished mask_plan.
@@ -143,13 +150,22 @@ print(f"RUN  {root}")
 print(f"     {num_shards} shards x {len(stages)} stages   running {elapsed_h:.1f} h")
 print()
 
-pct = (done_units / total_units * 100) if total_units else 0
+pct = max(min(done_units / total_units * 100, 100), 0) if total_units else 0
 bar = "#" * int(pct / 2.5) + "." * (40 - int(pct / 2.5))
 print(f"PROGRESS  [{bar}] {pct:5.1f}%   {done_units:,.0f} / {total_units:,.0f} shard-hours of work")
 machines = max(len(active), 1)
-if total_units:
-    # Shards run one per machine, so the remaining work divides by the machine count --
-    # not by the rate so far, which was set by whichever stages happen to be done.
+if len(complete) >= 3:
+    # Once shards are finishing, OBSERVED throughput beats any model of stage cost: it
+    # already contains the startup overhead, the stragglers and the real machine count.
+    per_h = len(complete) / elapsed_h
+    remaining_h = (num_shards - len(complete)) / per_h
+    eta = time.strftime("%a %H:%M UTC", time.gmtime(now + remaining_h * 3600))
+    print(f"          {len(complete)} shards done in {elapsed_h:.1f} h = {per_h:.1f} shards/h"
+          f"  ->  ~{remaining_h:.0f} h left ({remaining_h / 24:.1f} days, ETA {eta})")
+    print(f"          measured throughput; each machine still owes "
+          f"~{(num_shards - len(complete)) / machines:.1f} shards")
+elif total_units:
+    # Nothing has finished end to end yet, so fall back to modelled stage cost.
     remaining_h = (total_units - done_units) / machines
     eta = time.strftime("%a %H:%M UTC", time.gmtime(now + remaining_h * 3600))
     print(f"          {remaining_h:.0f} h left on {machines} machines  "
@@ -217,10 +233,12 @@ REMOTE_EOF
 
 snapshot() {
   local ids id cmd status out
-  ids="$(aws ssm describe-instance-information --region "$AWS_REGION" \
+  local err
+  err="$(aws ssm describe-instance-information --region "$AWS_REGION" \
     --filters "Key=tag:Project,Values=$PROJECT_TAG" \
     --query 'InstanceInformationList[?PingStatus==`Online`].InstanceId' \
-    --output text 2>/dev/null | tr '\t\n' '  ')"
+    --output text 2>&1 >/tmp/.amc-ids)" || { echo "$err" >&2; return 1; }
+  ids="$(tr '\t\n' '  ' < /tmp/.amc-ids)"
   if [[ -z "${ids// }" ]]; then echo "no online instances tagged Project=$PROJECT_TAG" >&2; return 1; fi
 
   local payload
