@@ -8,8 +8,10 @@
 #
 #   RUN_ROOT=/mnt/amc-data/amc-runs/2025-full bash ops/remediate_shard.sh 7
 #
-# Refuses to touch a shard another box holds a live lease on -- two pipelines writing
-# one shard's sqlite would corrupt it -- and refuses to redo an already-remediated one.
+# CLAIMS the shard through the same lease protocol resume_shard.sh uses, and holds it
+# until done. That is not optional: clearing the stage markers makes a finished shard
+# look incomplete, so an idle worker will claim and re-run it. On the shard-0 pilot a
+# worker did exactly that 30 minutes in, and two pipelines wrote one sqlite file.
 set -Eeuo pipefail
 umask 0002
 
@@ -29,23 +31,41 @@ say() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] remediate[$SHARD]: $*"; }
 
 [[ -d "$SHARD_DIR" ]] || { say "no such shard dir: $SHARD_DIR"; exit 2; }
 
-# A live lease means a worker is mid-shard on it right now.
-LEASE="$RUN_ROOT/shards/shard-$SHARD.lock/lease"
-if [[ -f "$LEASE" ]]; then
-  EPOCH="$(grep -oE '[0-9]{9,}' "$LEASE" | head -1 || true)"
-  if [[ -n "$EPOCH" ]]; then
-    AGE=$(( $(date +%s) - EPOCH ))
-    if (( AGE >= 0 && AGE < LEASE_TTL )); then
-      say "SKIP: a worker holds a live lease (${AGE}s old); shard is in flight"
-      exit 3
-    fi
-  fi
-fi
-
 if [[ -f "$NOTE" ]]; then
   say "SKIP: already remediated ($NOTE)"
   exit 0
 fi
+
+# --- claim the shard, same protocol as resume_shard.sh -----------------------
+SHARDS_DIR="$RUN_ROOT/shards"
+LOCK="$SHARDS_DIR/shard-$SHARD.lock"
+SELF="$(curl -fsS --max-time 2 http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || hostname):$$"
+mkdir -p "$SHARDS_DIR"
+
+write_lease() { printf '%s %s %s\n' "$(date +%s)" "$SELF" "$(hostname)" > "$LOCK/lease"; }
+
+if ! mkdir "$LOCK" 2>/dev/null; then
+  EPOCH="$(awk 'NR==1{print $1}' "$LOCK/lease" 2>/dev/null || true)"
+  [[ -n "$EPOCH" ]] || EPOCH="$(stat -c %Y "$LOCK" 2>/dev/null || echo 0)"
+  AGE=$(( $(date +%s) - EPOCH ))
+  if (( AGE >= 0 && AGE < LEASE_TTL )); then
+    say "SKIP: worker $(awk 'NR==1{print $3}' "$LOCK/lease" 2>/dev/null) holds a live lease (${AGE}s old)"
+    exit 3
+  fi
+  say "taking over a stale lease (${AGE}s old)"
+  TOMB="$LOCK.dead.$$.$RANDOM"
+  mv "$LOCK" "$TOMB" 2>/dev/null && rm -rf "$TOMB"
+  mkdir "$LOCK" 2>/dev/null || { say "SKIP: lost the takeover race"; exit 3; }
+fi
+write_lease
+HB_PID=""
+( while true; do write_lease; sleep "${AMC_LEASE_HEARTBEAT:-60}"; done ) & HB_PID=$!
+cleanup() {
+  [[ -n "$HB_PID" ]] && kill "$HB_PID" 2>/dev/null || true
+  rm -rf "$LOCK" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+say "claimed shard (lease held by $SELF)"
 
 cd "$REPO_DIR"
 say "invalidating changed items"
