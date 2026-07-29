@@ -48,15 +48,23 @@ for s in $(seq 0 31); do
   log="$R/logs/remediate-driver-$s.log"
   note="$R/outputs/shard-$s/.pii_pipeline/reports/spoken_number_remediation.json"
   slog="$R/logs/remediate-shard-$s.log"
-  stage=""
-  [ -f "$slog" ] && stage=$(grep -oE "START [a-z_]+ shard" "$slog" 2>/dev/null | tail -1 | awk "{print \$2}")
+  stage=""; last_fail=""
+  if [ -f "$slog" ]; then
+    stage=$(grep -oE "START [a-z_]+ shard" "$slog" 2>/dev/null | tail -1 | awk "{print \$2}")
+    last=$(grep -oE "(START [a-z_]+ shard|END [a-z_]+ rc=[0-9]+)" "$slog" 2>/dev/null | tail -1)
+    case "$last" in END*rc=0) ;; END*) last_fail="$last" ;; esac
+  fi
   if [ -f "$log" ] && grep -q "DONE: every spoken number" "$log" 2>/dev/null; then
     done_n=$((done_n+1))
     detail=$(grep -oE "[0-9,]+ contain a spoken number, [0-9,]+ now masked, [0-9,]+ still unmasked" "$log" | tail -1)
     printf "%-9s %-11s %s\n" "shard-$s" VERIFIED "$detail"
-  elif [ -f "$log" ] && grep -qE "WARNING: some spoken numbers|Traceback|rc=[1-9]" "$log" 2>/dev/null; then
+  elif [ -f "$log" ] && [ -n "$last_fail" ]; then
+    # A stage failure shows up as rc!=0 in the STAGE log; the driver dies on it under
+    # `set -e`, so its own log just stops and would otherwise read as "running". Only
+    # the LAST boundary counts: the log is appended across retries, so an old rc=2 sits
+    # there forever once a retry is under way.
     fail_n=$((fail_n+1))
-    printf "%-9s %-11s %s\n" "shard-$s" FAILED "$(grep -oE "remediate\[$s\]: .*" "$log" | tail -1)"
+    printf "%-9s %-11s %s\n" "shard-$s" FAILED "$last_fail"
   elif [ -f "$log" ]; then
     run_n=$((run_n+1))
     prog=$(tail -c 400 "$slog" 2>/dev/null | tr "\r" "\n" | grep -oE "[0-9]+%\|" | tail -1 | tr -d "|")
