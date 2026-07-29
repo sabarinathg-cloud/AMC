@@ -38,7 +38,7 @@ read -r -d '' REMOTE <<'REMOTE_EOF'
 RUN_ENV_PATH="__RUN_ENV__"
 RUN_ROOT_ARG="__RUN_ROOT__"
 python3 - "$RUN_ENV_PATH" "$RUN_ROOT_ARG" <<'PY'
-import glob, json, os, re, subprocess, sys, time
+import glob, json, os, re, statistics, subprocess, sys, time
 
 run_env, run_root_arg = sys.argv[1], sys.argv[2]
 
@@ -77,12 +77,48 @@ active = [s for s in status if s.get("stage") != "complete" and s.get("state") !
 
 # Per-stage completion across every shard: the .done markers are the durable record.
 marker_counts = {}
+marker_times = {}
 for m in glob.glob(f"{root}/outputs/shard-*/.pii_pipeline/stage_markers/*.done"):
-    marker_counts[os.path.basename(m)[:-5]] = marker_counts.get(os.path.basename(m)[:-5], 0) + 1
+    stage = os.path.basename(m)[:-5]
+    marker_counts[stage] = marker_counts.get(stage, 0) + 1
+    shard_dir = m.split("/.pii_pipeline/")[0]
+    marker_times.setdefault(shard_dir, {})[stage] = os.path.getmtime(m)
 
-# Progress in stage-units (shard x stage) so it is meaningful before any shard finishes.
-total_units = num_shards * len(stages) if num_shards and stages else 0
-done_units = sum(marker_counts.get(s, 0) for s in stages)
+# Cost of each stage RELATIVE TO asr_qwen, measured on the completed 2026-full run.
+# Stages are nowhere near equally expensive -- granite is ~3x qwen and align ~3.1x -- so
+# counting bare stage-units puts the ETA out by a wide margin. Only used for stages this
+# run has not finished anywhere yet; anything measured here wins.
+REF_VS_QWEN = {
+    "asr_cohere": 1.04, "asr_granite": 2.98, "normalize": 1.05, "consensus": 0.06,
+    "pii": 0.22, "align": 3.11, "mask_plan": 0.01, "redact": 0.39,
+    "validate": 0.61, "manifest": 0.06,
+}
+
+# Measured hours per shard for every stage that has finished somewhere in THIS run.
+measured = {}
+for shard_dir, times in marker_times.items():
+    prev = os.path.getctime(shard_dir)
+    for stage in stages:
+        if stage not in times:
+            break
+        measured.setdefault(stage, []).append((times[stage] - prev) / 3600)
+        prev = times[stage]
+measured = {k: statistics.median(v) for k, v in measured.items() if v}
+
+qwen_base = measured.get("asr_qwen")
+weights = {}
+for stage in stages:
+    if stage in measured:
+        weights[stage] = measured[stage]
+    elif qwen_base and stage in REF_VS_QWEN:
+        weights[stage] = REF_VS_QWEN[stage] * qwen_base
+    else:
+        weights[stage] = 1.0
+
+# Progress in HOURS OF WORK rather than stage count, so an unfinished granite pass is not
+# treated as interchangeable with an unfinished mask_plan.
+total_units = num_shards * sum(weights.values()) if num_shards and stages else 0
+done_units = sum(weights[s] for times in marker_times.values() for s in times if s in weights)
 
 # Run start is run.env, written once at launch. Status files are NOT a substitute: they
 # are rewritten at every stage transition, so their mtime is always recent and the
@@ -109,14 +145,19 @@ print()
 
 pct = (done_units / total_units * 100) if total_units else 0
 bar = "#" * int(pct / 2.5) + "." * (40 - int(pct / 2.5))
-print(f"PROGRESS  [{bar}] {pct:5.1f}%   {done_units:,} / {total_units:,} stage-units")
-if done_units and total_units:
-    remaining_h = (total_units - done_units) / (done_units / elapsed_h)
+print(f"PROGRESS  [{bar}] {pct:5.1f}%   {done_units:,.0f} / {total_units:,.0f} shard-hours of work")
+machines = max(len(active), 1)
+if total_units:
+    # Shards run one per machine, so the remaining work divides by the machine count --
+    # not by the rate so far, which was set by whichever stages happen to be done.
+    remaining_h = (total_units - done_units) / machines
     eta = time.strftime("%a %H:%M UTC", time.gmtime(now + remaining_h * 3600))
-    print(f"          {done_units / elapsed_h:.0f} stage-units/h  ->  ~{remaining_h:.1f} h left  (ETA {eta})")
-    if not complete:
-        print("          (rough: stages are weighted equally, but they are not equally "
-              "expensive.\n           Firms up once the first shard clears all stages.)")
+    print(f"          {remaining_h:.0f} h left on {machines} machines  "
+          f"({remaining_h / 24:.1f} days, ETA {eta})")
+    unmeasured = [s for s in stages if s not in measured]
+    if unmeasured:
+        print(f"          {len(stages) - len(unmeasured)}/{len(stages)} stage costs measured "
+              f"on this run; rest scaled from 2026-full")
 print()
 
 not_started = num_shards - len(status)
