@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 
 from .models import PIISpan
 from .config import PipelineConfig
+from .spoken_numbers import find_spoken_number_runs
 
 
 def _pii_device() -> tuple[str, int]:
@@ -82,6 +83,13 @@ class RegexPIIDetector(PIIDetector):
                 name = text[start:end].strip()
                 if _likely_name(name):
                     spans.append(PIISpan("PERSON_NAME", name, start, end, 0.99, "rule_name"))
+        # Numbers recited digit by digit. PHONE above only matches digit CHARACTERS, and
+        # the neural detectors are surface-form bound too, so a number spoken as words is
+        # invisible to every other detector in the stack (see `spoken_numbers`).
+        for run in find_spoken_number_runs(text):
+            spans.append(
+                PIISpan(run.entity_type, run.text, run.start, run.end, 0.95, "spoken_number")
+            )
         return resolve_overlaps(spans)
 
 
